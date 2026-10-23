@@ -1,0 +1,61 @@
+import { normalizeSettings, type Settings } from '@nvt/core';
+import { browser } from 'wxt/browser';
+
+export { normalizeSettings };
+
+export const SETTINGS_KEY = 'nvt.settings';
+export const YANDEX_AUTH_KEY = 'nvt.yandexAuth';
+/** { at, message }: why the last login attempt failed (Russian text, no secrets); removed on success */
+export const YANDEX_LOGIN_ERROR_KEY = 'nvt.yandexLoginError';
+/** VoiceStatus: latest Yandex-tier attempt + latest voiced chunk (written by content scripts) */
+export const VOICE_STATUS_KEY = 'nvt.voiceStatus';
+
+export interface YandexAuth {
+  token: string;
+  /** ms epoch; 0 = unknown */
+  expiresAt: number;
+  login?: string;
+}
+
+export async function loadYandexAuth(): Promise<YandexAuth | null> {
+  const got = await browser.storage.local.get(YANDEX_AUTH_KEY);
+  const a = got[YANDEX_AUTH_KEY] as Partial<YandexAuth> | undefined;
+  if (!a || typeof a.token !== 'string' || !a.token) return null;
+  return { token: a.token, expiresAt: typeof a.expiresAt === 'number' ? a.expiresAt : 0, login: typeof a.login === 'string' ? a.login : undefined };
+}
+
+/** set once the autoTranslate default was moved to 'on' for the stored settings (see loadSettings) */
+const AUTO_DEFAULT_KEY = 'nvt.autoTranslateOnByDefault';
+
+/** Full settings: stored values + defaults + the Yandex token (unless expired). The token is not part of SETTINGS_KEY. */
+export async function loadSettings(): Promise<Settings> {
+  const got = await browser.storage.local.get([SETTINGS_KEY, AUTO_DEFAULT_KEY]);
+  const s = normalizeSettings(got[SETTINGS_KEY]);
+  if (got[AUTO_DEFAULT_KEY] !== true) {
+    // one-time: settings saved before the default became 'on' still hold 'off' and would keep auto-translate off
+    s.autoTranslate = 'on';
+    await browser.storage.local.set({ [SETTINGS_KEY]: normalizeSettings(s), [AUTO_DEFAULT_KEY]: true });
+  }
+  const auth = await loadYandexAuth();
+  if (auth && (auth.expiresAt === 0 || auth.expiresAt > Date.now())) s.yandexToken = auth.token;
+  return s;
+}
+
+/** Persists a partial update (token field is ignored: it lives in YANDEX_AUTH_KEY). */
+export async function saveSettings(patch: Partial<Settings>): Promise<void> {
+  const got = await browser.storage.local.get(SETTINGS_KEY);
+  const cur = normalizeSettings(got[SETTINGS_KEY]);
+  const { yandexToken: _t, ...rest } = patch;
+  void _t;
+  await browser.storage.local.set({ [SETTINGS_KEY]: normalizeSettings({ ...cur, ...rest }) });
+}
+
+/** Calls `cb` with fresh settings whenever settings or the Yandex login change. Returns an unsubscribe. */
+export function onSettingsChanged(cb: (s: Settings) => void): () => void {
+  const fn = (changes: Record<string, unknown>, area: string): void => {
+    if (area !== 'local' || !(SETTINGS_KEY in changes || YANDEX_AUTH_KEY in changes)) return;
+    void loadSettings().then(cb);
+  };
+  browser.storage.onChanged.addListener(fn);
+  return () => browser.storage.onChanged.removeListener(fn);
+}

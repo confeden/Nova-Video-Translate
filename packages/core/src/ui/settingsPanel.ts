@@ -1,0 +1,741 @@
+/**
+ * Framework-free settings panel (Russian UI), shared by the extension options page and, later, the userscript.
+ * The host supplies persistence and the few operations that need privileged HTTP (ListModels) or account flows.
+ * API keys are shown masked and are never logged.
+ */
+import type { ModelInfo } from '../models';
+import type { ProviderId } from '../providers/types';
+import type { TokenCheck } from '../providers/yandex/oauth';
+import type { VoiceReport } from './videoController';
+import { SOURCE_LANG_OPTIONS } from '../lang/names';
+import { isActiveState, stateText, voiceLine, type TranslateStatus } from './status';
+import { DEFAULT_SETTINGS, type Settings } from '../types';
+import { localTtsSection, type LocalTtsPanelHost } from './localTtsSection';
+
+export interface YandexAccountInfo {
+  login?: string;
+  /** ms epoch, 0 / absent = unknown */
+  expiresAt?: number;
+}
+
+export interface VoiceStatus {
+  /** latest attempt of the Yandex tiers */
+  live?: VoiceReport;
+  /** latest chunk that was actually voiced (any tier) */
+  voiced?: VoiceReport;
+}
+
+export interface SettingsPanelHost extends LocalTtsPanelHost {
+  getSettings(): Promise<Settings>;
+  saveSettings(patch: Partial<Settings>): Promise<void>;
+  /** ListModels with this key; rejects when the key is invalid / unreachable */
+  listGeminiModels(key: string): Promise<ModelInfo[]>;
+  /** null = signed out */
+  getYandexAccount(): Promise<YandexAccountInfo | null>;
+  yandexLogin(): Promise<void>;
+  yandexLogout(): Promise<void>;
+  /** asks login.yandex.ru whether the stored token is accepted; omitted = no check button */
+  yandexCheck?(): Promise<TokenCheck>;
+  /** why the last login attempt failed (cleared on success) */
+  getYandexLoginError?(): Promise<string | undefined>;
+  getVoiceStatus?(): Promise<VoiceStatus>;
+  /** result cache statistics / reset; omitted = the cache block shows only the settings */
+  cacheStats?(): Promise<{ entries: number; bytes: number }>;
+  cacheClear?(): Promise<void>;
+  /** build version shown at the bottom ("Версия X.Y.Z") */
+  version?: string;
+  /** state of the video this panel controls; null = no video here; omitted = no translate block at all */
+  getTranslateStatus?(): Promise<TranslateStatus | null>;
+  /** starts / stops translation of that video and returns the fresh status */
+  toggleTranslate?(): Promise<TranslateStatus | null>;
+  /** translate the video although it was detected as Russian ("Всё равно перевести") */
+  forceTranslate?(): Promise<TranslateStatus | null>;
+  /** diagnostics text of the page (content-script world); null = nothing reachable */
+  getDiagReport?(): Promise<{ text: string; source?: string } | null>;
+  clearDiag?(): Promise<void>;
+  /** shows a test subtitle on the page's player; false = no player */
+  showTestCue?(text: string): Promise<boolean>;
+}
+
+export interface SettingsPanelHandle {
+  refresh(): Promise<void>;
+  destroy(): void;
+}
+
+export const PROVIDER_LABELS: Record<ProviderId, string> = {
+  'yandex-live': 'Яндекс — живые голоса',
+  yandex: 'Яндекс — обычные',
+  groq: 'Groq (распознавание и перевод) + локальный голос',
+  local: 'Локальные модели (без интернета-сервисов)',
+  gemini: 'Gemini (запасной, выключен)',
+};
+
+
+const NOT_TRANSLATE = /tts|live|audio|image|transcribe|embed|imagen|veo|aqa/i;
+
+const STYLE_ID = 'nvt-settings-style';
+const CSS = `
+.nvt-sp{--bg:#181a1c;--fg:#f1f1f1;--mut:#9aa0a6;--line:#2b2f33;--ctl:#3c4043;--acc:#35d477;--card:#181a1c;--bad:#ff8a80;--inp:#222528;
+ font:13px/1.4 "Segoe UI",Roboto,Arial,sans-serif;color:var(--fg);background:var(--bg);padding:12px;box-sizing:border-box;color-scheme:dark}
+.nvt-sp h1{font-size:14px;margin:0 0 8px;padding-right:24px}
+.nvt-sp h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);margin:0}
+.nvt-sp section{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:0 0 8px}
+.nvt-sp .row{display:flex;align-items:center;gap:6px;margin:6px 0;flex-wrap:wrap}
+.nvt-sp .row>label{flex:1 1 auto;color:#c9cdd1;font-size:12px}
+.nvt-sp .row:has(>input[type=checkbox]){flex-wrap:nowrap}
+.nvt-sp .row:has(>input[type=checkbox])>label{min-width:0}
+.nvt-sp .grow{flex:1 1 auto;min-width:0}
+.nvt-sp input[type=text],.nvt-sp input[type=password],.nvt-sp input[type=number],.nvt-sp select{background:var(--inp);color:var(--fg);border:1px solid var(--ctl);
+ border-radius:6px;padding:3px 6px;font:inherit;font-size:12px;min-width:0;max-width:100%}
+.nvt-sp button{background:transparent;color:#c9cdd1;border:1px solid var(--ctl);border-radius:6px;padding:3px 8px;font:inherit;font-size:12px;cursor:pointer}
+.nvt-sp button:hover:not(:disabled){background:var(--inp);border-color:var(--acc)}
+.nvt-sp button:disabled{opacity:.4;cursor:default}
+.nvt-sp button.primary{background:var(--acc);color:#08361d;border-color:var(--acc);font-weight:600}
+.nvt-sp button.primary:hover:not(:disabled){background:#4ade87}
+.nvt-sp input[type=checkbox]{accent-color:var(--acc);width:14px;height:14px;margin:0}
+.nvt-sp .prov{display:flex;align-items:center;gap:6px;padding:3px 0;border-top:1px solid #232629}
+.nvt-sp .prov:first-child{border-top:0}
+.nvt-sp .prov .name{flex:1;font-size:12px}
+.nvt-sp .prov button{padding:0 6px;line-height:18px}
+.nvt-sp .sub-row{display:flex;align-items:center;gap:6px;margin:2px 0 6px 20px;flex-wrap:wrap;font-size:12px}
+.nvt-sp .hint{color:#7c8288;font-size:11px;line-height:1.35;margin:3px 0}
+.nvt-sp .key{font-family:ui-monospace,Consolas,monospace;flex:1}
+.nvt-sp .ok{color:var(--acc)}.nvt-sp .bad{color:var(--bad)}
+.nvt-sp input[type=range]{flex:1;min-width:70px;accent-color:var(--acc)}
+.nvt-sp .val{width:36px;text-align:right;font-size:12px}
+.nvt-sp details>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;user-select:none}
+.nvt-sp details>summary::-webkit-details-marker{display:none}
+.nvt-sp details>summary::before{content:"\\25B8";color:var(--mut);transition:transform .12s}
+.nvt-sp details[open]>summary::before{transform:rotate(90deg)}
+.nvt-sp details[open]>summary{margin-bottom:6px}
+.nvt-sp .top{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:0 0 8px;background:#222528}
+.nvt-sp .top .big{width:100%;padding:7px 10px;font-size:13px;font-weight:600;border-radius:6px}
+.nvt-sp .top .big.on{background:#d33;border-color:#d33;color:#fff}
+.nvt-sp .top .st{margin-top:6px;font-weight:600;font-size:12px}
+.nvt-sp .top .sub{color:var(--mut);margin-top:2px;font-size:12px}
+.nvt-sp .top .sub.bad{color:var(--bad)}
+.nvt-sp .top .sub.ok{color:var(--acc)}
+.nvt-sp .ver{color:var(--mut);font-size:11px;text-align:center;margin:2px 0 0}
+.nvt-sp textarea{width:100%;box-sizing:border-box;height:80px;font:11px ui-monospace,Consolas,monospace;background:var(--inp);color:var(--fg);border:1px solid var(--ctl);border-radius:6px}
+`;
+
+type Child = Node | string | null | undefined | false;
+
+function h<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  props: Record<string, unknown> = {},
+  ...kids: Child[]
+): HTMLElementTagNameMap[K] {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (v === undefined || v === false) continue;
+    if (k === 'class') el.className = String(v);
+    else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v as EventListener);
+    else if (k in el) (el as unknown as Record<string, unknown>)[k] = v;
+    else el.setAttribute(k, String(v));
+  }
+  for (const c of kids) if (c) el.append(c);
+  return el;
+}
+
+function maskKey(k: string): string {
+  return k.length <= 10 ? '••••' : `${k.slice(0, 4)}…${k.slice(-4)}`;
+}
+
+function debounce<A extends unknown[]>(fn: (...a: A) => void, ms: number): (...a: A) => void {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  return (...a) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...a), ms);
+  };
+}
+
+export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): SettingsPanelHandle {
+  const doc = root.ownerDocument;
+  // inside a Shadow DOM (userscript modal) the stylesheet must live in the shadow root, not in <head>
+  const rn = root.getRootNode();
+  const styleHost: ParentNode = typeof ShadowRoot !== 'undefined' && rn instanceof ShadowRoot ? rn : doc;
+  if (!styleHost.querySelector(`#${STYLE_ID}`)) {
+    const st = doc.createElement('style');
+    st.id = STYLE_ID;
+    st.textContent = CSS;
+    (styleHost instanceof ShadowRoot ? styleHost : (doc.head ?? doc.documentElement)).appendChild(st);
+  }
+  root.classList.add('nvt-sp');
+
+  let s: Settings = structuredClone(DEFAULT_SETTINGS);
+  let models: ModelInfo[] = [];
+  let modelsMsg = '';
+  const keyStatus = new Map<string, { ok: boolean; text: string }>();
+  let yandex: YandexAccountInfo | null = null;
+  let yandexCheck: { text: string; ok: boolean; avatarUrl?: string } | null = null;
+  let loginError: string | undefined;
+  let voiceStatus: VoiceStatus = {};
+  let destroyed = false;
+  const openSet = new Set<string>(['mix']);
+  let status: TranslateStatus | null | undefined;
+  let statusBusy = false;
+  let diagMsg = '';
+  let diagText = '';
+
+  const save = async (patch: Partial<Settings>): Promise<void> => {
+    s = { ...s, ...patch };
+    await host.saveSettings(patch);
+  };
+  const saveSoon = debounce((patch: Partial<Settings>) => void host.saveSettings(patch), 250);
+
+  const loadModels = async (): Promise<void> => {
+    models = [];
+    modelsMsg = '';
+    const key = s.geminiKeys[0];
+    if (!key) return;
+    try {
+      models = await host.listGeminiModels(key);
+    } catch {
+      modelsMsg = 'Не удалось получить список моделей';
+    }
+  };
+
+  // ---- sections ----
+
+  /** collapsible section; the open/closed state survives re-renders */
+  const sec = (id: string, title: string, ...kids: Child[]): HTMLElement => {
+    const d = h('details', { open: openSet.has(id), ontoggle: () => (d.open ? openSet.add(id) : openSet.delete(id)) });
+    d.append(h('summary', {}, h('h2', {}, title)));
+    for (const k of kids) if (k) d.append(k);
+    return h('section', {}, d);
+  };
+
+  const voicesSection = (): HTMLElement => {
+    const list = h('div');
+    s.voiceOrder.forEach((id, i) => {
+      const cb = h('input', {
+        type: 'checkbox',
+        checked: s.voiceEnabled[id] !== false,
+        onchange: () => void save({ voiceEnabled: { ...s.voiceEnabled, [id]: cb.checked } }),
+      });
+      const move = (d: number) => async (): Promise<void> => {
+        const o = [...s.voiceOrder];
+        const j = i + d;
+        if (j < 0 || j >= o.length) return;
+        [o[i], o[j]] = [o[j]!, o[i]!];
+        await save({ voiceOrder: o });
+        render();
+      };
+      list.append(
+        h(
+          'div',
+          { class: 'prov' },
+          cb,
+          h('span', { class: 'name' }, `${i + 1}. ${PROVIDER_LABELS[id]}`),
+          h('button', { title: 'Выше', disabled: i === 0, onclick: move(-1) }, '↑'),
+          h('button', { title: 'Ниже', disabled: i === s.voiceOrder.length - 1, onclick: move(1) }, '↓'),
+        ),
+      );
+      if (id === 'yandex-live') list.append(yandexRow());
+      if (id === 'groq') list.append(groqRow());
+    });
+    return sec(
+      'src',
+      'Источники озвучки',
+      list,
+    );
+  };
+
+  const slider = (label: string, value: number, key: 'originalVolume' | 'translationVolume'): HTMLElement => {
+    const val = h('span', { class: 'val' }, `${Math.round(value * 100)}%`);
+    const inp = h('input', {
+      type: 'range',
+      min: '0',
+      max: '100',
+      step: '1',
+      value: String(Math.round(value * 100)),
+      oninput: () => {
+        const v = Number(inp.value) / 100;
+        val.textContent = `${inp.value}%`;
+        s = { ...s, [key]: v };
+        saveSoon({ [key]: v });
+      },
+    });
+    return h('div', { class: 'row' }, h('label', {}, label), inp, val);
+  };
+
+  const toggle = (label: string, on: boolean, onChange: (v: boolean) => void): HTMLElement => {
+    const cb = h('input', { type: 'checkbox', checked: on, onchange: () => onChange(cb.checked) });
+    return h('div', { class: 'row' }, h('label', {}, label), cb);
+  };
+
+  const mixSection = (): HTMLElement =>
+    sec(
+      'mix',
+      'Звук и перевод',
+      slider('Громкость оригинала', s.originalVolume, 'originalVolume'),
+      slider('Громкость перевода', s.translationVolume, 'translationVolume'),
+      h(
+        'div',
+        { class: 'row' },
+        h('label', {}, 'Язык перевода'),
+        h('select', { disabled: true }, h('option', {}, 'Русский')),
+      ),
+      toggle('Субтитры', s.subtitles === 'on', (v) => void save({ subtitles: v ? 'on' : 'off' })),
+      toggle('Использовать родной русский дубляж, если есть', s.preferNativeDub !== false, (v) => void save({ preferNativeDub: v })),
+      toggle('Не переводить видео на русском', s.skipRussian !== 'off', (v) => void save({ skipRussian: v ? 'on' : 'off' })),
+      toggle('Ждать конца ячейки перед озвучкой (меньше обрывов фраз, больше задержка)', s.holdCellsToEnd === true, (v) => void save({ holdCellsToEnd: v })),
+      (() => {
+        const sel = h('select', { class: 'grow', onchange: () => void save({ sourceLang: sel.value }) });
+        for (const [code, label] of SOURCE_LANG_OPTIONS) sel.append(h('option', { value: code }, label));
+        if (!SOURCE_LANG_OPTIONS.some(([c]) => c === s.sourceLang)) sel.append(h('option', { value: s.sourceLang }, s.sourceLang));
+        sel.value = s.sourceLang;
+        return h('div', { class: 'row' }, h('label', {}, 'Язык оригинала'), sel);
+      })(),
+      toggle('Переводить автоматически', s.autoTranslate === 'on', (v) => void save({ autoTranslate: v ? 'on' : 'off' })),
+      toggle('Ждать перевод: ставить видео на паузу, пока не готов первый фрагмент', s.prerollPause === 'on', (v) => void save({ prerollPause: v ? 'on' : 'off' })),
+      (() => {
+        const sel = h('select', { class: 'grow', onchange: () => void save({ clickAction: sel.value === 'toggle' ? 'toggle' : 'settings' }) },
+          h('option', { value: 'settings' }, 'открывать настройки'),
+          h('option', { value: 'toggle' }, 'сразу включать перевод'),
+        );
+        sel.value = s.clickAction;
+        return h('div', { class: 'row' }, h('label', {}, 'Клик по кнопке на плеере'), sel);
+      })(),
+    );
+
+  const modelSelect = (role: 'translate' | 'tts'): HTMLSelectElement => {
+    const cur = s.geminiModels[role];
+    const ids = models
+      .filter((m) => m.supportedGenerationMethods.includes('generateContent'))
+      .map((m) => m.id)
+      .filter((id) => (role === 'tts' ? /tts/i.test(id) : !NOT_TRANSLATE.test(id)));
+    if (cur && !ids.includes(cur)) ids.unshift(cur);
+    const sel = h('select', {
+      class: 'grow',
+      onchange: () => void save({ geminiModels: { ...s.geminiModels, [role]: sel.value } }),
+    });
+    sel.append(h('option', { value: '' }, 'Авто'));
+    for (const id of ids) sel.append(h('option', { value: id }, id));
+    sel.value = cur;
+    return sel;
+  };
+
+  const geminiSection = (): HTMLElement => {
+    const keysBox = h('div');
+    s.geminiKeys.forEach((k, i) => {
+      const st = keyStatus.get(k);
+      const status = h('span', { class: st?.ok ? 'ok' : 'bad' }, st?.text ?? '');
+      const check = h('button', {
+        onclick: async () => {
+          check.disabled = true;
+          status.className = '';
+          status.textContent = 'Проверка…';
+          try {
+            const m = await host.listGeminiModels(k);
+            keyStatus.set(k, { ok: true, text: `Ключ работает (моделей: ${m.length})` });
+            if (i === 0) models = m;
+          } catch {
+            keyStatus.set(k, { ok: false, text: 'Ключ не принят' });
+          }
+          render();
+        },
+      }, 'Проверить ключ');
+      keysBox.append(
+        h(
+          'div',
+          { class: 'prov' },
+          h('span', { class: 'key' }, maskKey(k)),
+          status,
+          check,
+          h('button', {
+            title: 'Удалить ключ',
+            onclick: async () => {
+              keyStatus.delete(k);
+              await save({ geminiKeys: s.geminiKeys.filter((x) => x !== k) });
+              await loadModels();
+              render();
+            },
+          }, 'Удалить'),
+        ),
+      );
+    });
+    const newKey = h('input', { type: 'password', class: 'grow', placeholder: 'Вставьте API-ключ Google AI Studio', autocomplete: 'off' });
+    const add = async (): Promise<void> => {
+      const v = newKey.value.trim();
+      if (!v || s.geminiKeys.includes(v)) return;
+      newKey.value = '';
+      await save({ geminiKeys: [...s.geminiKeys, v] });
+      await loadModels();
+      render();
+    };
+    newKey.addEventListener('keydown', (e) => {
+      if ((e as KeyboardEvent).key === 'Enter') void add();
+    });
+    return sec(
+      'gem',
+      'Gemini',
+      keysBox,
+      h('div', { class: 'row' }, newKey, h('button', { class: 'primary', onclick: () => void add() }, 'Добавить')),
+      h('div', { class: 'row' }, h('label', {}, 'Модель перевода'), modelSelect('translate')),
+      h('div', { class: 'row' }, h('label', {}, 'Модель озвучки'), modelSelect('tts')),
+      modelsMsg ? h('div', { class: 'hint bad' }, modelsMsg) : null,
+    );
+  };
+
+  // ---- Chrome built-in AI (Gemini Nano audio ASR + Translator en->ru): status and an explicit, click-only download ----
+  type AiApi = { availability(o?: unknown): Promise<string>; create(o?: unknown): Promise<unknown> };
+  const aiEnv = (): { LanguageModel?: AiApi; Translator?: AiApi } => globalThis as unknown as { LanguageModel?: AiApi; Translator?: AiApi };
+  const AI_LM_OPTS = { expectedInputs: [{ type: 'audio' }, { type: 'text', languages: ['en'] }], expectedOutputs: [{ type: 'text', languages: ['en'] }] };
+  const AI_TR_OPTS = { sourceLanguage: 'en', targetLanguage: 'ru' };
+  const AI_STATE: Record<string, string> = { available: 'установлена', downloadable: 'можно скачать', downloading: 'скачивается', unavailable: 'недоступна' };
+  let aiInfo: { lm: string; tr: string } | null = null;
+  let aiBusy = '';
+  const aiProbe = async (): Promise<void> => {
+    const e = aiEnv();
+    const ask = async (api: AiApi | undefined, o: unknown): Promise<string> => {
+      if (!api) return 'absent';
+      try {
+        return await api.availability(o);
+      } catch {
+        return 'unavailable';
+      }
+    };
+    aiInfo = { lm: await ask(e.LanguageModel, AI_LM_OPTS), tr: await ask(e.Translator, AI_TR_OPTS) };
+    if (!destroyed) render();
+  };
+  const aiDownload = async (): Promise<void> => {
+    const e = aiEnv();
+    const run = async (name: string, api: AiApi | undefined, o: Record<string, unknown>): Promise<void> => {
+      if (!api) return;
+      aiBusy = `${name}: 0%`;
+      render();
+      const monitor = (m: EventTarget): void =>
+        m.addEventListener('downloadprogress', (ev) => {
+          aiBusy = `${name}: ${Math.round(((ev as Event & { loaded?: number }).loaded ?? 0) * 100)}%`;
+          if (!destroyed) render();
+        });
+      const created = (await api.create({ ...o, monitor })) as { destroy?: () => void };
+      created.destroy?.();
+    };
+    try {
+      if (aiInfo?.tr === 'downloadable' || aiInfo?.tr === 'downloading') await run('Переводчик', e.Translator, AI_TR_OPTS);
+      if (aiInfo?.lm === 'downloadable' || aiInfo?.lm === 'downloading') await run('Распознавание речи', e.LanguageModel, AI_LM_OPTS);
+    } catch (err) {
+      aiBusy = `ошибка: ${err instanceof Error ? err.message : 'не удалось скачать'}`;
+      render();
+      return;
+    }
+    aiBusy = '';
+    await aiProbe();
+  };
+  const chromeAiSection = (): HTMLElement => {
+    if (!aiInfo && !aiBusy) void aiProbe();
+    const st = (v: string | undefined): string => (v === 'absent' ? 'нет в этом браузере' : (v && AI_STATE[v]) || '…');
+    const need = !!aiInfo && (aiInfo.lm === 'downloadable' || aiInfo.tr === 'downloadable');
+    return sec('chromeai', 'Нейросеть Chrome (встроенная)',
+      h('div', { class: 'hint' }, `Распознавание речи: ${st(aiInfo?.lm)}; переводчик: ${st(aiInfo?.tr)}`),
+      need || aiBusy
+        ? h('div', { class: 'row' },
+            h('button', { class: 'primary', disabled: !!aiBusy && !aiBusy.startsWith('ошибка'), onclick: () => void aiDownload() }, 'Скачать модели Chrome'),
+            aiBusy ? h('span', { class: aiBusy.startsWith('ошибка') ? 'bad' : 'hint', style: 'margin-left:8px' }, aiBusy) : null)
+        : null,
+    );
+  };
+
+  const groqRow = (): HTMLElement => {
+    const input = h('input', { type: 'password', class: 'grow', placeholder: 'Ключ Groq (вставьте сюда)', autocomplete: 'off', value: s.groqApiKey });
+    const getBtn = h('button', { onclick: () => window.open('https://console.groq.com/keys', '_blank', 'noopener') }, 'Получить ключ');
+    const saved = h('span', { class: 'ok' }, '✓');
+    const sync = (): void => {
+      const has = input.value.trim() !== '';
+      getBtn.hidden = has;
+      saved.hidden = !has;
+    };
+    sync();
+    const commit = (): void => void save({ groqApiKey: input.value.trim() });
+    input.addEventListener('input', sync);
+    input.addEventListener('change', commit);
+    input.addEventListener('paste', () => setTimeout(() => { sync(); commit(); }, 0));
+    return h('div', { class: 'sub-row' }, input, saved, getBtn);
+  };
+
+  const when = (t: number): string => new Date(t).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const outcomeText = (r: VoiceReport): { text: string; good: boolean } => {
+    switch (r.outcome) {
+      case 'ok':
+        return { text: `озвучено: ${r.label ?? ''}`, good: true };
+      case 'declined':
+        return { text: 'живые голоса недоступны для этого видео или языка — использованы обычные', good: false };
+      case 'auth-rejected':
+        return { text: 'вход не принят Яндексом — войдите снова', good: false };
+      case 'no-token':
+        return { text: 'вы не вошли в Яндекс — живые голоса не использовались', good: false };
+      default:
+        return { text: `ошибка${r.detail ? `: ${r.detail}` : ''}`, good: false };
+    }
+  };
+
+  const yandexRow = (): HTMLElement => {
+    const expired = !!yandex && !!yandex.expiresAt && yandex.expiresAt <= Date.now();
+    const last = voiceStatus.live ? outcomeText(voiceStatus.live) : null;
+    if (!yandex) {
+      return h('div', { class: 'sub-row' },
+        h('button', { class: 'primary', onclick: () => void host.yandexLogin() }, 'Войти в Яндекс'),
+        loginError ? h('span', { class: 'bad' }, loginError) : null);
+    }
+    return h('div', { class: 'sub-row' },
+      h('span', { class: expired ? 'bad' : 'ok' }, expired ? 'Вход истёк — войдите снова' : `Вы вошли${yandex.login ? `: ${yandex.login}` : ''}`),
+      h('button', {
+        onclick: async () => {
+          await host.yandexLogout();
+          yandex = null;
+          yandexCheck = null;
+          render();
+        },
+      }, expired ? 'Войти снова' : 'Выйти'),
+      last && !last.good && voiceStatus.live ? h('span', { class: 'bad' }, last.text) : null);
+  };
+
+  const cacheSection = (): HTMLElement => {
+    const info = h('div', { class: 'hint' }, host.cacheStats ? 'В кэше: …' : '');
+    const showStats = async (): Promise<void> => {
+      if (!host.cacheStats) return;
+      try {
+        const st = await host.cacheStats();
+        info.textContent = `В кэше: ${st.entries} фрагментов, ${(st.bytes / 1048576).toFixed(1)} МБ`;
+      } catch {
+        info.textContent = 'В кэше: нет данных';
+      }
+    };
+    void showStats();
+    const num = (label: string, value: number, min: number, max: number, key: 'cacheDays' | 'cacheMaxMB'): HTMLElement => {
+      const inp = h('input', {
+        type: 'number',
+        min: String(min),
+        max: String(max),
+        value: String(value),
+        style: 'width:90px',
+        onchange: () => {
+          const v = Math.min(max, Math.max(min, Math.round(Number(inp.value) || value)));
+          inp.value = String(v);
+          void save({ [key]: v } as Partial<Settings>);
+        },
+      });
+      return h('div', { class: 'row' }, h('label', {}, label), inp);
+    };
+    const clear = h('button', {
+      disabled: !host.cacheClear,
+      onclick: async () => {
+        clear.disabled = true;
+        try {
+          await host.cacheClear?.();
+        } finally {
+          clear.disabled = false;
+          await showStats();
+        }
+      },
+    }, 'Очистить кэш');
+    return sec(
+      'cache',
+      'Кэш переводов',
+      toggle('Кэшировать готовые переводы', s.cacheEnabled && s.cacheProviders.includes('gemini'), (v) =>
+        void save({ cacheEnabled: v, cacheProviders: v ? [...new Set<ProviderId>([...s.cacheProviders, 'gemini', 'groq', 'local'])] : s.cacheProviders }),
+      ),
+      num('Хранить, дней', s.cacheDays, 1, 30, 'cacheDays'),
+      num('Максимальный размер, МБ', s.cacheMaxMB, 10, 5000, 'cacheMaxMB'),
+      h('div', { class: 'row' }, clear),
+      info,
+    );
+  };
+
+  // ---- translate toggle + status (top of the panel) ----
+
+  const topBox = h('div', { class: 'top' });
+  const renderTop = (): void => {
+    const st = status;
+    const active = !!st && (isActiveState(st.state) || st.state === 'native-dub');
+    const forceable = !!st?.canForce;
+    const btn = h(
+      'button',
+      {
+        class: `big ${active ? 'on' : 'primary'}`,
+        disabled: !st || statusBusy,
+        onclick: async () => {
+          statusBusy = true;
+          renderTop();
+          try {
+            status = (await (forceable ? (host.forceTranslate ?? host.toggleTranslate)?.call(host) : host.toggleTranslate?.())) ?? status;
+          } catch {
+            /* the next poll shows the real state */
+          }
+          statusBusy = false;
+          renderTop();
+        },
+      },
+      st ? (active ? 'Перевод: Выключить' : forceable ? 'Всё равно перевести' : 'Перевод: Включить') : st === undefined ? 'Перевод: проверяю страницу…' : 'Перевод: нет видео на странице',
+    );
+    const lines: Child[] = [];
+    if (st) {
+      lines.push(h('div', { class: 'st' }, stateText(st.state, st.slow, { etaSec: st.etaSec, source: st.etaSource })));
+      if (st.language) lines.push(h('div', { class: st.state === 'skipped-ru' ? 'sub' : 'hint' }, st.language));
+      if (st.voice) lines.push(h('div', { class: 'sub ok' }, voiceLine(st.voice, st.later)));
+      if (st.subtitles) lines.push(h('div', { class: 'sub ok' }, st.subtitles));
+      // problem / warning lines are NOT shown here (owner decision): they live in the diagnostics report only
+      if (st.page) lines.push(h('div', { class: 'hint' }, `Вкладка: ${st.page}`));
+    } else if (st === null) {
+      lines.push(h('div', { class: 'hint' }, 'Откройте страницу с видео — здесь появится управление переводом.'));
+    }
+    topBox.replaceChildren(btn, ...(lines.filter(Boolean) as Node[]));
+  };
+  const pollStatus = async (): Promise<void> => {
+    if (destroyed || statusBusy || !host.getTranslateStatus) return;
+    try {
+      status = await host.getTranslateStatus();
+    } catch {
+      status = null;
+    }
+    if (!destroyed) renderTop();
+  };
+  const pollTimer = host.getTranslateStatus ? setInterval(() => void pollStatus(), 1000) : undefined;
+
+  // ---- diagnostics ----
+
+  /** Writes the report to a file: the save dialog opens on the Desktop where the browser supports it, else a normal download. Returns the file name. */
+  const saveReport = async (text: string): Promise<string | null> => {
+    const name = `nvt-report-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.txt`;
+    try {
+      const pick = (globalThis as unknown as { showSaveFilePicker?: (o: unknown) => Promise<{ name: string; createWritable(): Promise<{ write(d: string): Promise<void>; close(): Promise<void> }> }> }).showSaveFilePicker;
+      if (pick) {
+        const fh = await pick({ suggestedName: name, startIn: 'desktop', types: [{ description: 'Текст', accept: { 'text/plain': ['.txt'] } }] });
+        const w = await fh.createWritable();
+        await w.write(text);
+        await w.close();
+        return fh.name;
+      }
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') return null;
+    }
+    try {
+      const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+      const a = h('a', { href: url, download: name });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      return `${name} (папка «Загрузки»)`;
+    } catch {
+      return null;
+    }
+  };
+
+  const copyText = async (text: string): Promise<boolean> => {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      /* fall through to the legacy path (focus rules of iframes / permission policy) */
+    }
+    try {
+      const ta = doc.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+      (doc.body ?? doc.documentElement).appendChild(ta);
+      ta.select();
+      const ok = doc.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  };
+
+  const diagSection = (): HTMLElement => {
+    const msg = h('div', { class: 'hint' }, diagMsg);
+    const set = (m: string, text = ''): void => {
+      diagMsg = m;
+      diagText = text;
+      render();
+    };
+    return sec(
+      'diag',
+      'Диагностика',
+      h(
+        'div',
+        { class: 'row' },
+        host.getDiagReport
+          ? h('button', {
+              class: 'primary',
+              onclick: async () => {
+                let r: { text: string; source?: string } | null = null;
+                try {
+                  r = (await host.getDiagReport?.()) ?? null;
+                } catch {
+                  r = null;
+                }
+                if (!r) return set('Нет данных: откройте страницу с видео и повторите.');
+                const lines = r.text.split('\n').length;
+                const from = r.source ? ` (вкладка ${r.source})` : '';
+                const saved = await saveReport(r.text);
+                if (saved) set(`Отчёт сохранён: ${saved}${from}.`);
+                else set(`Не удалось сохранить файл${from} — выделите текст ниже и скопируйте вручную.`, r.text);
+              },
+            }, 'Сохранить отчёт на рабочий стол')
+          : null,
+        host.clearDiag
+          ? h('button', {
+              onclick: async () => {
+                await host.clearDiag?.().catch(() => {});
+                set('Журнал очищен.');
+              },
+            }, 'Очистить журнал')
+          : null,
+        host.showTestCue
+          ? h('button', {
+              onclick: async () => {
+                const ok = await host.showTestCue?.('Тестовый субтитр: так выглядят субтитры NVT').catch(() => false);
+                set(ok ? 'Тестовый субтитр показан на плеере (6 секунд).' : 'На странице нет плеера с видео.');
+              },
+            }, 'Показать тестовый субтитр')
+          : null,
+      ),
+      msg,
+      diagText ? h('textarea', { readOnly: true, value: diagText, onfocus: (e: Event) => (e.target as HTMLTextAreaElement).select() }) : null,
+    );
+  };
+
+  function render(): void {
+    if (destroyed) return;
+    renderTop();
+    const kids: Child[] = [
+      h('h1', {}, 'Nova Video Translate'),
+      host.getTranslateStatus ? topBox : null,
+      mixSection(),
+      voicesSection(),
+      geminiSection(),
+      chromeAiSection(),
+      host.getLocalTtsInfo ? localTtsSection(host) : null,
+      cacheSection(),
+      diagSection(),
+      host.version ? h('div', { class: 'ver' }, `Версия ${host.version}`) : null,
+    ];
+    root.replaceChildren(...(kids.filter(Boolean) as Node[]));
+  }
+
+  const refresh = async (): Promise<void> => {
+    s = await host.getSettings();
+    yandex = await host.getYandexAccount();
+    loginError = (await host.getYandexLoginError?.().catch(() => undefined)) ?? undefined;
+    voiceStatus = (await host.getVoiceStatus?.().catch(() => ({}))) ?? {};
+    render();
+    await loadModels();
+    render();
+  };
+  void refresh();
+  void pollStatus();
+
+  return {
+    refresh,
+    destroy() {
+      destroyed = true;
+      if (pollTimer) clearInterval(pollTimer);
+      root.replaceChildren();
+    },
+  };
+}
