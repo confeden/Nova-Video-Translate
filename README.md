@@ -58,3 +58,13 @@ npm run build
 ## Лицензия
 
 GPL-3.0. Часть протокола перевода Яндекса основана на открытом проекте [voice-over-translation](https://github.com/ilyhalight/voice-over-translation).
+
+---
+
+# Создано с ❤️
+
+🙋 **Группа в Телеграм:** [@nova_txt](https://t.me/nova_txt) — вопросы, новости,
+поддержка.
+
+☕ **[Отблагодарить](https://nova-app.eu/donate)** — если NVT оказался для вас полезным.
+Это необязательный способ сказать "спасибо".
