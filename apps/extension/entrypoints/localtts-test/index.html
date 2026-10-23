@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NVT: самотест локального голоса</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; max-width: 760px }
+      pre { background: #f2f2f5; padding: 10px; white-space: pre-wrap; border-radius: 6px }
+      button { padding: 6px 12px; margin-right: 8px }
+      @media (prefers-color-scheme: dark) { body { background: #17171a; color: #ececf1 } pre { background: #202025 } }
+    </style>
+  </head>
+  <body>
+    <h1>Самотест локального голоса (Supertonic)</h1>
+    <p>Страница разработчика: <code>chrome-extension://&lt;id&gt;/localtts-test.html</code>. Модель должна быть скачана в настройках.</p>
+    <button id="status">Состояние</button>
+    <button id="run">Синтез 3 фраз</button>
+    <button id="play">Синтез и проигрывание</button>
+    <pre id="out">…</pre>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
