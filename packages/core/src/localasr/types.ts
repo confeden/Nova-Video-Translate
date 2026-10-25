@@ -3,7 +3,7 @@
  * free text from audio. Keep dependency-free; implementations are registered by the apps through `LocalAsrRegistry`.
  */
 
-export type LocalAsrEngineId = 'chrome-prompt-audio' | 'whisper-wasm' | 'helper-faster-whisper';
+export type LocalAsrEngineId = 'whisper-webgpu' | 'chrome-prompt-audio' | 'whisper-wasm' | 'helper-faster-whisper';
 
 export interface LocalAsrOptions {
   /** ISO language hint (the engine may ignore it; the Prompt API is English only) */
@@ -22,6 +22,11 @@ export interface LocalAsrResult {
   segments: LocalAsrSegment[];
   /** ISO code when the engine knows it */
   lang?: string;
+  /** `lang` came from the engine's own language detection (no language was passed in) */
+  detected?: boolean;
+  /** which model / device ran it (diagnostics only) */
+  model?: string;
+  device?: string;
 }
 
 export interface LocalAsr {

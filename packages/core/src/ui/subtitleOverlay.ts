@@ -18,7 +18,15 @@ export function subtitleMetrics(playerW: number, playerH: number): { fontPx: num
   return { fontPx, bottomPx };
 }
 
+/** Text of a cue for the chosen language; falls back to the translation when no original is known. */
+export function cueDisplayText(cue: SubtitleCue | undefined, lang: 'original' | 'translation'): string {
+  if (!cue) return '';
+  return lang === 'original' && cue.src ? cue.src : cue.text;
+}
+
 export interface SubtitleOverlay {
+  /** which text to show (applies live, re-renders the current cue) */
+  setLang(lang: 'original' | 'translation'): void;
   /** replace the cue list (sorted copy is kept) */
   setCues(cues: readonly SubtitleCue[]): void;
   /** show `text` for `ms` regardless of settings / media time (debug hook) */
@@ -36,12 +44,15 @@ export interface SubtitleOverlay {
 export function createSubtitleOverlay(video: HTMLVideoElement, getHost: () => HTMLElement | null): SubtitleOverlay {
   let index = new CueIndex([]);
   let enabled = false;
+  let lang: 'original' | 'translation' = 'original';
   let el: HTMLElement | undefined;
   let textEl: HTMLElement | undefined;
   let test: { text: string; until: number } | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let ro: ResizeObserver | undefined;
   let shown = '';
+  /** identity of what is on screen: the active cue object (or the test cue); the timer re-renders only when it changes */
+  let shownKey: unknown = null;
   const EVENTS = ['timeupdate', 'seeked', 'seeking', 'pause', 'play', 'ratechange', 'loadedmetadata'] as const;
 
   /** positions the line inside the VIDEO's box (the container may be much larger than the video, e.g. <body>) */
@@ -80,10 +91,17 @@ export function createSubtitleOverlay(video: HTMLVideoElement, getHost: () => HT
     return true;
   };
 
+  /** the cue that should be visible right now (object identity), null when nothing is */
+  const activeKey = (): unknown => {
+    if (test && Date.now() < test.until) return test;
+    return enabled ? (index.at(video.currentTime) ?? null) : null;
+  };
+
   const render = (): void => {
     const now = Date.now();
     if (test && now >= test.until) test = undefined;
-    const want = test ? test.text : enabled ? (index.at(video.currentTime)?.text ?? '') : '';
+    shownKey = activeKey();
+    const want = test ? test.text : enabled ? cueDisplayText(index.at(video.currentTime), lang) : '';
     if (!want) {
       if (el) el.style.display = 'none';
       shown = '';
@@ -101,9 +119,17 @@ export function createSubtitleOverlay(video: HTMLVideoElement, getHost: () => HT
 
   const onEvent = (): void => render();
   for (const e of EVENTS) video.addEventListener(e, onEvent);
-  timer = setInterval(render, 150);
+  // light timer: a cue that ends (or starts) between media events is caught here; re-render only on a cue change
+  timer = setInterval(() => {
+    if (activeKey() !== shownKey) render();
+  }, 250);
 
   return {
+    setLang(l) {
+      if (l === lang) return;
+      lang = l;
+      render();
+    },
     setCues(cues) {
       index = new CueIndex(cues);
       render();

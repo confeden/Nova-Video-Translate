@@ -5,6 +5,7 @@ import { FakeCapture, FakeProvider, FakeScheduler, FakeVideo, chunk, flush, seg,
 import type { Settings } from '../src/types';
 
 class PVideo extends FakeVideo {
+  duration?: number;
   ended = false;
   pauses = 0;
   plays = 0;
@@ -27,7 +28,7 @@ const shortSleep = async (ms: number, signal: AbortSignal): Promise<void> => {
   await new Promise<void>((_, rej) => signal.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError'))));
 };
 
-function setup(over: Partial<Settings> = {}, extra: { maxParallelYandex?: number; sleep?: (ms: number, s: AbortSignal) => Promise<void>; hintSleep?: (ms: number, s: AbortSignal) => Promise<void> } = {}) {
+function setup(over: Partial<Settings> = {}, extra: { capKind?: 'hls' | 'mse'; maxParallelYandex?: number; sleep?: (ms: number, s: AbortSignal) => Promise<void>; hintSleep?: (ms: number, s: AbortSignal) => Promise<void> } = {}) {
   const video = new PVideo();
   const providers = [new FakeProvider('yandex-live'), new FakeProvider('yandex'), new FakeProvider('gemini')];
   const caps: FakeCapture[] = [];
@@ -43,6 +44,7 @@ function setup(over: Partial<Settings> = {}, extra: { maxParallelYandex?: number
     events: { onState: (s, d) => states.push([s, d]) },
     createCapture: (async () => {
       const c = new FakeCapture();
+      if (extra.capKind) c.kind = extra.capKind;
       caps.push(c);
       return c;
     }) as never,
@@ -57,6 +59,7 @@ function setup(over: Partial<Settings> = {}, extra: { maxParallelYandex?: number
     maxParallelYandex: extra.maxParallelYandex,
     latencyPriors: { yandex: 22, 'yandex-live': 22, gemini: 12 },
     hintSleep: extra.hintSleep,
+    liveChunkSec: 15,
   });
   const yandex = providers.find((p) => p.id === 'yandex')!;
   return { video, engine, yandex, caps, scheds, states, clock };
@@ -187,6 +190,7 @@ describe('preroll pause and the preparing status', () => {
     const e = setup({ prerollPause });
     e.video.currentTime = ct;
     e.video.paused = false;
+    e.video.duration = 1e6; // VOD-like: a live video is never paused for the preroll
     await e.engine.start();
     return e;
   };
@@ -265,11 +269,84 @@ describe('preroll pause and the preparing status', () => {
         : Promise.resolve();
     const e = setup({ prerollPause: 'on' }, { sleep });
     e.video.paused = false;
+    e.video.duration = 1e6; // VOD-like: a live video is never paused for the preroll
     await e.engine.start();
     expect(e.video.paused).toBe(true);
     fire();
     await flush();
     expect(e.video.plays).toBe(1);
+    e.engine.stop();
+  });
+});
+
+describe('preroll pause on a live HLS capture', () => {
+  /** sleeps by length: the resume delay is instant, the live cap (15 s) is fireable, the 60 s timeout never fires */
+  const mkSleep = () => {
+    const fired: Array<() => void> = [];
+    const sleep = (ms: number, signal: AbortSignal): Promise<void> => {
+      if (ms < 1000) return Promise.resolve();
+      if (ms > 15_000) return new Promise<void>((_, rej) => signal.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError'))));
+      return new Promise<void>((res, rej) => {
+        fired.push(res);
+        signal.addEventListener('abort', () => rej(new DOMException('aborted', 'AbortError')));
+      });
+    };
+    return { sleep, fired };
+  };
+
+  it('caps the wait at 15 s once the capture is hls', async () => {
+    const { sleep, fired } = mkSleep();
+    const e = setup({ prerollPause: 'on' }, { capKind: 'hls', sleep });
+    e.video.paused = false;
+    e.video.duration = 1e6; // VOD-like: a live video is never paused for the preroll
+    await e.engine.start();
+    expect(e.video.paused).toBe(true);
+    expect(fired).toHaveLength(1); // the live cap timer; the 60 s one is the pending long sleep
+    fired[0]!();
+    await flush();
+    expect(e.video.plays).toBe(1);
+    expect(e.video.paused).toBe(false);
+    e.engine.stop();
+  });
+
+  it('a live video (no finite duration) is never paused for the preroll', async () => {
+    const { sleep } = mkSleep();
+    const e = setup({ prerollPause: 'on' }, { capKind: 'hls', sleep });
+    e.video.duration = NaN;
+    e.video.paused = false;
+    await e.engine.start();
+    expect(e.video.paused).toBe(false);
+    expect(e.video.pauses).toBe(0);
+    expect(diag.entries().some((x) => x.ev === 'preroll-skip')).toBe(true);
+    e.engine.stop();
+  });
+
+  it('a non-live capture keeps the long wait (no cap timer)', async () => {
+    const { sleep, fired } = mkSleep();
+    const e = setup({ prerollPause: 'on' }, { capKind: 'mse', sleep });
+    e.video.paused = false;
+    e.video.duration = 1e6; // VOD-like: a live video is never paused for the preroll
+    await e.engine.start();
+    expect(fired).toHaveLength(0);
+    e.engine.stop();
+  });
+
+  it('two consecutive chunks without speech release the pause', async () => {
+    const { sleep } = mkSleep();
+    const e = setup({ prerollPause: 'on' }, { capKind: 'hls', sleep });
+    e.yandex.fallback = { segments: [], sourceLang: 'en' };
+    e.video.currentTime = 1000;
+    e.video.paused = false;
+    e.video.duration = 1e6; // VOD-like: a live video is never paused for the preroll
+    await e.engine.start();
+    expect(e.video.paused).toBe(true);
+    e.caps[0]!.emit(chunk(1030)); // ahead of the playhead: does not cover it
+    await flush();
+    expect(e.video.paused).toBe(true);
+    e.caps[0]!.emit(chunk(1045));
+    await flush();
+    expect(e.video.plays).toBe(1);
+    expect(e.video.paused).toBe(false);
     e.engine.stop();
   });
 });

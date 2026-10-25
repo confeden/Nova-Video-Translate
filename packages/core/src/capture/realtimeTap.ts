@@ -115,6 +115,11 @@ export interface RealtimeOptions {
   silenceLimitSec?: number;
   /** advancing, audible-element digital silence after which the stream is reported 'tainted' */
   taintLimitSec?: number;
+  /**
+   * Raw 16 kHz blocks while the media clock advances, with video.currentTime at the block's arrival (HLS clock alignment).
+   * Monitor use: the chunks are simply never consumed.
+   */
+  onPcm?: (samples: Float32Array, videoTime: number) => void;
 }
 
 export interface RealtimeTap {
@@ -184,6 +189,7 @@ export function createRealtimeTap(video: HTMLMediaElement, opts: RealtimeOptions
 
   const onSamples = (s: Float32Array): void => {
     if (!chunker.active) return;
+    if (opts.onPcm && playing() && video.playbackRate === lastRate) opts.onPcm(s, video.currentTime);
     if (video.playbackRate !== lastRate) {
       drop('rate');
       return resume();
@@ -241,7 +247,8 @@ export function createRealtimeTap(video: HTMLMediaElement, opts: RealtimeOptions
         w.port.onmessage = (e: MessageEvent<Float32Array>) => onSamples(e.data);
         node = w;
       } catch {
-        const sp = ctx.createScriptProcessor(4096, 1, 1); // CSP blocked the worklet module
+        // CSP blocked the worklet module. Largest legal buffer: fewer main-thread callbacks (each one copies a chunk)
+        const sp = ctx.createScriptProcessor(16384, 1, 1);
         sp.onaudioprocess = (e) => onSamples(e.inputBuffer.getChannelData(0).slice(0));
         node = sp;
       }

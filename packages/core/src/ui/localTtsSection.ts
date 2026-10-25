@@ -3,7 +3,8 @@
  * progress, and "Проверить голос" (synthesises a fixed sample and plays it here). Self-contained (own tiny DOM helper, reuses the
  * panel's CSS classes) so settingsPanel.ts only needs one line. A model is NEVER downloaded without a click on its button.
  */
-import { AUTO_ENGINE_ORDER, LOCAL_TTS_ENGINES, LOCAL_TTS_SAMPLE_TEXT, engineInfo, resolveVoice, unitFor, type LocalTtsChoice, type LocalTtsEngineInfo } from '../localtts/catalog';
+import { AUTO_ENGINE_ORDER, LOCAL_TTS_ENGINES, engineInfo, resolveVoice, unitFor, type LocalTtsChoice, type LocalTtsEngineInfo } from '../localtts/catalog';
+import { stressedSample } from '../localtts/stress';
 import { MODEL_TOTAL_BYTES } from '../localtts/supertonic/constants';
 import type { LttsEnv, LttsState } from '../localtts/supertonic/protocol';
 import { b64ToInt16 } from '../localtts/supertonic/pcm';
@@ -27,6 +28,8 @@ export interface LocalTtsPanelState {
 export interface LocalTtsPanelInfo {
   env: LttsEnv;
   units: Record<string, LttsState | undefined>;
+  /** measured f0 of the engine's voices (calibration cache), keyed by engine@revision */
+  calib?: Record<string, { f0: Record<string, number> }>;
 }
 
 export interface LocalTtsTestResult {
@@ -130,7 +133,7 @@ export function autoEngine(voices: { voice: string }, pi: LocalTtsPanelInfo | nu
 }
 
 /** 0.1 s ramps on both ends keep the test sample from clicking */
-function playPcm(pcmB64: string, sampleRate: number): { stop(): void; done: Promise<void> } {
+export function playPcm(pcmB64: string, sampleRate: number): { stop(): void; done: Promise<void> } {
   const pcm = b64ToInt16(pcmB64);
   const AC = (globalThis as unknown as { AudioContext?: typeof AudioContext }).AudioContext;
   if (!AC) throw new Error('AudioContext недоступен');
@@ -174,7 +177,7 @@ export function localTtsSection(host: LocalTtsPanelHost & Partial<SettingsAccess
 
   const engineSel = h('select', { style: 'width:100%' });
   const voiceSel = h('select', { style: 'width:100%' });
-  const voiceRow = h('div', { class: 'row' }, h('label', {}, 'Голос: '), voiceSel);
+  const voiceRow = h('div', { class: 'row' }, h('label', {}, 'Голос модели: '), voiceSel);
   const rows = h('div', {});
   const testBtn = h('button', {}, 'Проверить голос');
   const stopBtn = h('button', { style: 'display:none' }, 'Стоп');
@@ -206,9 +209,12 @@ export function localTtsSection(host: LocalTtsPanelHost & Partial<SettingsAccess
   };
 
   const fillVoices = (): void => {
+    // only a per-voice-download engine (Piper) needs this picker: it selects WHICH voice file to download. The speaker voices
+    // (male / female) are chosen in the lists of the block "Перевод live-трансляций" (voicePicker). It used to be hidden for
+    // the default 'auto' engine, which is why the owner could not pick a voice at all.
     const id = choice === 'auto' ? undefined : choice;
-    voiceRow.style.display = id ? '' : 'none';
-    if (!id) return;
+    voiceRow.style.display = id && infoOf(id).perVoiceUnit ? '' : 'none';
+    if (!id || !infoOf(id).perVoiceUnit) return;
     const info = infoOf(id);
     voiceSel.replaceChildren(...info.voices.map((v) => h('option', { value: v.id }, v.label)));
     voiceSel.value = resolveVoice(id, voice);
@@ -255,20 +261,21 @@ export function localTtsSection(host: LocalTtsPanelHost & Partial<SettingsAccess
     fillRows();
   };
 
-  const saveChoice = async (): Promise<void> => {
-    await host.saveSettings?.({ localTtsEngine: choice, localTtsVoice: voice });
+  const saveChoice = async (patch: Partial<Settings> = {}): Promise<void> => {
+    await host.saveSettings?.({ localTtsEngine: choice, localTtsVoice: voice, ...patch });
   };
 
   engineSel.addEventListener('change', () => {
     choice = engineSel.value as LocalTtsChoice;
     voice = '';
     repaint();
-    void saveChoice();
+    void saveChoice({ localTtsVoiceMale: 'auto', localTtsVoiceFemale: 'auto' }); // voices belong to the engine
   });
   voiceSel.addEventListener('change', () => {
     voice = voiceSel.value;
     repaint();
-    void saveChoice();
+    const g = engineInfo(choice === 'auto' ? 'piper-wasm' : choice)?.voices.find((v) => v.id === voice)?.gender;
+    void saveChoice(g === 'm' ? { localTtsVoiceMale: voice } : g === 'f' ? { localTtsVoiceFemale: voice } : {});
   });
 
   let player: { stop(): void } | undefined;
@@ -292,7 +299,7 @@ export function localTtsSection(host: LocalTtsPanelHost & Partial<SettingsAccess
     testOut.textContent = `Синтез (${infoOf(id).label}, первый запуск дольше: загрузка модели)…`;
     try {
       const t0 = Date.now();
-      const r = await host.localTtsTest(id, v, LOCAL_TTS_SAMPLE_TEXT);
+      const r = await host.localTtsTest(id, v, stressedSample(id).long);
       const wall = (Date.now() - t0) / 1000;
       const rtf = r.durationSec > 0 ? r.ms / 1000 / r.durationSec : 0;
       testOut.className = 'hint ok';

@@ -23,6 +23,12 @@ export const decodeToPcm16k: Decoder = async (bytes) => {
   return toMono16k(chans, buf.sampleRate);
 };
 
+/** Lets the page (video, UI) run between two heavy decodes in a loop. */
+export function yieldToMain(): Promise<void> {
+  const sch = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+  return sch?.yield ? sch.yield() : new Promise<void>((r) => setTimeout(r, 0));
+}
+
 export function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);

@@ -21,7 +21,6 @@ const CSS = `
 .nvt-btn .nvt-icon{width:28px;height:28px;pointer-events:none}
 .nvt-btn.ytp-button{width:48px;height:100%}
 .nvt-btn[data-state=idle] .nvt-icon{filter:saturate(.9) brightness(.92)}
-.nvt-btn[data-state=active] .nvt-icon{filter:drop-shadow(0 0 5px rgba(60,230,120,.9))}
 .nvt-btn[data-state=loading] .nvt-icon{animation:nvt-pulse 1s ease-in-out infinite}
 .nvt-btn[data-state=error] .nvt-icon{filter:grayscale(1) brightness(.8)}
 .nvt-btn[data-state=error]::after{content:"";position:absolute;right:9px;top:11px;width:7px;height:7px;border-radius:50%;background:#ff4d4d}
@@ -31,8 +30,13 @@ const CSS = `
 .nvt-overlay{position:absolute;right:12px;top:45%;z-index:2147483000;width:40px;height:40px;border-radius:10px;
  background:rgba(0,0,0,.55);backdrop-filter:blur(4px);opacity:0;transition:opacity .2s;cursor:grab;touch-action:none}
 .nvt-overlay.nvt-drag{cursor:grabbing;transition:none;opacity:1}
-.nvt-overlay.nvt-show,.nvt-overlay:hover,.nvt-overlay:has(.nvt-btn:is([data-state=active],[data-state=loading])){opacity:1}
+.nvt-overlay.nvt-show,.nvt-overlay:hover,.nvt-overlay:not(.nvt-tw-fb):has(.nvt-btn:is([data-state=active],[data-state=loading])){opacity:1}
 .nvt-overlay .nvt-btn{width:100%;height:100%}
+.nvt-overlay.nvt-tw-fb{top:12px;right:12px}
+.nvt-btn.nvt-tw{width:30px;height:30px;margin:0 2px;flex:none;border-radius:.4rem;opacity:1;transition:background-color .1s}
+.nvt-btn.nvt-tw:hover{transform:none;background:rgba(255,255,255,.2)}
+.nvt-btn.nvt-tw .nvt-icon{width:22px;height:22px}
+.nvt-btn.nvt-tw[data-state=error]::after,.nvt-btn.nvt-tw[data-state=active]::after,.nvt-btn.nvt-tw[data-warn]:not([data-state=error])::after{right:2px;top:2px}
 `;
 
 function ensureStyle(doc: Document): void {
@@ -43,11 +47,16 @@ function ensureStyle(doc: Document): void {
   (doc.head ?? doc.documentElement).appendChild(s);
 }
 
-function makeButton(video: HTMLVideoElement, opts: PlayerButtonOptions, ytp: boolean): HTMLButtonElement {
+type ButtonKind = 'yt' | 'tw' | 'overlay';
+/** which <video> a mounted .nvt-btn belongs to (de-dupe of stale / duplicate buttons after player re-mounts) */
+const OWNERS = new WeakMap<Element, HTMLVideoElement>();
+
+function makeButton(video: HTMLVideoElement, opts: PlayerButtonOptions, kind: ButtonKind): HTMLButtonElement {
   const b = video.ownerDocument.createElement('button');
   b.type = 'button';
-  b.className = ytp ? 'ytp-button nvt-btn' : 'nvt-btn';
-  b.title = opts.title ?? 'NVT (Nova Video Translate)';
+  b.className = kind === 'yt' ? 'ytp-button nvt-btn' : kind === 'tw' ? 'nvt-btn nvt-tw' : 'nvt-btn';
+  OWNERS.set(b, video);
+  b.title = opts.title ?? 'NVT';
   b.setAttribute('aria-label', b.title);
   b.dataset.state = 'idle';
   b.append(createIconElement(video.ownerDocument));
@@ -146,70 +155,193 @@ function makeDraggable(overlay: HTMLElement, parent: HTMLElement): void {
   });
 }
 
-/** YouTube-like players: first child of the right control group (leftmost of the right-hand buttons). */
-function findControlsHost(video: HTMLVideoElement): HTMLElement | null {
+/** YouTube: the player root and its right control group (leftmost of the right-hand buttons is the first child). */
+function findControlsHost(video: HTMLVideoElement): { root: HTMLElement; host: HTMLElement | null } | null {
   const player = video.closest<HTMLElement>('.html5-video-player');
   if (!player) return null;
-  return player.querySelector<HTMLElement>('.ytp-right-controls');
+  return { root: player, host: player.querySelector<HTMLElement>('.ytp-right-controls') };
+}
+
+/** Twitch: the player root and its right control group (null while React has not rendered it / narrow layouts drop it). */
+function findTwitch(video: HTMLVideoElement): { root: HTMLElement; host: HTMLElement | null } | null {
+  const root = video.closest<HTMLElement>('.video-player') ?? video.closest<HTMLElement>('[data-a-target="video-player"], .video-player__container');
+  if (!root) return null;
+  return { root, host: root.querySelector<HTMLElement>('.player-controls__right-control-group') };
+}
+
+/** a control group that exists but is display:none / has no boxes (narrow Twitch layouts) cannot hold the button */
+function usable(host: HTMLElement | null): host is HTMLElement {
+  if (!host || !host.isConnected) return false;
+  try {
+    if (getComputedStyle(host).display === 'none') return false;
+    const rects = host.getClientRects?.();
+    if (rects && rects.length === 0) return false;
+  } catch {
+    // no layout engine: assume usable
+  }
+  return true;
 }
 
 // Sibling extensions that also prepend into the same container (NVS: Nova Video Saver). We sit right after
 // them and never re-order once placed, so two observers can never fight over the first slot.
 const SIBLING_IDS = ['nova-download-btn'];
 
+const HIDE_AFTER_MS = 3000;
+
 /**
- * Mounts the NVT button for one <video>. On YouTube it sits left of the right-hand player controls (next to
- * other extensions' buttons); elsewhere it is a hover overlay at the video's top-left corner.
- * A MutationObserver re-inserts it when the player re-renders (YouTube SPA navigation, ad breaks, etc.).
+ * Mounts the NVT button for one <video>. YouTube and Twitch: inside the right-hand control group, right after
+ * other extensions' buttons (NVS); elsewhere (or while the control group is missing / hidden) a hover overlay.
+ * Observers re-insert it when the player re-renders (SPA navigation, ad breaks, React re-renders, resize).
  */
 export function mountPlayerButton(video: HTMLVideoElement, opts: PlayerButtonOptions): PlayerButton {
   const doc = video.ownerDocument;
   ensureStyle(doc);
   let state: ButtonState = 'idle';
   let btn: HTMLButtonElement | null = null;
+  let btnKind: ButtonKind | null = null;
   let overlay: HTMLElement | null = null;
+  let overlayFb = false;
+  let overlayCleanup: (() => void) | null = null;
+  let anchored = false; // placed right after the sibling extension's button: never moved again
   let destroyed = false;
+
+  const dropOverlay = (): void => {
+    overlayCleanup?.();
+    overlayCleanup = null;
+    overlay?.remove();
+    overlay = null;
+  };
+
+  const ensureBtn = (kind: ButtonKind): HTMLButtonElement => {
+    if (!btn || btnKind !== kind) {
+      btn?.remove();
+      btn = makeButton(video, opts, kind);
+      btnKind = kind;
+    }
+    btn.dataset.state = state;
+    return btn;
+  };
+
+  /** removes buttons / overlays that are not ours and belong to this video or to videos that left the DOM */
+  const dedupe = (scope: ParentNode): void => {
+    scope.querySelectorAll<HTMLElement>('.nvt-btn').forEach((el) => {
+      if (el === btn) return;
+      const owner = OWNERS.get(el);
+      if (owner && owner !== video && owner.isConnected) return;
+      const wrap = el.parentElement;
+      el.remove();
+      if (wrap?.classList.contains('nvt-overlay') && wrap !== overlay) wrap.remove();
+    });
+  };
+
+  const findSibling = (scope: ParentNode): HTMLElement | undefined => {
+    for (const id of SIBLING_IDS) {
+      const el = scope.querySelector<HTMLElement>(`#${id}`) ?? doc.getElementById(id);
+      if (el) return el;
+    }
+    return undefined;
+  };
+
+  const placeInline = (kind: 'yt' | 'tw', root: HTMLElement, host: HTMLElement): void => {
+    dropOverlay();
+    dedupe(root);
+    const b = ensureBtn(kind);
+    const sib = findSibling(kind === 'yt' ? host : root);
+    if (sib && !anchored) {
+      // NVS exists (or appeared later): sit right after it, once
+      if (!(b.isConnected && b.previousElementSibling === sib)) sib.after(b);
+      anchored = true;
+      return;
+    }
+    if (b.isConnected && (b.parentElement === host || (sib && b.previousElementSibling === sib))) return; // never re-order
+    if (sib) sib.after(b);
+    else host.prepend(b);
+  };
+
+  const placeInOverlay = (parent: HTMLElement, fallback: boolean): void => {
+    if (overlay && overlay.parentElement === parent && overlayFb === fallback && btn && btn.parentElement === overlay) return;
+    dropOverlay();
+    dedupe(parent);
+    if (getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+    const ov = doc.createElement('div');
+    ov.className = fallback ? 'nvt-overlay nvt-tw-fb' : 'nvt-overlay';
+    overlay = ov;
+    overlayFb = fallback;
+    ov.appendChild(ensureBtn('overlay'));
+    parent.appendChild(ov);
+    if (fallback) {
+      // Twitch rhythm: controls appear on mouse move and fade after ~3 s of stillness / when the mouse leaves
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const show = (): void => {
+        ov.classList.add('nvt-show');
+        clearTimeout(timer);
+        timer = setTimeout(() => ov.classList.remove('nvt-show'), HIDE_AFTER_MS);
+      };
+      const hide = (): void => {
+        clearTimeout(timer);
+        ov.classList.remove('nvt-show');
+      };
+      parent.addEventListener('mousemove', show);
+      parent.addEventListener('mouseenter', show);
+      parent.addEventListener('mouseleave', hide);
+      overlayCleanup = () => {
+        clearTimeout(timer);
+        parent.removeEventListener('mousemove', show);
+        parent.removeEventListener('mouseenter', show);
+        parent.removeEventListener('mouseleave', hide);
+      };
+      return;
+    }
+    const saved = loadPos();
+    if (saved && parent.clientWidth > 0) placeOverlay(ov, parent, saved.x * parent.clientWidth, saved.y * parent.clientHeight);
+    makeDraggable(ov, parent);
+    const show = (): void => ov.classList.add('nvt-show');
+    const hide = (): void => ov.classList.remove('nvt-show');
+    parent.addEventListener('mouseenter', show);
+    parent.addEventListener('mouseleave', hide);
+    overlayCleanup = () => {
+      parent.removeEventListener('mouseenter', show);
+      parent.removeEventListener('mouseleave', hide);
+    };
+  };
 
   const place = (): void => {
     if (destroyed) return;
-    const host = findControlsHost(video);
-    if (host) {
-      overlay?.remove();
-      overlay = null;
-      if (!btn || btn.parentElement !== host) {
-        btn ??= makeButton(video, opts, true);
-        btn.dataset.state = state;
-        const sibling = SIBLING_IDS.map((id) => host.querySelector<HTMLElement>(`#${id}`)).find(Boolean);
-        if (sibling) sibling.after(btn);
-        else host.prepend(btn);
-      }
-      return;
+    const yt = findControlsHost(video);
+    if (yt?.host) return placeInline('yt', yt.root, yt.host);
+    const tw = yt ? null : findTwitch(video);
+    if (tw) {
+      if (usable(tw.host)) return placeInline('tw', tw.root, tw.host);
+      return placeInOverlay(tw.root, true); // control group missing / hidden: never leave the page without a button
     }
     const parent = video.parentElement;
-    if (!parent) return;
-    if (!overlay || overlay.parentElement !== parent) {
-      if (getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
-      overlay?.remove();
-      overlay = doc.createElement('div');
-      overlay.className = 'nvt-overlay';
-      btn = makeButton(video, opts, false);
-      btn.dataset.state = state;
-      overlay.appendChild(btn);
-      parent.appendChild(overlay);
-      const saved = loadPos();
-      if (saved && parent.clientWidth > 0) placeOverlay(overlay, parent, saved.x * parent.clientWidth, saved.y * parent.clientHeight);
-      makeDraggable(overlay, parent);
-      const show = (): void => overlay?.classList.add('nvt-show');
-      const hide = (): void => overlay?.classList.remove('nvt-show');
-      parent.addEventListener('mouseenter', show);
-      parent.addEventListener('mouseleave', hide);
-    }
+    if (parent) placeInOverlay(parent, false);
   };
 
+  const rootOf = (): Element => findControlsHost(video)?.root ?? findTwitch(video)?.root ?? video.parentElement ?? doc.body;
   place();
-  const root = video.closest('.html5-video-player') ?? video.parentElement ?? doc.body;
-  const mo = new MutationObserver(() => place());
+  let root = rootOf();
+  const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => place()) : undefined;
+  const mo = new MutationObserver(() => {
+    if (destroyed) return;
+    if (!root.isConnected) {
+      // the whole player was re-mounted: follow the video to its new container
+      const next = rootOf();
+      if (next !== root) {
+        root = next;
+        mo.disconnect();
+        mo.observe(root, { childList: true, subtree: true });
+        ro?.disconnect();
+        ro?.observe(root);
+      }
+    }
+    place();
+  });
   mo.observe(root, { childList: true, subtree: true });
+  // narrow / theater / fullscreen layouts hide or re-create the control group without necessarily mutating our subtree
+  ro?.observe(root);
+  const onFs = (): void => place();
+  doc.addEventListener('fullscreenchange', onFs);
 
   return {
     get el() {
@@ -222,8 +354,10 @@ export function mountPlayerButton(video: HTMLVideoElement, opts: PlayerButtonOpt
     destroy() {
       destroyed = true;
       mo.disconnect();
+      ro?.disconnect();
+      doc.removeEventListener('fullscreenchange', onFs);
+      dropOverlay();
       btn?.remove();
-      overlay?.remove();
     },
   };
 }

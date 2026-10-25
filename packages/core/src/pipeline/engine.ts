@@ -1,10 +1,22 @@
 /** TranslationEngine: capture -> prioritised chunk queue -> provider chain -> scheduler. */
 import { Rechunker } from '../capture/rechunk';
 import { diag } from '../diag';
-import { createCapture as defaultCreateCapture, type Capture, type CaptureKind, type CaptureStatus } from '../capture';
+import { createCapture as defaultCreateCapture, isHlsHost, strategiesForHost, type Capture, type CaptureKind, type CaptureStatus } from '../capture';
 import { DubScheduler, type BufferedRange, type DubSchedulerOptions } from '../playback/scheduler';
 import type { AudioChunk, DubProvider, DubSegment, ProviderId, SubtitleCue } from '../providers/types';
 import type { Settings } from '../types';
+import { siteVoiceOverride, withSiteOverride } from '../settings';
+import { LIVE_CHUNK_SEC, LiveDelayController, availableBackSec, SkipLog, isDefinitelyLive, isLiveVideo, resolveLiveDelaySec } from '../live/liveDelay';
+import {
+  LIVE_YANDEX_JOB_DEADLINE_MS,
+  LIVE_YANDEX_MAX_INFLIGHT,
+  YandexLiveGate,
+  qualityDelayCapSec,
+  qualityDelaySec,
+  qualityExtraJumpSec,
+} from '../live/liveQuality';
+import { localReasons, reasonText } from '../localasr';
+import { speechOnsetSec } from '../localasr/speechPlacement';
 import { PASS_CONFIDENCE, SKIP_CONFIDENCE, type LangVerdict } from '../lang/detect';
 import type { LangVerdictStore } from '../lang/store';
 import { findRussianDub, type AudioTracksController } from '../nativedub';
@@ -23,11 +35,31 @@ import {
   YANDEX_SUPER_CELLS,
   jobTimeoutMs,
   planCell,
+  PLAN_MARGIN_SEC,
   LIVE_CHUNK_CAP,
   upgradeDecision,
+  UPGRADE_LEAD_SEC,
   yandexTierCap,
   type CellPlan,
 } from './planner';
+
+/** the background hls probe: how often it starts while realtime is the fallback, and how long one try lasts */
+export const HLS_PROBE_EVERY_MS = 30_000;
+export const HLS_PROBE_RUN_MS = 45_000;
+
+/** watchdog (long-session self-healing): tick period, thresholds, minimum gap between restarts, health line period */
+export const WATCHDOG_TICK_MS = 5_000;
+export const STALL_NO_CHUNK_SEC = 25;
+export const STALL_NO_DUB_SEC = 60;
+export const STALL_CALIBRATING_SEC = 100;
+export const STALL_RESTART_GAP_MS = 30_000;
+export const HEALTH_EVERY_MS = 30_000;
+/** consecutive dubs that arrived already in the past, on a live realtime capture, before the watchdog tries to restore hls */
+export const STALL_LATE_DUBS = 3;
+/** the ads state held longer than this is treated as stuck (the DOM evidence is polled every 500 ms, so a real break never lasts this long) */
+export const ADS_STUCK_SEC = 300;
+/** chunk RMS above this counts as speech for the 'no dub although speech exists' watchdog */
+export const SPEECH_RMS = 0.01;
 
 export type EngineState = 'idle' | 'starting' | 'translating' | 'buffering' | 'skipped-ru' | 'native-dub' | 'error' | 'stopped';
 
@@ -84,12 +116,18 @@ export interface SchedulerLike {
   start(): void;
   dispose(): void;
   setVolume(v: number): void;
+  /** dub lag changed in the settings panel */
+  setDubLagSec?(v: number): void;
   getBuffered?(): BufferedRange[];
   /** drop matching segments (a playing one fades out); used when a tier is switched off */
   removeSegmentsWhere?(pred: (seg: DubSegment) => boolean, opts?: { fadeSec?: number; reason?: string }): number;
+  /** re-time matching segments by deltaSec without dropping them (a provisional clock offset was corrected) */
+  shiftSegmentsWhere?(pred: (seg: DubSegment) => boolean, deltaSec: number, opts?: { reason?: string; maxPlayingMoveSec?: number }): number;
 }
 
 export interface EngineDeps {
+  /** page host for per-site tier overrides (default location.hostname) */
+  host?: string;
   video: HTMLVideoElement;
   audioCtx: AudioContext;
   providers: DubProvider[];
@@ -111,6 +149,16 @@ export interface EngineDeps {
   hintSleep?: (ms: number, signal: AbortSignal) => Promise<void>;
   /** override of SLOW_START_HINT_MS */
   slowStartMs?: number;
+  /** cell length of the live 'hls' capture (default LIVE_CHUNK_SEC; tests use the VOD grid) */
+  liveChunkSec?: number;
+  /** how often the background hls probe runs while the capture is the realtime fallback (default HLS_PROBE_EVERY_MS) */
+  hlsProbeEveryMs?: number;
+  /** how long one probe tries to align before it gives up (default HLS_PROBE_RUN_MS) */
+  hlsProbeRunMs?: number;
+  /** watchdog tick period (default WATCHDOG_TICK_MS; tests call watchdogTick() themselves) */
+  watchdogMs?: number;
+  /** reload the local ASR (reset the offscreen queue / model) when the watchdog restarts a stalled pipeline */
+  resetLocalAsr?: () => Promise<void>;
   /** override of the per-tier latency priors (s), mainly for tests */
   latencyPriors?: Partial<Record<ProviderId, number>>;
   /** early language gate: absent = no gate (everything is translated, the provider decides) */
@@ -165,6 +213,24 @@ export const YANDEX_MAX_PARALLEL = 5;
 export const SLOW_START_HINT_MS = 40_000;
 /** a cell is "on time" when its slot starts at least this long after the expected arrival of its dub */
 const START_MARGIN_SEC = 3;
+/** rewind-when-ready: the playhead goes back to this long before the late dub's slot */
+const REWIND_MARGIN_SEC = 1;
+/**
+ * rewind policy (hls, auto delay): ONE seek per session part. A further jump only after >= EXTRA_REWIND_LATE_RUN consecutive late dubs and
+ * >= EXTRA_REWIND_MIN_GAP_MS since the last seek, by at most EXTRA_REWIND_MAX_SEC (each seek replays audio the viewer already heard).
+ */
+const EXTRA_REWIND_LATE_RUN = 3;
+const EXTRA_REWIND_MIN_GAP_MS = 60_000;
+const EXTRA_REWIND_MAX_SEC = 6;
+const EXTRA_REWIND_MIN_SEC = 3;
+/** quality mode: the single extra jump waits at least this long after the first rewind (the back-buffer must have grown) */
+const QUALITY_EXTRA_MIN_GAP_MS = 20_000;
+/** a provisional-offset correction never moves a dub that is playing right now by more than this */
+const RETIME_PLAYING_MAX_MOVE_SEC = 1;
+/** soft restarts (poller only, same session) the watchdog tries before it recreates the whole capture */
+const MAX_SOFT_RESTARTS = 2;
+/** a real clock alignment moving provisional dubs by more than this re-times them */
+const RETIME_MIN_SEC = 1.5;
 /** a hedge (same tier overran its own expectation) starts after this multiple of the tier's expected latency */
 const HEDGE_OVERRUN = 1.5;
 const HEDGE_MIN_MS = 15_000;
@@ -176,6 +242,10 @@ const MAX_QUEUED = 10;
 const RATE_BACKOFF_MS = 60_000;
 /** prerollPause: give up waiting and resume the video after this long */
 const PREROLL_MAX_MS = 60_000;
+/** a live HLS stream (Twitch) cannot be waited for as long: the preroll pause is capped here, counted from its start */
+export const PREROLL_LIVE_MAX_MS = 15_000;
+/** live capture: this many consecutive cells without speech end the preroll pause at once (nothing will come to wait for) */
+export const PREROLL_EMPTY_RELEASE = 2;
 /** short wait between "dub ready" and resuming, so the scheduler has decoded the first segment */
 const PREROLL_RESUME_DELAY_MS = 250;
 const MAX_CHUNK_RETRIES = 3;
@@ -242,6 +312,10 @@ export class TranslationEngine {
   private _state: EngineState = 'idle';
   private _active?: ProviderId;
   private settings: Settings;
+  /** the settings as given (before the site / live-video voice override) */
+  private rawSettings: Settings;
+  /** the video is a live stream (infinite duration, Twitch, or YouTube isLive): cloud tiers are off, live delay applies */
+  private liveVideo = false;
   private readonly chain = createChainState();
   private readonly tasks = new Map<number, Task>();
   private readonly doneRanges = new Map<number, number>();
@@ -296,6 +370,11 @@ export class TranslationEngine {
   private unverified = false;
   private langInfo?: LanguageInfo;
   private excluded = new Set<CaptureKind>();
+  /** a Twitch ad break is running (reported by the 'hls' capture or its probe): no live-delay seeks, the panel says why nothing is dubbed */
+  private adsActive = false;
+  /** background probe that brings 'hls' back after it was given up for 'realtime' (alignment kept failing outside an ad break) */
+  private hlsProbeTimer?: ReturnType<typeof setTimeout>;
+  private hlsProbe?: Capture;
   private gen = 0;
   /**
    * Bumped by every start() and every teardown(): an async continuation (probe, provider call, late race winner, cache
@@ -318,13 +397,93 @@ export class TranslationEngine {
   private pausedByUs = false;
   private selfPlay = false;
   private prerollCtrl?: AbortController;
+  private prerollAt = 0;
+  /** consecutive cells that came back without any speech (reset by a voiced cell and by every capture start) */
+  private emptyRun = 0;
+  private liveDelay?: LiveDelayController;
+  private yandexSkipLogAt = -Infinity;
+  /** cancel functions of the live-Yandex job cutoff timers, by attempt key */
+  private readonly capTimers = new Map<string, () => void>();
+  /** 'quality' live mode: sampling / backoff of Yandex requests, and the single extra jump already done */
+  private yandexGate = new YandexLiveGate(() => (this.deps.now ?? Date.now)());
+  private qualityExtraDone = false;
+  private liveSkips?: SkipLog;
+  /**
+   * rewind-when-ready: video-time slot (start + lag) of the first dub that arrived too late for its slot; the playhead is moved back
+   * by what that dub needs (limited by the ad-aware back-buffer) instead of waiting for a full back-buffer before translating
+   */
+  private rewindSlot?: number;
+  /** rewind policy: seeks done by the live-delay controller in this session, when the last one happened, and an extra jump being requested */
+  private rewinds = 0;
+  private lastRewindAt = -Infinity;
+  private extraRewindSec = 0;
+  private extraRewindAt = -Infinity;
+  /** segments produced from chunks stamped with a provisional clock offset, and the cells they belong to (cell -> duration) */
+  private provSegs = new WeakSet<DubSegment>();
+  private provCells = new Map<number, number>();
+  /** the real alignment's shift (new - provisional) once known; later results of provisional chunks are shifted by it */
+  private provShift?: number;
+  /** time-to-first-dub bookkeeping (diag 'ttfd'): ad time, capture alignment, first ASR result */
+  private ttfd: { logged: boolean; adMs: number; adSince?: number; alignAt?: number; asrMs?: number } = { logged: false, adMs: 0 };
+  /** consecutive voiced chunks whose segments were all already in the past on arrival */
+  private lateRun = 0;
+  // ---- watchdog / health ----
+  private wdTimer?: ReturnType<typeof setInterval>;
+  private wd = { chunksOut: 0, dubs: 0, capOpenedAt: 0, lastChunkAt: 0, lastDubAt: 0, speechSinceDub: undefined as number | undefined, playSince: undefined as number | undefined, lastRestartAt: -Infinity, lastHealthAt: 0, adsSince: undefined as number | undefined, lateDubs: 0, gapSince: undefined as number | undefined, gapLogged: false, softRestarts: 0 };
   /** last error of start()/capture switching, for the UI */
   lastError?: string;
+
+  /** playhead at the previous timeupdate / seeked (detects the Twitch player rebuilding its timeline) */
+  private lastCt = 0;
+
+  /**
+   * The live player rebuilt its buffer (pause/resume on Twitch: currentTime jumps to ~0 and the whole video clock is new). Every
+   * cell, dub and mapping keyed in the OLD clock is void: left alone, old dubs would play at their old times in the new clock
+   * (wrong content, early or late) and new cells with the same keys would be dropped as 'done'.
+   * @returns true when a reset was handled
+   */
+  private checkTimelineReset(ct: number): boolean {
+    const prev = this.lastCt;
+    this.lastCt = ct;
+    if (this.capture?.kind !== 'hls' || !(prev > 20) || !(ct < 2) || this.liveDelay?.ownSeekPending()) return false;
+    diag.log('timeline-reset', { ct, prev });
+    this.abortTasks();
+    this.doneRanges.clear();
+    this.kept.clear();
+    this.cellProvider.clear();
+    this.pendingSwaps.clear();
+    this.scheduler?.removeSegmentsWhere?.(() => true, { fadeSec: 0.1, reason: 'timeline-reset' });
+    this.segments = [];
+    this.cues = [];
+    this.dubReady = false;
+    this.provCells.clear();
+    this.provShift = undefined;
+    this.provSegs = new WeakSet();
+    // a new player timeline: the next late dub may rewind once again
+    this.rewindSlot = undefined;
+    this.extraRewindSec = 0;
+    this.rechunker?.reset(ct);
+    this.capture.invalidateClock?.('engine-reset');
+    this.capture.start(ct).catch((e) => this.fail(e));
+    this.updateReady();
+    return true;
+  }
 
   private readonly onSeeked = (): void => {
     if (this._state !== 'starting' && this._state !== 'translating' && this._state !== 'buffering') return;
     const ct = this.deps.video.currentTime;
-    const cs = this.settings.chunkSec;
+    if (this.liveDelay?.takeOwnSeek()) {
+      this.lastCt = ct;
+      // our own live-delay seek: the capture window restarts at the new position, the session and its queued cells stay
+      this.rechunker?.reset(ct);
+      this.capture?.start(ct).catch((e) => this.fail(e));
+      this.feedFromTrack();
+      this.pump();
+      this.updateReady();
+      return;
+    }
+    if (this.checkTimelineReset(ct)) return;
+    const cs = this.cellSec();
     let near = false;
     for (const [s, e] of this.doneRanges) if (ct >= s - cs && ct <= e + cs) near = true;
     for (const t of this.tasks.values()) {
@@ -348,6 +507,9 @@ export class TranslationEngine {
   };
 
   private readonly onTimeUpdate = (): void => {
+    if (this._state === 'starting' || this._state === 'translating' || this._state === 'buffering') {
+      if (this.checkTimelineReset(this.deps.video.currentTime)) return;
+    } else this.lastCt = this.deps.video.currentTime;
     if (this.tracks.size > 0) {
       this.feedFromTrack();
       this.pump();
@@ -365,13 +527,22 @@ export class TranslationEngine {
     this.emitPreparing();
   };
 
+  private hasLocalProvider(): boolean {
+    return this.deps.providers.some((p) => p.id === 'local');
+  }
+
   constructor(private readonly deps: EngineDeps) {
-    this.settings = deps.settings;
+    this.rawSettings = deps.settings;
+    this.settings = withSiteOverride(deps.settings, this.hostName());
     this.model = new LatencyModel(() => (deps.now ?? Date.now)(), { ...TIER_PRIOR_SEC, ...deps.latencyPriors });
   }
 
   get state(): EngineState {
     return this._state;
+  }
+  /** live stream (start-time detection incl. the YouTube isLive bridge flag, or the element right now) */
+  get live(): boolean {
+    return this.isLive();
   }
   get activeProvider(): ProviderId | undefined {
     return this._active;
@@ -396,17 +567,58 @@ export class TranslationEngine {
     await this.beginTranslation(gen);
   }
 
+  /** Live video (not Twitch: that one is a host rule): the cloud tiers are not requested, the live delay may apply. Decided once per start. */
+  private async detectLiveVideo(gen: number): Promise<void> {
+    const v = this.deps.video;
+    let via: string | undefined = isDefinitelyLive(v) ? 'duration' : undefined;
+    if (!via && this.deps.videoKey?.()?.startsWith('yt:')) {
+      try {
+        if ((await this.deps.audioTracks?.list())?.live) via = 'yt-isLive';
+      } catch {
+        /* no reader */
+      }
+      if (gen !== this.gen) return;
+      if (!via) {
+        const root = (v as { closest?: (q: string) => Element | null }).closest?.('.html5-video-player');
+        if (root?.querySelector('.ytp-time-display.ytp-live')) via = 'ytp-live';
+      }
+    }
+    if (!via) return;
+    this.liveVideo = true;
+    const before = this.settings;
+    this.settings = withSiteOverride(this.rawSettings, this.hostName(), true, this.hasLocalProvider());
+    const cloud = (['yandex-live', 'yandex', 'groq', 'gemini'] as ProviderId[]).some((id) => before.voiceEnabled[id] !== false);
+    diag.log('live-video', { via, cloudOff: cloud });
+    // informative only when the user's own chain had cloud voices that are now off
+    if (cloud && !siteVoiceOverride(this.hostName()) && this.settings.liveMode !== 'quality') localReasons.set('live', reasonText.live());
+  }
+
   /** the translation proper: providers, probes, capture (everything after the language gate and the native-dub check) */
   private async beginTranslation(gen: number): Promise<void> {
+    await this.detectLiveVideo(gen);
+    if (gen !== this.gen) return;
     await Promise.all(this.deps.providers.map((p) => (p.probe ? p.probe().catch(() => undefined) : undefined)));
     if (gen !== this.gen) return;
     this.usable = this.computeUsable();
+    if (this.liveVideo && this.settings.liveMode === 'quality') {
+      this.yandexGate = new YandexLiveGate(() => (this.deps.now ?? Date.now)());
+      this.qualityExtraDone = false;
+      diag.log('live-quality', { yandex: this.yandexUsable(), tiers: [...this.usable], capSec: qualityDelayCapSec(this.hostName()) });
+      if (!this.yandexUsable()) localReasons.set('quality-slow', reasonText.qualitySlow());
+    }
     diag.log('engine-start', {
       t: this.deps.video.currentTime,
-      chunkSec: this.settings.chunkSec,
+      chunkSec: this.cellSec(),
       order: this.settings.voiceOrder.join('>'),
       usable: [...this.usable],
       authSkip: [...this.chain.authSkip],
+      // why a tier of the chain is not used right away (no waiting for it): disabled in the settings / needs sign-in (no token) / not configured
+      skipped: Object.fromEntries(
+        this.deps.providers
+          .filter((p) => !this.usable.has(p.id))
+          .map((p) => [p.id, this.settings.voiceEnabled[p.id] === false ? 'disabled' : this.chain.authSkip.has(p.id) ? 'auth' : p.id === 'yandex-live' && !this.settings.yandexToken ? 'no-token' : 'not-configured']),
+      ),
+      first: this.topUsable(this.usable) ?? null,
       voice: this.settings.voiceEnabled,
       yandexToken: !!this.settings.yandexToken,
       ctx: this.deps.audioCtx.state,
@@ -418,6 +630,9 @@ export class TranslationEngine {
     this.deps.video.addEventListener('playing', this.onTimeUpdate);
     this.deps.video.addEventListener('play', this.onPlayEvent);
     this.listening = true;
+    this.startWatchdog();
+    // explicit delay (>= 3 s) starts now; liveDelaySec < 0 (auto) waits until the 'hls' capture is running (ensureLiveDelay)
+    if (this.settings.liveDelaySec >= 3) this.ensureLiveDelay();
     this.beginPreroll(gen);
     // re-emit the preparing state once the slow-start threshold passes (and every 5 s after, for wait -> switch changes)
     let ticks = 0;
@@ -439,8 +654,161 @@ export class TranslationEngine {
       if (!cap) return;
       this.rechunker?.reset(this.deps.video.currentTime);
       await cap.start(this.deps.video.currentTime);
+      this.ensureLiveDelay();
     } catch (e) {
       if (gen === this.gen) this.fail(e);
+    }
+  }
+
+  /** Cell grid in seconds: the live 'hls' capture uses a shorter one (settings.chunkSec stays the VOD grid). */
+  private cellSec(): number {
+    const hls = this.capture ? this.capture.kind === 'hls' : isHlsHost(this.hostName()) && !this.excluded.has('hls');
+    return hls ? Math.min(this.settings.chunkSec, this.deps.liveChunkSec ?? LIVE_CHUNK_SEC) : this.settings.chunkSec;
+  }
+
+  /** Live delay in seconds for the current setting and capture: explicit value, or auto (-1) = from the measured latency with the 'hls' capture, else 0. */
+  effectiveLiveDelaySec(): number {
+    if (this.qualityLive() && this.settings.liveDelaySec < 0) return this.qualityTotalDelaySec();
+    return resolveLiveDelaySec(this.settings.liveDelaySec, this.capture?.kind, this.cellSec(), this.latencySec(), this.lagSec(), this.isLive());
+  }
+
+  /** 'quality' live mode is on for this video and a Yandex tier can take part (otherwise it behaves as 'fast') */
+  private qualityLive(): boolean {
+    return this.liveVideo && this.settings.liveMode === 'quality' && this.yandexUsable();
+  }
+
+  /** total delay target of the quality mode: what is applied plus what the ad-aware back-buffer still holds, up to the site's cap */
+  private qualityTotalDelaySec(): number {
+    const applied = this.liveDelay?.appliedSec() ?? 0;
+    const v = this.deps.video;
+    const avail = availableBackSec(v, v.currentTime, this.capture?.adEndSec?.()).sec;
+    const cap = qualityDelayCapSec(this.hostName());
+    return Math.min(cap, applied + qualityDelaySec(avail, this.hostName()));
+  }
+
+  /** a live stream: detected at start (liveVideo) or reported by the element right now */
+  private isLive(): boolean {
+    return this.liveVideo || isLiveVideo(this.deps.video);
+  }
+
+  /** Dub lag (s): the slot of a phrase is its start + this (the scheduler shifts its timeline by the same amount). */
+  private lagSec(): number {
+    const v = this.settings.dubLagSec;
+    return typeof v === 'number' && Number.isFinite(v) ? Math.min(6, Math.max(0, v)) : 0;
+  }
+
+  /** auto live delay on the 'hls' capture (Twitch): translate at once, rewind when the first dub is ready (the player's back-buffer is short and holds ads) */
+  private rewindWhenReady(): boolean {
+    return this.settings.liveDelaySec < 0 && (this.capture?.kind === 'hls' || this.qualityLive());
+  }
+
+  /**
+   * The total delay the controller should apply. Explicit setting / already rewound: the effective (auto) delay. Rewind-when-ready, first
+   * rewind: only what the late dub needs = how far past its slot the playhead is + a 1 s margin.
+   */
+  private liveDelayWantedSec(): number {
+    const eff = this.effectiveLiveDelaySec();
+    if (!this.rewindWhenReady()) return eff;
+    // exactly ONE rewind per session part: once something is applied the wanted total stays there (no incremental re-seeks that replay
+    // content the viewer already heard); only an explicitly requested extra jump adds to it
+    const applied = this.liveDelay?.appliedSec() ?? 0;
+    if (applied > 0) return applied + this.extraRewindSec;
+    if (this.rewindSlot === undefined) return 0;
+    if (this.qualityLive() && this.settings.liveDelaySec < 0) return eff; // quality: straight to the largest safe delay, not only what this dub needs
+    return Math.min(60, Math.max(0, this.deps.video.currentTime - this.rewindSlot + REWIND_MARGIN_SEC));
+  }
+
+  /**
+   * rewind-when-ready: a dub just became ready. When its slot is already (nearly) gone, ask the live-delay controller to move the
+   * playhead back so it can still be heard. The controller limits the rewind to the ad-aware back-buffer.
+   */
+  private maybeRewindForDub(segments: DubSegment[]): void {
+    const ld = this.liveDelay;
+    if (!ld || !this.rewindWhenReady() || segments.length === 0) return;
+    if (ld.appliedSec() > 0) return this.maybeExtraRewind(ld);
+    const slot = Math.min(...segments.map((x) => x.start)) + this.lagSec();
+    const ct = this.deps.video.currentTime;
+    const needed = ct - slot + REWIND_MARGIN_SEC;
+    // quality mode: the first dub (local) is the cue to move to the largest safe delay even when its slot is still ahead (Yandex needs the time)
+    if (needed < 3 && !this.qualityLive()) return; // the slot is still ahead: nothing to catch up
+    this.rewindSlot = slot;
+    diag.log('rewind-ready', { slot: Math.round(slot * 100) / 100, ct: Math.round(ct * 100) / 100, neededSec: Math.round(needed * 10) / 10, adEnd: this.capture?.adEndSec?.() ?? null });
+    ld.requestRewind();
+  }
+
+  /**
+   * After the one rewind: another (small) jump only when dubs keep arriving late (>= 3 in a row), >= 60 s after the last seek, and the
+   * measured pipeline says more delay would help (auto delay > what is applied). Never more than EXTRA_REWIND_MAX_SEC.
+   */
+  private maybeExtraRewind(ld: LiveDelayController): void {
+    const now = this.nowMs();
+    if (this.qualityLive() && this.settings.liveDelaySec < 0) return this.maybeQualityExtraJump(ld, now);
+    if (this.lateRun < EXTRA_REWIND_LATE_RUN || now - this.lastRewindAt < EXTRA_REWIND_MIN_GAP_MS) return;
+    if (this.extraRewindSec > 0 && now - this.extraRewindAt < 70_000) return;
+    const want = Math.min(EXTRA_REWIND_MAX_SEC, this.effectiveLiveDelaySec() - ld.appliedSec());
+    if (want < EXTRA_REWIND_MIN_SEC) return;
+    this.extraRewindSec = want;
+    this.extraRewindAt = now;
+    diag.log('rewind-extra', { sec: Math.round(want * 10) / 10, lateRun: this.lateRun, sinceLastSec: Math.round((now - this.lastRewindAt) / 1000), applied: ld.appliedSec() });
+    ld.requestRewind();
+  }
+
+  /**
+   * Quality mode: ONE more jump after the first rewind, only when the back-buffer has grown (target not reached) and the jump replays
+   * at most QUALITY_EXTRA_JUMP_MAX_SEC. Never repeated.
+   */
+  private maybeQualityExtraJump(ld: LiveDelayController, now: number): void {
+    if (this.qualityExtraDone || this.extraRewindSec > 0 || now - this.lastRewindAt < QUALITY_EXTRA_MIN_GAP_MS) return;
+    const v = this.deps.video;
+    const avail = availableBackSec(v, v.currentTime, this.capture?.adEndSec?.()).sec;
+    const sec = qualityExtraJumpSec(avail, ld.appliedSec(), this.hostName());
+    if (sec <= 0) return;
+    this.qualityExtraDone = true;
+    this.extraRewindSec = sec;
+    this.extraRewindAt = now;
+    diag.log('rewind-extra', { mode: 'quality', sec: Math.round(sec * 10) / 10, applied: ld.appliedSec(), available: Math.round(avail * 10) / 10 });
+    ld.requestRewind();
+  }
+
+  /** (Re)evaluates whether the live-delay controller should run: it needs a live video and an effective delay >= 3 s. Cheap; called periodically. */
+  private ensureLiveDelay(): void {
+    const skip = (this.liveSkips ??= new SkipLog(this.deps.now));
+    // an ad break: the playing audio is the ad, the playhead must not be moved (the controller itself is suspended too)
+    if (this.adsActive) return skip.log('ads');
+    const v = this.deps.video;
+    // the Twitch player has no finite duration while it plays, but right after a pause/rebuild it can report anything: the 'hls' capture exists for live only
+    const live = this.isLive() || this.capture?.kind === 'hls';
+    const eff = this.effectiveLiveDelaySec();
+    const want = live && (eff >= 3 || (this.qualityLive() && this.settings.liveDelaySec < 0));
+    if (!want) {
+      if (!live) skip.log('not-live', { duration: v.duration, seekableEnd: v.seekable && v.seekable.length > 0 ? v.seekable.end(v.seekable.length - 1) : null });
+      else if (this.settings.liveDelaySec >= 0 && this.settings.liveDelaySec < 3) skip.log('setting<3', { setting: this.settings.liveDelaySec });
+      else skip.log('capture-no-lookahead', { kind: this.capture?.kind ?? null, setting: this.settings.liveDelaySec });
+    }
+    if (want && !this.liveDelay) {
+      this.liveDelay = new LiveDelayController({
+        video: v,
+        getDelaySec: () => this.liveDelayWantedSec(),
+        suspended: () => this.adsActive,
+        // never rewind into or across an ad break (the video time of the ad is not stream content)
+        adEnd: () => this.capture?.adEndSec?.(),
+        // auto (-1): rewind-when-ready, nothing is moved until a dub is waiting for it
+        gate: () => !this.rewindWhenReady() || this.rewindSlot !== undefined,
+        immediate: () => this.rewindWhenReady(),
+        onOwnSeek: () => {
+          this.capture?.noteOwnSeek?.();
+          this.rewinds++;
+          this.lastRewindAt = this.nowMs();
+          this.extraRewindSec = 0;
+        },
+        now: this.deps.now,
+      });
+      this.liveDelay.start();
+    } else if (!want && this.liveDelay && this.settings.liveDelaySec < 0) {
+      this.liveDelay.stop();
+      this.liveDelay = undefined;
+    } else if (want && this.liveDelay) {
+      this.liveDelay.reapply();
     }
   }
 
@@ -534,8 +902,14 @@ export class TranslationEngine {
     this.setState('stopped');
   }
 
-  updateSettings(s: Settings): void {
+  private hostName(): string {
+    return this.deps.host ?? (typeof location !== 'undefined' ? location.hostname : '');
+  }
+
+  updateSettings(raw: Settings): void {
     const prev = this.settings;
+    this.rawSettings = raw;
+    const s = withSiteOverride(raw, this.hostName(), this.liveVideo, this.hasLocalProvider());
     this.settings = s;
     const keysChanged = prev.geminiKeys.join('\n') !== s.geminiKeys.join('\n');
     if (prev.yandexToken !== s.yandexToken || prev.groqApiKey !== s.groqApiKey || keysChanged) this.chain.authSkip.clear();
@@ -547,6 +921,7 @@ export class TranslationEngine {
     } else if (prev.translationVolume !== s.translationVolume) {
       this.scheduler.setVolume(s.translationVolume);
     }
+    if (prev.dubLagSec !== s.dubLagSec) this.scheduler.setDubLagSec?.(this.lagSec());
   }
 
   // ---- tier switching (owner feedback #3) ----
@@ -663,7 +1038,7 @@ export class TranslationEngine {
   private chunksFromCapture = 0;
 
   private async openCapture(gen: number): Promise<Capture | undefined> {
-    const all: CaptureKind[] = ['mse', 'direct', 'realtime'];
+    const all: CaptureKind[] = strategiesForHost(this.hostName());
     const strategies = all.filter((k) => !this.excluded.has(k));
     if (strategies.length === 0) {
       this.fail(new Error('no capture strategy left'));
@@ -678,18 +1053,27 @@ export class TranslationEngine {
     if (gen !== this.gen) return cap;
     this.capture = cap;
     this.chunksFromCapture = 0;
+    this.emptyRun = 0;
+    this.wd.capOpenedAt = this.nowMs();
     diag.log('capture-open', { kind: cap.kind, strategies });
+    // a fallback away from hls on an hls host (offline / token error / no transport): same background probe as every other fallback
+    if (cap.kind !== 'hls' && isHlsHost(this.hostName()) && strategies.includes('hls')) {
+      this.excluded.add('hls');
+      this.armHlsProbe(gen);
+    }
+    if (cap.kind === 'hls') this.capPrerollForLive(gen);
     // fixed [k*chunkSec, (k+1)*chunkSec) cells: a second viewing produces identical chunk boundaries (result cache)
     const rc = new Rechunker({
-      chunkSec: this.settings.chunkSec,
+      chunkSec: this.cellSec(),
       emit: (c) => this.onChunk(c),
       // an incomplete cell that is still far enough ahead keeps waiting for its missing piece (a partial cell costs a
       // full request for little audio); once it is about to become late, the partial is better than nothing
-      // holdCellsToEnd: keep the cell until playback has passed its end (the rest of its audio is still coming)
+      // holdCellsToEnd (realtime captures only): keep the cell until playback has passed its end (the rest of its audio is still coming).
+      // Meaningless with the 'hls' capture (it has lookahead: cells arrive complete), where it is forced off and has no UI toggle.
       hold: (start) =>
-        this.settings.holdCellsToEnd
-          ? start + this.settings.chunkSec > this.deps.video.currentTime
-          : start > this.deps.video.currentTime + this.latencySec() + START_MARGIN_SEC,
+        this.settings.holdCellsToEnd && cap.kind !== 'hls'
+          ? start + this.cellSec() + this.lagSec() > this.deps.video.currentTime
+          : start + this.lagSec() > this.deps.video.currentTime + this.latencySec() + START_MARGIN_SEC,
     });
     this.rechunker = rc;
     // diagnostics: how far the player has buffered ahead of playback (the lead the capture can deliver in time)
@@ -697,18 +1081,275 @@ export class TranslationEngine {
     this.bufTimer = setInterval(() => {
       const b = v.buffered;
       const end = b && b.length > 0 ? b.end(b.length - 1) : v.currentTime;
-      diag.log('buf-ahead', { ct: v.currentTime, aheadSec: end - v.currentTime, ranges: b.length, kind: cap.kind });
+      diag.log('buf-ahead', { ct: v.currentTime, aheadSec: end - v.currentTime, ranges: b?.length ?? 0, kind: cap.kind });
+      if (cap.kind === 'hls' || this.isLive()) this.ensureLiveDelay();
     }, 3000);
     this.offChunk = cap.onChunk((c) => {
       this.chunksFromCapture++;
+      this.noteChunk(c);
+      if (cap.kind === 'mse') this.noteMseClock(c);
       this.archiveChunk(c, cap.kind);
       rc.push(c);
     });
     return cap;
   }
 
+  /**
+   * The real clock alignment replaced a provisional offset: slots of chunks emitted under it moved by `shift` (new - old). Only FUTURE
+   * cells use the real offset by themselves. Already scheduled provisional dubs are left alone when the difference is small; above
+   * RETIME_MIN_SEC they are re-timed in the scheduler (not dropped), the not yet running provisional cells ahead of the playhead are
+   * re-requested from the real mapping, and results of provisional chunks still in flight are shifted when they arrive.
+   */
+  private onRetime(shift: number): void {
+    this.provShift = shift;
+    const large = Math.abs(shift) > RETIME_MIN_SEC;
+    const ct = this.deps.video.currentTime;
+    let moved = 0;
+    if (large) {
+      moved = this.scheduler?.shiftSegmentsWhere?.((seg) => this.provSegs.has(seg), shift, { reason: 'provisional-offset', maxPlayingMoveSec: RETIME_PLAYING_MAX_MOVE_SEC }) ?? 0;
+      this.segments = this.segments.map((x) => (this.provSegs.has(x) ? { ...x, start: x.start + shift, end: x.end + shift } : x));
+      for (const [cell, dur] of this.provCells) {
+        if (cell + dur <= ct - 1) continue;
+        const t = this.tasks.get(cell);
+        if (t && t.status !== 'running') {
+          t.ctrl.abort();
+          this.tasks.delete(cell);
+        } else if (t) continue;
+        this.doneRanges.delete(cell);
+      }
+      // the capture re-delivers the audio after the playhead under the real mapping
+      this.rechunker?.reset(ct);
+      this.capture?.start(ct).catch((e) => this.fail(e));
+    }
+    this.provCells.clear();
+    this.provSegs = new WeakSet();
+    diag.log('align-retime', { shiftSec: shift, large, moved, ct, estimate: Math.abs(shift) > 0.5 });
+    this.pump();
+  }
+
+  /** diag 'ttfd', once per session at the first audible dub: where the time to the first voice went */
+  private logTtfd(): void {
+    const t = this.ttfd;
+    if (t.logged) return;
+    t.logged = true;
+    const nowMs = (this.deps.now ?? Date.now)();
+    const adMs = t.adMs + (t.adSince !== undefined ? nowMs - t.adSince : 0);
+    const r1 = (ms: number): number => Math.round(ms / 100) / 10;
+    diag.log('ttfd', {
+      sinceStartSec: r1(nowMs - this.startedAt),
+      adSec: r1(adMs),
+      alignSec: t.alignAt !== undefined ? r1(t.alignAt - this.startedAt) : null,
+      asrSec: t.asrMs !== undefined ? r1(t.asrMs) : null,
+      capture: this.capture?.kind ?? null,
+      rewound: this.liveDelay?.appliedSec() ?? 0,
+    });
+  }
+
+  // ---- watchdog ----
+
+  private nowMs(): number {
+    return (this.deps.now ?? Date.now)();
+  }
+
+  private mseClock: { lastLogAt: number; lastDelta?: number; gen: number } = { lastLogAt: -Infinity, gen: -1 };
+
+  /**
+   * MSE chunks are stamped tfdt + timestampOffset and used as video time as is. delta = (end of the newest decoded segment) - (end of
+   * the buffered range holding it): constant while both clocks agree; a jump means the DVR window / live edge moved or the player
+   * re-based its timeline, and every cell index (cache cell, slots) after it is off by that much.
+   */
+  private noteMseClock(c: AudioChunk): void {
+    const v = this.deps.video;
+    const b = v.buffered;
+    if (!b || b.length === 0) return;
+    const end = c.startSec + c.durationSec;
+    let bufEnd: number | undefined;
+    for (let i = 0; i < b.length; i++) if (b.start(i) - 1 <= end && end <= b.end(i) + 1) bufEnd = b.end(i);
+    if (bufEnd === undefined) return;
+    const m = this.mseClock;
+    if (m.gen !== this.gen) {
+      m.gen = this.gen;
+      m.lastDelta = undefined;
+      m.lastLogAt = -Infinity;
+    }
+    const delta = Math.round((end - bufEnd) * 1000) / 1000;
+    const t = this.nowMs();
+    if (m.lastDelta !== undefined && Math.abs(delta - m.lastDelta) > 0.5) {
+      diag.log('mse-clock-jump', { tfdtStart: c.startSec, ct: v.currentTime, delta, prev: m.lastDelta });
+    }
+    m.lastDelta = delta;
+    if (t - m.lastLogAt >= 30_000) {
+      m.lastLogAt = t;
+      diag.log('mse-clock', { tfdtStart: c.startSec, ct: v.currentTime, delta });
+    }
+  }
+
+  private noteChunk(c: AudioChunk): void {
+    const t = this.nowMs();
+    this.wd.chunksOut++;
+    this.wd.lastChunkAt = t;
+    this.wd.softRestarts = 0;
+    this.wd.gapSince = undefined;
+    this.wd.gapLogged = false;
+    if (c.pcm.length > 0) {
+      let sum = 0;
+      const n = Math.min(c.pcm.length, 16000);
+      for (let i = 0; i < n; i++) sum += (c.pcm[i]! / 32768) ** 2;
+      if (Math.sqrt(sum / Math.max(1, n)) > SPEECH_RMS) this.wd.speechSinceDub ??= t;
+    }
+    localReasons.clear('restart');
+  }
+
+  private noteDub(): void {
+    this.wd.dubs++;
+    this.wd.lastDubAt = this.nowMs();
+    this.wd.speechSinceDub = undefined;
+  }
+
+  private startWatchdog(): void {
+    this.stopWatchdog();
+    const t = this.nowMs();
+    this.wd = { ...this.wd, capOpenedAt: t, lastChunkAt: 0, lastDubAt: 0, speechSinceDub: undefined, playSince: this.deps.video.paused ? undefined : t, lastHealthAt: t, lastRestartAt: -Infinity, adsSince: undefined, lateDubs: 0, gapSince: undefined, gapLogged: false, softRestarts: 0 };
+    this.wdTimer = setInterval(() => this.watchdogTick(), this.deps.watchdogMs ?? WATCHDOG_TICK_MS);
+  }
+
+  private stopWatchdog(): void {
+    clearInterval(this.wdTimer);
+    this.wdTimer = undefined;
+  }
+
+  private alignedFlag(): boolean | null {
+    const c = this.capture as unknown as { state?: () => { aligned: boolean } } | undefined;
+    return this.capture?.kind === 'hls' ? (c?.state?.().aligned ?? null) : null;
+  }
+
+  private stallFlags(): Record<string, unknown> {
+    const v = this.deps.video;
+    return {
+      ads: this.adsActive,
+      aligned: this.alignedFlag(),
+      capture: this.capture?.kind ?? null,
+      asrQueue: [...this.tasks.values()].filter((x) => x.status === 'running').length,
+      queued: this.tasks.size,
+      state: this._state,
+      ct: Math.round(v.currentTime * 10) / 10,
+      lastError: this.lastError ?? null,
+    };
+  }
+
+  /**
+   * Long-session self-healing. Called every WATCHDOG_TICK_MS while a session runs (public for tests). Logs a compact 'health' line
+   * every 30 s and, when the video plays but nothing comes out, logs 'stall' and restarts the capture (token + playlist + realign),
+   * at most once per STALL_RESTART_GAP_MS. The reason surfaces through the local-reason line (no banner).
+   */
+  watchdogTick(): void {
+    if (this._state !== 'starting' && this._state !== 'translating' && this._state !== 'buffering') return;
+    const v = this.deps.video;
+    const t = this.nowMs();
+    const w = this.wd;
+    const playing = !v.paused && !v.ended;
+    if (!playing) w.playSince = undefined;
+    else w.playSince ??= t;
+    const ago = (x: number): number | null => (x > 0 ? Math.round((t - x) / 100) / 10 : null);
+    if (t - w.lastHealthAt >= HEALTH_EVERY_MS) {
+      w.lastHealthAt = t;
+      const f = this.stallFlags();
+      diag.log('health', { chunksOut: w.chunksOut, dubsScheduled: w.dubs, lastChunkAgoSec: ago(w.lastChunkAt), lastDubAgoSec: ago(w.lastDubAt), asrQueue: f.asrQueue, adsState: this.adsActive, aligned: f.aligned, capture: f.capture, playing, rewinds: this.rewinds, gaps: this.capture?.gapCount?.() ?? 0 });
+    }
+    if (!playing || !this.capture) return;
+    let what: string | undefined;
+    let sinceSec = 0;
+    if (this.adsActive) {
+      if (w.adsSince !== undefined && (t - w.adsSince) / 1000 > ADS_STUCK_SEC) {
+        what = 'ads-stuck';
+        sinceSec = (t - w.adsSince) / 1000;
+      }
+    } else {
+      const ref = Math.max(w.lastChunkAt, w.capOpenedAt, w.playSince ?? 0);
+      // an hls capture that is still calibrating (first alignment takes ~40 s) is not stalled
+      const calibrating = this.capture.kind === 'hls' && this.alignedFlag() !== true;
+      if ((t - ref) / 1000 > (calibrating ? STALL_CALIBRATING_SEC : STALL_NO_CHUNK_SEC)) {
+        what = 'no-chunks';
+        sinceSec = (t - ref) / 1000;
+      } else if (w.speechSinceDub !== undefined && (t - Math.max(w.speechSinceDub, w.playSince ?? 0)) / 1000 > STALL_NO_DUB_SEC) {
+        what = 'no-dubs';
+        sinceSec = (t - w.speechSinceDub) / 1000;
+      } else if (w.lateDubs >= STALL_LATE_DUBS && this.capture.kind === 'realtime' && isHlsHost(this.hostName())) {
+        what = 'late-dubs';
+        sinceSec = w.lateDubs;
+      }
+    }
+    if (!what) {
+      w.gapSince = undefined;
+      w.gapLogged = false;
+      return;
+    }
+    // The anonymous playlist carries stitched-ad segments (a 'gap'): no content audio from OUR stream for up to ~30 s although the capture is
+    // healthy and the player shows no ad. Restarting would only create a new anonymous usher session (another preroll ad + a re-alignment).
+    if ((what === 'no-chunks' || what === 'no-dubs') && this.capture.inGap?.()) {
+      w.gapSince ??= t;
+      if ((t - w.gapSince) / 1000 <= ADS_STUCK_SEC) {
+        if (!w.gapLogged) {
+          w.gapLogged = true;
+          diag.log('stall', { what: 'gap', sinceSec: Math.round(sinceSec * 10) / 10, gaps: this.capture.gapCount?.() ?? 0, ...this.stallFlags() });
+        }
+        return;
+      }
+    }
+    if (t - w.lastRestartAt < STALL_RESTART_GAP_MS) return;
+    w.lastRestartAt = t;
+    diag.log('stall', { what, sinceSec: Math.round(sinceSec * 10) / 10, ...this.stallFlags() });
+    this.restartForStall(what);
+  }
+
+  private restartForStall(what: string): void {
+    const ct = this.deps.video.currentTime;
+    localReasons.set('restart', reasonText.restart());
+    this.setAds(false);
+    this.lateRun = 0;
+    this.wd.lateDubs = 0;
+    this.wd.speechSinceDub = undefined;
+    // results of cells around the playhead may have been lost with the dead pipeline (or with a reset player): allow re-requests
+    for (const [s, e] of [...this.doneRanges]) if (e > ct - 2) this.doneRanges.delete(s);
+    if (what === 'late-dubs' || this.excluded.has('hls')) {
+      this.excluded.delete('hls');
+      this.stopHlsProbe();
+    }
+    const reset = this.deps.resetLocalAsr;
+    if (reset && what !== 'late-dubs') void reset().catch((e) => diag.log('asr-reset-failed', { message: String((e as Error)?.message ?? e).slice(0, 100) }));
+    this.rechunker?.reset(ct);
+    // hls: restart only the poller (same media URL / token, the aligned clock or the remembered offset stays); a full capture restart
+    // creates a new anonymous Twitch session. Only when soft restarts did not bring chunks back is the capture recreated.
+    const cap = this.capture;
+    if (cap?.kind === 'hls' && cap.softRestart && what !== 'late-dubs' && this.wd.softRestarts < MAX_SOFT_RESTARTS) {
+      this.wd.softRestarts++;
+      cap.softRestart(what);
+      void cap.start(ct).catch((e) => this.fail(e));
+      return;
+    }
+    void this.switchCapture();
+  }
+
+  private setAds(active: boolean): void {
+    if (this.adsActive === active) return;
+    this.adsActive = active;
+    const nowMs = (this.deps.now ?? Date.now)();
+    if (active) this.ttfd.adSince = nowMs;
+    else if (this.ttfd.adSince !== undefined) {
+      this.ttfd.adMs += nowMs - this.ttfd.adSince;
+      this.ttfd.adSince = undefined;
+    }
+    this.wd.adsSince = active ? nowMs : undefined;
+    diag.log('ads-state', { active });
+    if (active) localReasons.set('ads', reasonText.ads());
+    else localReasons.clear('ads');
+  }
+
   private onCaptureStatus(st: CaptureStatus, gen: number): void {
     if (gen !== this.gen) return;
+    if (st.type === 'ads') return this.setAds(st.active);
+    if (st.type === 'aligned' || st.type === 'provisional') this.ttfd.alignAt ??= (this.deps.now ?? Date.now)();
+    if (st.type === 'retime') return this.onRetime(st.shiftSec);
     if (st.type !== 'tainted' && st.type !== 'unsupported') return;
     const kind = this.capture?.kind;
     if (st.type === 'tainted') {
@@ -717,7 +1358,89 @@ export class TranslationEngine {
       if (this.chunksFromCapture > 0) return;
     }
     if (kind) this.excluded.add(kind);
+    // alignment kept failing outside an ad break: realtime serves meanwhile, hls is probed in the background and taken back
+    // EVERY way hls can fail (align-failed, tainted, offline, token/poll errors) keeps the background probe: realtime has no lookahead
+    // (every dub is late), so hls is taken back as soon as one probe aligns
+    if (kind === 'hls') {
+      this.setAds(false);
+      if (st.type === 'unsupported') {
+        diag.log('hls-lost', { reason: st.reason });
+        this.armHlsProbe(gen);
+      }
+    }
     void this.switchCapture();
+  }
+
+  // ---- background hls probe ----
+
+  private armHlsProbe(gen: number): void {
+    clearTimeout(this.hlsProbeTimer);
+    this.hlsProbeTimer = setTimeout(() => void this.runHlsProbe(), this.deps.hlsProbeEveryMs ?? HLS_PROBE_EVERY_MS);
+    void gen;
+  }
+
+  private stopHlsProbe(): void {
+    clearTimeout(this.hlsProbeTimer);
+    this.hlsProbeTimer = undefined;
+    const p = this.hlsProbe;
+    this.hlsProbe = undefined;
+    try {
+      p?.stop();
+    } catch {
+      /* already stopped */
+    }
+  }
+
+  /** one lightweight alignment attempt with a second HlsCapture that delivers no chunks; success switches the engine back to hls */
+  private async runHlsProbe(): Promise<void> {
+    this.hlsProbeTimer = undefined;
+    const gen = this.gen;
+    if (this.capture?.kind === 'hls' || !this.excluded.has('hls') || this.hlsProbe) return;
+    if (this._state !== 'translating' && this._state !== 'starting' && this._state !== 'buffering') return;
+    let inAds = false;
+    let done = false;
+    const finish = (switchBack: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(watchdog);
+      this.stopHlsProbe();
+      if (inAds) this.setAds(false);
+      if (gen !== this.gen) return;
+      if (switchBack) {
+        diag.log('hls-probe', { ok: true });
+        this.excluded.delete('hls');
+        this.setAds(false);
+        void this.switchCapture();
+      } else {
+        if (!inAds) diag.log('hls-probe', { ok: false });
+        this.armHlsProbe(gen);
+      }
+    };
+    const watchdog = setTimeout(() => finish(false), this.deps.hlsProbeRunMs ?? HLS_PROBE_RUN_MS);
+    try {
+      const create = this.deps.createCapture ?? defaultCreateCapture;
+      const cap = await create(this.deps.video, {
+        chunkSec: this.settings.chunkSec,
+        strategies: ['hls'],
+        onStatus: (st) => {
+          if (done || gen !== this.gen) return;
+          if (st.type === 'aligned') finish(true);
+          else if (st.type === 'ads') {
+            inAds = st.active;
+            this.setAds(st.active);
+          } else if (st.type === 'unsupported' || st.type === 'tainted') finish(false);
+        },
+      });
+      if (done || gen !== this.gen || cap.kind !== 'hls') {
+        cap.stop();
+        if (!done) finish(false);
+        return;
+      }
+      this.hlsProbe = cap;
+      await cap.start(this.deps.video.currentTime);
+    } catch {
+      finish(false);
+    }
   }
 
   private async switchCapture(): Promise<void> {
@@ -740,6 +1463,7 @@ export class TranslationEngine {
       }
       if (!cap) return;
       await cap.start(this.deps.video.currentTime);
+      this.ensureLiveDelay();
     } catch (e) {
       if (gen === this.gen) this.fail(e);
     }
@@ -785,7 +1509,8 @@ export class TranslationEngine {
       diag.log('chunk-stale', { cell: c.startSec, dur: c.durationSec, ct: this.deps.video.currentTime });
       return;
     }
-    diag.log('chunk-queued', { cell: c.startSec, dur: c.durationSec, partial: !!c.partial, ct: this.deps.video.currentTime, kind: this.capture?.kind });
+    if (c.provisional) this.provCells.set(c.startSec, c.durationSec);
+    diag.log('chunk-queued', { cell: c.startSec, dur: c.durationSec, partial: !!c.partial, ct: this.deps.video.currentTime, kind: this.capture?.kind, ...(c.provisional ? { provisional: true } : {}) });
     this.tasks.set(c.startSec, { chunk: c, status: 'queued', attempts: 0, noTierWaits: 0, ctrl: new AbortController() });
     if (!this.dubReady && this._state === 'starting') this.emitPreparing();
     this.pumpSoon();
@@ -806,7 +1531,9 @@ export class TranslationEngine {
 
   private isStale(c: AudioChunk): boolean {
     // a realtime tap can only deliver a cell after it was played, so its dub is always late: keep such cells for rewinds
-    const lim = this.capture?.kind === 'realtime' ? 120 : STALE_SEC;
+    let lim = this.capture?.kind === 'realtime' ? 120 : STALE_SEC;
+    // rewind-when-ready: a cell the playhead has passed is still worth dubbing while the first rewind can reach its slot (ad-aware back-buffer)
+    if (this.rewindWhenReady() && (this.liveDelay?.appliedSec() ?? 0) === 0) lim = Math.max(lim, availableBackSec(this.deps.video, this.deps.video.currentTime, this.capture?.adEndSec?.()).sec - 1);
     return c.startSec + c.durationSec < this.deps.video.currentTime - lim;
   }
 
@@ -854,9 +1581,11 @@ export class TranslationEngine {
         this.tasks.delete(key);
         continue;
       }
-      const end = c.startSec + c.durationSec;
+      const lag = this.lagSec();
+      const slot = c.startSec + lag;
+      const end = c.startSec + c.durationSec + lag;
       let g: number;
-      if (lat > 0) g = c.startSec >= arrive + START_MARGIN_SEC ? 0 : end - arrive >= LATE_TAIL_SEC ? 1 : 2;
+      if (lat > 0) g = slot >= arrive + START_MARGIN_SEC ? 0 : end - arrive >= LATE_TAIL_SEC ? 1 : 2;
       else g = end > ct ? 0 : 2;
       if (t.revoice && g > 0) g = 1;
       queued.push({ t, g });
@@ -926,6 +1655,7 @@ export class TranslationEngine {
 
   private tierCap(id: ProviderId): number {
     let cap = id === 'gemini' ? GEMINI_MAX_PARALLEL : id === 'groq' ? GROQ_MAX_PARALLEL : id === 'local' ? LOCAL_MAX_PARALLEL : id === 'yandex-live' ? LIVE_CHUNK_CAP : this.yandexCap();
+    if (this.qualityLive() && TranslationEngine.isYandexId(id)) cap = Math.min(cap, LIVE_YANDEX_MAX_INFLIGHT);
     if ((this.deps.now ?? Date.now)() < this.rateUntil) cap = Math.min(cap, this.rateCap);
     return Math.max(1, cap);
   }
@@ -938,6 +1668,8 @@ export class TranslationEngine {
 
   /** Cells (tasks) in flight: the Yandex cap when Yandex is usable (plus Gemini's own), else Gemini's. Halved after a rate-limit-like answer. */
   private concurrency(): number {
+    // quality live mode: a cell's task ends with the local dub (Yandex jobs go on in the background under their own cap)
+    if (this.qualityLive()) return LOCAL_MAX_PARALLEL + 1;
     let cap = this.isYandexTier() ? this.yandexCap() : 0;
     if (this.usable.has('gemini')) cap += GEMINI_MAX_PARALLEL;
     if (this.usable.has('groq')) cap += GROQ_MAX_PARALLEL;
@@ -951,13 +1683,14 @@ export class TranslationEngine {
   private planTask(task: Task): { plan: CellPlan; blocked: boolean; tts: number } {
     const now = (this.deps.now ?? Date.now)();
     const c = task.chunk;
-    const tts = c.startSec - this.deps.video.currentTime;
+    const tts = c.startSec + this.lagSec() - this.deps.video.currentTime;
     const ft = this.trackTierFor(c);
     if (ft) return { plan: { start: [ft], preferred: ft, reason: 'full-track', inTime: [ft], late: false }, blocked: false, tts };
     const all = eligibleProviders(this.deps.providers, this.settings, this.chain, now);
     const free = all.filter((p) => this.tierActive(p.id) < this.tierCap(p.id));
     if (all.length === 0) return { plan: { start: [], reason: 'no-tier', inTime: [], late: true }, blocked: false, tts }; // the chain reports "no tier"
     if (free.length === 0) return { plan: { start: [], reason: 'no-tier', inTime: [], late: true }, blocked: true, tts };
+    if (this.qualityLive() && !task.revoice && all.some((p) => p.id === 'local')) return this.planLiveQuality(task, all, free, tts);
     // a pinned (full-track) tier is fast only for the cells its track covers; this cell is not covered, so it runs at its chunk-mode speed
     // D26 live policy (chunk mode): the live tier starts only for a cell whose slot is at least its expected latency away
     // (the server ETA of a live job is 500-750 s); it never runs as the fall-through of a cell it was gated out of
@@ -983,12 +1716,41 @@ export class TranslationEngine {
     return { plan, blocked: false, tts };
   }
 
+  /**
+   * 'quality' live mode: the local tier runs for EVERY cell (the safety net); the Yandex gate adds at most one Yandex tier (sampling for
+   * evidence, then only when the latency model says it fits before the slot). A Yandex dub that arrives >= UPGRADE_LEAD_SEC before the
+   * slot replaces the local one (onLateWin -> applyUpgrade); a later one is kept for rewinds only.
+   */
+  private planLiveQuality(task: Task, all: DubProvider[], free: DubProvider[], tts: number): { plan: CellPlan; blocked: boolean; tts: number } {
+    const dur = task.chunk.durationSec;
+    if (!free.some((p) => p.id === 'local')) return { plan: { start: [], reason: 'no-tier', inTime: [], late: true }, blocked: true, tts };
+    const tierOf = (p: DubProvider): { id: ProviderId; expectedSec: number } => ({ id: p.id, expectedSec: this.model.expectedSec(p.id, dur) });
+    const yAll = all.filter((p) => TranslationEngine.isYandexId(p.id)).map(tierOf);
+    const yBusy = this.tierActive('yandex') + this.tierActive('yandex-live') >= LIVE_YANDEX_MAX_INFLIGHT;
+    const yFree = yBusy ? [] : free.filter((p) => TranslationEngine.isYandexId(p.id)).map(tierOf);
+    const budget = Math.max(tts, (this.liveDelay?.appliedSec() ?? 0) + this.lagSec());
+    const d = yAll.length === 0 ? { send: [] as ProviderId[], reason: 'busy' as const, backoff: undefined } : this.yandexGate.decide({ ttsSec: tts, budgetSec: budget, tiers: yFree, all: yAll });
+    const nowMs = this.deps.now ?? Date.now;
+    if (d.reason === 'probe' || d.reason === 'in-time') localReasons.clear('quality-slow');
+    if (d.backoff) {
+      localReasons.set('quality-slow', reasonText.qualitySlow());
+      diag.log('yandex-live-skip', { why: 'too-slow', results: d.backoff.results, expS: Math.round(d.backoff.bestExpectedSec * 10) / 10, budgetS: Math.round(d.backoff.budgetSec * 10) / 10, backoffMin: 5 });
+    } else if (d.reason === 'late' && this.yandexSkipLogAt + 30_000 <= nowMs()) {
+      this.yandexSkipLogAt = nowMs();
+      diag.log('yandex-live-skip', { why: 'cell-late', cell: task.chunk.startSec, tts: Math.round(tts * 10) / 10, exp: Object.fromEntries(yAll.map((t) => [t.id, Math.round(t.expectedSec * 10) / 10])) });
+    }
+    const start: ProviderId[] = [...d.send, 'local'];
+    const inTime = yAll.filter((t) => d.send.includes(t.id) && t.expectedSec + PLAN_MARGIN_SEC <= tts).map((t) => t.id);
+    return { plan: { start, preferred: start[0], reason: 'live-quality', inTime: [...inTime, 'local'], late: false }, blocked: false, tts };
+  }
+
   /** whole-job deadline (ms) of a Yandex tier's attempt, evaluated when the attempt starts */
   private deadlineFor(id: ProviderId, task: Task): number | undefined {
     if (id === 'gemini' || id === 'groq' || id === 'local') return undefined;
+    if (this.qualityLive()) return LIVE_YANDEX_JOB_DEADLINE_MS;
     const c = task.chunk;
     const ct = this.deps.video.currentTime;
-    return jobTimeoutMs(c.startSec - ct, ct >= c.startSec + c.durationSec, this.model.expectedSec(id, c.durationSec));
+    return jobTimeoutMs(c.startSec + this.lagSec() - ct, ct >= c.startSec + c.durationSec + this.lagSec(), this.model.expectedSec(id, c.durationSec));
   }
 
   private onRateSignal(id: ProviderId, status?: number): void {
@@ -1009,7 +1771,7 @@ export class TranslationEngine {
     const tierIds = this.deps.providers.map((p) => p.id);
     diag.log('cell-plan', {
       cell: key,
-      tts: Math.round((key - ct0) * 10) / 10,
+      tts: Math.round((key + this.lagSec() - ct0) * 10) / 10,
       exp: this.model.snapshot(tierIds),
       start: plan.start,
       pref: plan.preferred,
@@ -1052,6 +1814,7 @@ export class TranslationEngine {
           warn: (w) => this.deps.events?.onWarning?.(w),
           sourceLang: this.sourceLang,
           getSettings: () => this.settings,
+          isLive: () => this.isLive(),
           hedgeAfterMs,
           hedgeTimer: this.deps.hedgeTimer,
           plan: plan.start,
@@ -1063,6 +1826,7 @@ export class TranslationEngine {
             diag.log('latency-hint', { tier: id, remainingS: Math.round(sec) });
           },
           onLatency: (id, ms, censored) => this.onLatency(id, ms, censored, task.chunk.durationSec),
+          onTierResult: (id, ok, ms) => this.noteYandexResult(task, id, ok, ms),
           onLate: (win) => {
             if (session !== this.session) {
               diag.log('stale-drop', { where: 'late-win', why: 'session', cell: key, tier: win.providerId });
@@ -1076,8 +1840,11 @@ export class TranslationEngine {
             if (abort) {
               task.provider = id;
               this.liveAttempts.set(k, { id, abort });
+              this.capLiveYandexAttempt(task, id, k, abort);
             } else {
               this.liveAttempts.delete(k);
+              this.capTimers.get(k)?.();
+              this.capTimers.delete(k);
               if (task.provider === id) task.provider = undefined;
             }
             if (!abort) this.pump();
@@ -1194,7 +1961,7 @@ export class TranslationEngine {
     const ct0 = this.deps.video.currentTime;
     diag.log('cell-plan', {
       cell: key,
-      tts: Math.round((key - ct0) * 10) / 10,
+      tts: Math.round((key + this.lagSec() - ct0) * 10) / 10,
       exp: this.model.snapshot(this.deps.providers.map((p) => p.id)),
       start: ids,
       pref: plan.preferred,
@@ -1231,7 +1998,7 @@ export class TranslationEngine {
     };
     const deadline = (id: ProviderId): number => {
       const ct = this.deps.video.currentTime;
-      return jobTimeoutMs(key - ct, ct >= key + total, this.model.expectedSec(id, total));
+      return jobTimeoutMs(key + this.lagSec() - ct, ct >= key + total + this.lagSec(), this.model.expectedSec(id, total));
     };
     const attempt = (dup: boolean, ac: AbortController): Promise<ChainOutcome> => {
       const state: ChainState = dup ? createChainState() : this.chain;
@@ -1253,6 +2020,7 @@ export class TranslationEngine {
           },
           sourceLang: this.sourceLang,
           getSettings: () => this.settings,
+          isLive: () => this.isLive(),
           hedgeAfterMs: 0,
           plan: ids,
           skip: plan.skip,
@@ -1382,6 +2150,43 @@ export class TranslationEngine {
     if (last !== undefined && t - last < everyMs) return;
     this.lastWarnAt.set(key, t);
     this.deps.events?.onWarning?.(w);
+  }
+
+  /**
+   * Evidence of the quality live mode: one diag line per finished Yandex request ('yandex-live-lat'), and the gate's result count.
+   * `late` = the dub arrived less than UPGRADE_LEAD_SEC before its slot (it would not replace the local dub).
+   */
+  private noteYandexResult(task: Task, id: ProviderId, ok: boolean, ms: number): void {
+    if (!TranslationEngine.isYandexId(id) || !this.qualityLive()) return;
+    this.yandexGate.record();
+    const c = task.chunk;
+    const tts = c.startSec + this.lagSec() - this.deps.video.currentTime;
+    diag.log('yandex-live-lat', { tier: id, cells: 1, audioSec: Math.round(c.durationSec * 10) / 10, ms: Math.round(ms), ok, late: tts < UPGRADE_LEAD_SEC, tts: Math.round(tts * 10) / 10 });
+  }
+
+  /** a live Yandex job is cut off after LIVE_YANDEX_JOB_DEADLINE_MS (+5 s) whatever its server ETA says: later than any delay target is useless */
+  private capLiveYandexAttempt(task: Task, id: ProviderId, key: string, abort: () => void): void {
+    if (!TranslationEngine.isYandexId(id) || !this.qualityLive()) return;
+    const att = this.liveAttempts.get(key);
+    const t0 = (this.deps.now ?? Date.now)();
+    const ac = new AbortController();
+    const link = (): void => ac.abort();
+    task.ctrl.signal.addEventListener('abort', link, { once: true });
+    this.capTimers.set(key, () => {
+      task.ctrl.signal.removeEventListener('abort', link);
+      ac.abort();
+    });
+    (this.deps.dupTimer ?? defaultSleep)(LIVE_YANDEX_JOB_DEADLINE_MS + 5000, ac.signal).then(
+      () => {
+        if (this.liveAttempts.get(key) !== att) return;
+        const ms = (this.deps.now ?? Date.now)() - t0;
+        this.onLatency(id, ms, true, task.chunk.durationSec);
+        this.noteYandexResult(task, id, false, ms);
+        diag.log('yandex-live-cut', { tier: id, cell: task.chunk.startSec, ms });
+        abort();
+      },
+      () => {},
+    );
   }
 
   private onLatency(id: ProviderId, ms: number, censored: boolean, durSec?: number): void {
@@ -1531,7 +2336,7 @@ export class TranslationEngine {
     const ft = this.deps.fullTrack;
     const vk = this.deps.videoKey?.();
     const session = this.session;
-    if (!ft || !vk?.startsWith('yt:')) return;
+    if (!ft || !vk?.startsWith('yt:') || this.liveVideo) return; // a live stream has no complete track to fetch
     // the real url is known even when no Yandex tier is usable yet: the complete-audio archive and a later mid-session enable need it
     const url = `https://youtu.be/${vk.slice(3)}`;
     this.probeUrl = url;
@@ -1953,6 +2758,35 @@ export class TranslationEngine {
     }
   }
 
+  /**
+   * Safety rule: a phrase cannot be dubbed before the speech of its chunk begins. Estimated sentence times (Whisper without
+   * timestamps, Gemini guesses) can fall into a lead-in of silence / music; such segments are moved (whole, duration kept)
+   * to the measured speech onset. The scheduler then adds the dub lag on top. Yandex cell voice-overs trail the speaker by
+   * construction and are left alone, as are chunks without captured audio.
+   */
+  private clampToSpeechOnset(chunk: AudioChunk, segs: DubSegment[], providerId: ProviderId): DubSegment[] {
+    if (segs.length === 0 || providerId === 'yandex' || providerId === 'yandex-live' || chunk.pcm.length === 0) return segs;
+    let onset = 0;
+    try {
+      onset = speechOnsetSec(chunk.pcm, chunk.sampleRate);
+    } catch {
+      return segs;
+    }
+    if (onset < 0.3) return segs;
+    const min = chunk.startSec + onset;
+    let moved = 0;
+    let maxShift = 0;
+    const out = segs.map((x) => {
+      if (x.start >= min - 0.05) return x;
+      const d = min - x.start;
+      moved++;
+      if (d > maxShift) maxShift = d;
+      return { ...x, start: x.start + d, end: x.end + d };
+    });
+    if (moved > 0) diag.log('onset-clamp', { cell: chunk.startSec, onset: Math.round(onset * 100) / 100, moved, maxShift: Math.round(maxShift * 100) / 100, tier: providerId });
+    return out;
+  }
+
   private onResult(task: Task, providerId: ProviderId, raw: DubSegment[], sourceLang?: string, subs?: SubtitleCue[], voice?: 'lively' | 'standard', ms = 0): void {
     if (sourceLang === 'ru' && this.skipEnabled()) {
       diag.log('lang-gate', { decision: 'skip', lang: 'ru', how: 'provider', tier: providerId });
@@ -1966,15 +2800,38 @@ export class TranslationEngine {
       diag.log('lang-gate', { decision: 'verified', lang: sourceLang, how: 'provider', tier: providerId });
       this.setLanguage({ lang: sourceLang, confidence: 0.99, how: 'provider', unverified: false });
     }
-    const segments = raw.map((x) => (x.providerId ? x : { ...x, providerId }));
+    let segments = this.clampToSpeechOnset(task.chunk, raw.map((x) => (x.providerId ? x : { ...x, providerId })), providerId);
+    if (task.chunk.provisional) {
+      // produced under a provisional clock offset: the real one may already be known (shift the slots) or still come (remember them)
+      const sh = this.provShift;
+      if (sh !== undefined && Math.abs(sh) > RETIME_MIN_SEC) segments = segments.map((x) => ({ ...x, start: x.start + sh, end: x.end + sh }));
+      else if (sh === undefined) for (const x of segments) this.provSegs.add(x);
+    }
     const cell = task.chunk.startSec;
     const dur = task.chunk.durationSec;
     const ct = this.deps.video.currentTime;
     const dubSec = segments.reduce((n, x) => n + Math.max(0, x.end - x.start), 0);
     // how far the playhead already is into the cell this dub belongs to (> 0.7 of it = the scheduler will skip it)
-    const intoCell = ct - cell;
+    const intoCell = ct - cell - this.lagSec();
     diag.log('chunk-voiced', { cell, dur, partial: !!task.chunk.partial, tier: providerId, ms, segments: segments.length, dubSec, ct, intoCell, voice });
-    if (segments.length === 0) diag.log('chunk-no-speech', { cell, tier: providerId });
+    if (segments.length > 0 && !task.revoice) {
+      // F: every segment of the chunk was already over when its dub arrived (live: useless) -> status after 3 in a row
+      const lastEnd = Math.max(...segments.map((x) => x.end));
+      if (lastEnd + this.lagSec() < ct) {
+        this.lateRun++;
+        if (this.lateRun >= 3) localReasons.set('late', reasonText.late(Math.round(ct - lastEnd)));
+        this.wd.lateDubs = this.lateRun;
+      } else {
+        this.lateRun = 0;
+        this.wd.lateDubs = 0;
+        localReasons.clear('late');
+      }
+    }
+    if (segments.length === 0) {
+      this.emptyRun++;
+      diag.log('chunk-no-speech', { cell, tier: providerId, run: this.emptyRun });
+      if (this.capture?.kind === 'hls' && this.emptyRun >= PREROLL_EMPTY_RELEASE) this.releasePreroll('no-speech');
+    } else this.emptyRun = 0;
     if (segments.length > 0 && intoCell > 0.7 * dur && !task.revoice) {
       this.warnThrottled('dub-late', {
         kind: 'dub-late',
@@ -1990,13 +2847,16 @@ export class TranslationEngine {
     this.deps.events?.onVoice?.({ providerId, voice });
     if (sourceLang) this.sourceLang = sourceLang;
     if (segments.length > 0) {
+      this.noteDub();
       this.segments.push(...segments);
       this.scheduler?.addSegments(segments);
       if (!this.schedStarted) {
         this.schedStarted = true;
         this.scheduler?.start();
       }
+      if (!task.revoice) this.maybeRewindForDub(segments);
     }
+    if (this.ttfd.asrMs === undefined && ms > 0 && segments.length > 0) this.ttfd.asrMs = ms;
     if (this.settings.subtitles === 'on' && subs && subs.length > 0) {
       const seen = new Set(this.cues.map((c) => `${c.start}|${c.text}`));
       for (const c of subs) if (!seen.has(`${c.start}|${c.text}`)) this.cues.push(c);
@@ -2065,6 +2925,7 @@ export class TranslationEngine {
     if (this._state === 'idle' || this._state === 'stopped' || this._state === 'error' || this._state === 'skipped-ru' || this._state === 'native-dub') return;
     if (!this.dubReady && this.coversPlayhead()) {
       this.dubReady = true;
+      localReasons.clear('live');
       diag.log('dub-ready', {
         ms: (this.deps.now ?? Date.now)() - this.startedAt,
         ct: this.deps.video.currentTime,
@@ -2091,6 +2952,11 @@ export class TranslationEngine {
   private beginPreroll(gen: number): void {
     const v = this.deps.video;
     if (this.settings.prerollPause !== 'on' || v.paused || v.ended) return;
+    // live: pausing destroys the player's buffer on Twitch (ct -> 0) and the delay seek replaces the wait
+    if (this.isLive() || isHlsHost(this.hostName())) {
+      diag.log('preroll-skip', { reason: 'live', ct: v.currentTime });
+      return;
+    }
     try {
       v.pause();
     } catch {
@@ -2100,6 +2966,7 @@ export class TranslationEngine {
     this.pausedByUs = true;
     const ctrl = new AbortController();
     this.prerollCtrl = ctrl;
+    this.prerollAt = (this.deps.now ?? Date.now)();
     diag.log('preroll-pause', { ct: v.currentTime });
     (this.deps.sleep ?? defaultSleep)(PREROLL_MAX_MS, ctrl.signal).then(
       () => {
@@ -2108,6 +2975,19 @@ export class TranslationEngine {
       () => {},
     );
     this.emitPreparing();
+  }
+
+  /** the capture turned out to be a live HLS one: shorten the preroll wait (a second timer; releasePreroll is idempotent) */
+  private capPrerollForLive(gen: number): void {
+    if (!this.prerollActive) return;
+    const left = Math.max(0, PREROLL_LIVE_MAX_MS - ((this.deps.now ?? Date.now)() - this.prerollAt));
+    const ctrl = this.prerollCtrl;
+    (this.deps.sleep ?? defaultSleep)(left, ctrl?.signal ?? new AbortController().signal).then(
+      () => {
+        if (gen === this.gen) this.releasePreroll('timeout-live');
+      },
+      () => {},
+    );
   }
 
   private endPreroll(): void {
@@ -2226,7 +3106,12 @@ export class TranslationEngine {
     return {
       translationVolume: this.settings.translationVolume,
       originalVolume: this.settings.originalVolume,
+      dubLagSec: this.lagSec(),
       onStarve: () => this.pump(),
+      onFirstPlay: () => this.logTtfd(),
+      // never lead the original: with the hls capture the monitor envelope says whether the original has started speaking (see DubScheduler onsetProbe)
+      onsetProbe: (vt) => (this.capture?.kind === 'hls' ? this.capture.onsetProbe?.(vt) : undefined),
+      forgetBehindSec: this.isLive() ? 60 : undefined,
       onDecodeError: (info) =>
         this.warnThrottled('dub-decode-failed', {
           kind: 'dub-decode-failed',
@@ -2274,6 +3159,16 @@ export class TranslationEngine {
     }
     this.liveAttempts.clear();
     this.releasePreroll('stop');
+    this.liveDelay?.stop();
+    this.liveDelay = undefined;
+    this.lateRun = 0;
+    localReasons.clear('late');
+    localReasons.clear('quality-slow');
+    this.stopHlsProbe();
+    this.stopWatchdog();
+    this.adsActive = false;
+    localReasons.clear('ads');
+    localReasons.clear('restart');
     if (this.listening) {
       this.deps.video.removeEventListener('seeked', this.onSeeked);
       this.deps.video.removeEventListener('timeupdate', this.onTimeUpdate);
@@ -2310,6 +3205,18 @@ export class TranslationEngine {
     this.pendingSwaps.clear();
     this.liveAttempts.clear();
     this.prep = undefined;
+    this.rewindSlot = undefined;
+    this.provSegs = new WeakSet();
+    this.provCells.clear();
+    this.provShift = undefined;
+    this.ttfd = { logged: false, adMs: 0 };
+    if (this.liveVideo) {
+      this.liveVideo = false;
+      this.settings = withSiteOverride(this.rawSettings, this.hostName());
+    }
+    localReasons.clear('live');
+    localReasons.clear('quality-slow');
+    this.qualityExtraDone = false;
     this.dubReady = false;
     this.firstRequestAt = 0;
     this.rateCap = 0;

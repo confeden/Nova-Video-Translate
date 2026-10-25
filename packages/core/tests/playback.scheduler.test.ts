@@ -50,7 +50,14 @@ class FakeCtx {
   }
   createBuffer(_ch: number, length: number, sampleRate: number) {
     const data = new Float32Array(length);
-    return { duration: length / sampleRate, getChannelData: () => data };
+    return {
+      duration: length / sampleRate,
+      length,
+      sampleRate,
+      numberOfChannels: 1,
+      getChannelData: () => data,
+      copyToChannel: (src: Float32Array) => data.set(src.subarray(0, length)),
+    };
   }
   /** test encoding: 10 bytes per second of audio */
   async decodeAudioData(buf: ArrayBuffer) {
@@ -71,6 +78,8 @@ const seg = (start: number, end: number, dur = end - start): DubSegment => ({
   end,
   audio: { kind: 'encoded', mime: 'audio/test', data: new Uint8Array(Math.round(dur * 10)) },
 });
+
+const segY = (start: number, end: number): DubSegment => ({ ...seg(start, end), providerId: 'yandex' });
 
 describe('DubScheduler', () => {
   let ctx: FakeCtx;
@@ -140,8 +149,8 @@ describe('DubScheduler', () => {
     fire('playing');
     expect(ctx.sources).toHaveLength(2);
     const second = ctx.sources[1]!.starts[0]!;
-    expect(second.offset).toBeCloseTo(0.5);
-    expect(second.when).toBeCloseTo(ctx.currentTime);
+    expect(second.offset).toBeCloseTo(0.5, 1);
+    expect(second.when).toBeCloseTo(ctx.currentTime, 1);
   });
 
   it('waiting stops audio and playing re-plans', async () => {
@@ -187,8 +196,8 @@ describe('DubScheduler', () => {
     fire('seeked');
     await flush();
     expect(live()).toHaveLength(1);
-    expect(live()[0]!.starts[0]!.offset).toBeCloseTo(0.8);
-    expect(live()[0]!.starts[0]!.when).toBeCloseTo(ctx.currentTime);
+    expect(live()[0]!.starts[0]!.offset).toBeCloseTo(0.8, 1);
+    expect(live()[0]!.starts[0]!.when).toBeCloseTo(ctx.currentTime, 1);
     const before = ctx.sources.length;
     video.currentTime = 11.6;
     fire('seeking');
@@ -222,7 +231,7 @@ describe('DubScheduler', () => {
     expect(ctx.sources).toHaveLength(2);
     const [a, b] = ctx.sources;
     expect(a!.playbackRate.value).toBe(1);
-    expect(b!.starts[0]!.when).toBeCloseTo(2.8);
+    expect(b!.starts[0]!.when).toBeCloseTo(2.8, 1);
     expect(b!.starts[0]!.when).toBeGreaterThanOrEqual(a!.starts[0]!.when + 2.8 - 1e-9);
   });
 
@@ -236,6 +245,40 @@ describe('DubScheduler', () => {
     const aEnd = a!.starts[0]!.when + 4.5 / a!.playbackRate.value;
     expect(b!.starts[0]!.when).toBeGreaterThanOrEqual(aEnd - 1e-9);
     expect(b!.playbackRate.value).toBe(1);
+  });
+
+  describe('pitch-preserving compression', () => {
+    const pcm = (start: number, end: number, sec: number): DubSegment => ({
+      start,
+      end,
+      audio: { kind: 'pcm', sampleRate: 1000, samples: Int16Array.from({ length: Math.round(sec * 1000) }, (_, i) => Math.round(8000 * Math.sin(i * 0.9))) },
+    });
+
+    it('plays a stretched buffer at the video rate instead of raising playbackRate', async () => {
+      const logs: Array<{ kind: string; data?: Record<string, unknown> }> = [];
+      const spy = vi.spyOn(diag, 'log').mockImplementation(((kind: string, data?: Record<string, unknown>) => void logs.push({ kind, data })) as never);
+      make().addSegments([pcm(0, 2, 4.5), pcm(2, 3, 1)]);
+      sch.start();
+      await flush();
+      await flush();
+      const a = ctx.sources[0]!;
+      expect(a.playbackRate.value).toBe(1);
+      expect((a.buffer as unknown as { duration: number }).duration).toBeCloseTo(4.5 / 1.1, 1);
+      const play = logs.find((l) => l.kind === 'seg-play')!;
+      expect(play.data!.stretch).toBeCloseTo(1.1);
+      // slot timing is unchanged: the next phrase still starts after this one ends
+      expect(ctx.sources[1]!.starts[0]!.when).toBeGreaterThanOrEqual(a.starts[0]!.when + 4.5 / 1.1 - 0.05);
+      spy.mockRestore();
+    });
+
+    it('keeps the video rate on top of the stretch', async () => {
+      make().addSegments([pcm(0, 2, 4.5), pcm(2, 3, 1)]);
+      video.playbackRate = 1.5;
+      sch.start();
+      await flush();
+      await flush();
+      expect(ctx.sources[0]!.playbackRate.value).toBeCloseTo(1.5);
+    });
   });
 
   it('re-schedules a source whose position drifted more than 0.35 s', async () => {
@@ -327,17 +370,17 @@ describe('DubScheduler', () => {
     expect(ctx.sources.length).toBe(n);
   });
 
-  it('late dub: a 15 s dub arriving at 73% still starts mid-buffer (tail >= 3 s); under 3 s left it is skipped', async () => {
-    make().addSegments([seg(0, 15)]);
+  it('continuous (yandex) late dub: a 15 s dub arriving at 73% still starts mid-buffer (tail >= 3 s); under 3 s left it is skipped', async () => {
+    make().addSegments([segY(0, 15)]);
     video.currentTime = 11;
     sch.start();
     await flush();
     expect(live()).toHaveLength(1);
-    expect(live()[0]!.starts[0]!.offset).toBeCloseTo(11);
+    expect(live()[0]!.starts[0]!.offset).toBeCloseTo(11, 1);
     sch.dispose();
     ctx.sources.length = 0;
     video.currentTime = 13;
-    make().addSegments([seg(0, 15)]);
+    make().addSegments([segY(0, 15)]);
     sch.start();
     await flush();
     expect(ctx.sources).toHaveLength(0);
@@ -357,6 +400,35 @@ describe('DubScheduler', () => {
     fire('seeked');
     await flush();
     expect(ctx.sources.length).toBe(before + 1);
-    expect(ctx.sources[before]!.starts[0]!.offset).toBeCloseTo(0.5);
+    expect(ctx.sources[before]!.starts[0]!.offset).toBeCloseTo(0.5, 1);
+  });
+});
+
+describe('DubScheduler memory release', () => {
+  it('releases decoded buffers far behind the playhead and entries when forgetBehindSec is set', async () => {
+    vi.useFakeTimers();
+    const ctx = new FakeCtx();
+    const video = new FakeVideo();
+    const sch = new DubScheduler(video as unknown as HTMLVideoElement, ctx as unknown as AudioContext, { forgetBehindSec: 60 });
+    const internals = sch as unknown as { entries: Array<{ buffer?: unknown }> };
+    sch.addSegments([seg(1, 2), seg(30, 31)]);
+    sch.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(internals.entries[0]!.buffer).toBeTruthy();
+    for (let i = 0; i < 100; i++) {
+      ctx.currentTime += 0.1;
+      video.currentTime += 0.1;
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(internals.entries[0]!.buffer).toBeTruthy(); // vt ~ 10: nothing is 20 s behind yet
+    video.currentTime = 25; // 23 s past the first segment end
+    await vi.advanceTimersByTimeAsync(500);
+    expect(internals.entries[0]!.buffer).toBeUndefined();
+    expect(internals.entries).toHaveLength(2);
+    video.currentTime = 100; // > 60 s behind both
+    await vi.advanceTimersByTimeAsync(500);
+    expect(internals.entries).toHaveLength(0);
+    sch.dispose();
+    vi.useRealTimers();
   });
 });

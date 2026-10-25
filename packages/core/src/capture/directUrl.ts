@@ -10,7 +10,7 @@
  */
 import type { AudioChunk } from '../providers/types';
 import { TARGET_RATE, sliceChunks } from './audio';
-import { decodeToPcm16k, type Decoder } from './decode';
+import { decodeToPcm16k, yieldToMain, type Decoder } from './decode';
 import { isMp4 } from './mp4';
 import { isWebm } from './webm';
 
@@ -136,6 +136,7 @@ export async function* directChunks(url: string, fromSec: number, opts: DirectOp
   let t = Math.max(0, fromSec);
   while (t < dur) {
     if (opts.signal?.aborted) return;
+    await yieldToMain(); // windows are decoded one after another: let the page breathe between them
     const a = Math.floor(bps * t);
     const b = Math.min(size - 1, Math.floor(bps * (t + win)) - 1);
     const bytes = await fetchBytes(url, f, opts.signal, [a, b]);

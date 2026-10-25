@@ -5,16 +5,26 @@
  */
 import type { AudioChunk, CacheSignature, ChunkResult, DubProvider, DubSegment, ProviderContext, TextSegment } from '../providers/types';
 import type { Settings } from '../types';
+import { diag } from '../diag';
 import { sha256Hex } from './hash';
 import { OPUS_MIME, webCodecsOpus, type AudioCodec } from './opus';
 import type { CachedChunk, CachedSegment, ResultCache } from './types';
 
-export const CACHE_KEY_VERSION = 'v1';
+/** v2: entries written by v1 may belong to live streams (DVR-position cells) and must never be read again */
+export const CACHE_KEY_VERSION = 'v2';
+
+let liveSkipLogged = false;
+/** tests: re-arm the once-per-session 'cache-skip' diag line */
+export function resetCacheSkipLog(): void {
+  liveSkipLogged = false;
+}
 
 export interface CacheInfo {
   /** stable video identity (videoCacheKey); undefined = do not cache (live stream, unknown duration) */
   videoKey(): string | undefined;
   settings(): Settings;
+  /** the video is a live stream RIGHT NOW (re-checked on every get and put: the live flag may arrive after the start) => no read, no write */
+  isLive?(): boolean;
   /** audio compression (default WebCodecs Opus) */
   codec?: AudioCodec;
   now?(): number;
@@ -158,6 +168,13 @@ export function withCache(inner: DubProvider, cache: ResultCache, info: CacheInf
       let el: ReturnType<typeof eligible>;
       try {
         el = eligible(chunk);
+        if (el && info.isLive?.()) {
+          if (!liveSkipLogged) {
+            liveSkipLogged = true;
+            diag.log('cache-skip', { reason: 'live' });
+          }
+          el = undefined;
+        }
         const vk = el ? info.videoKey() : undefined;
         if (el && vk) {
           let sig: CacheSignature = {};
@@ -179,6 +196,12 @@ export function withCache(inner: DubProvider, cache: ResultCache, info: CacheInf
           if (hit) {
             const res = await toDub(hit, ctx);
             if (res) {
+              diag.log('cache-hit', {
+                cell: chunk.startSec,
+                ageSec: Math.round((now() - hit.createdAt) / 1000),
+                bytes: hit.segments.reduce((n, x) => n + (x.opus?.length ?? 0), 0),
+                keyHash: key.slice(0, 8),
+              });
               info.onHit?.({ startSec: chunk.startSec, providerId: inner.id, key });
               return res;
             }
@@ -189,7 +212,8 @@ export function withCache(inner: DubProvider, cache: ResultCache, info: CacheInf
         key = undefined;
       }
       const res = await inner.translateChunk(chunk, ctx);
-      if (key && el) store(key, res, el.s);
+      // the live flag can arrive while the request is in flight: re-check before writing
+      if (key && el && !info.isLive?.()) store(key, res, el.s);
       return res;
     },
   };

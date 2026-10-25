@@ -1,4 +1,4 @@
-import { CaptionPretranslator, ChromePromptAudioAsr, ChromeTextTranslator, GroqChatTranslator, LiveGemini, YoutubeCaptionTimeline, createCaptionsBridgeClient, createGroqProvider, createLocalProvider, createPageRuntime, createRemoteCache, createYandexProviders, diag, localAsrRegistry, localTtsRegistry, type CacheMessage, type CacheReply, type DubProvider, type FullTrackProber, type VoiceReport } from '@nvt/core';
+import { CaptionPretranslator, ChromePromptAudioAsr, ChromeTextTranslator, GroqAsr, GroqChatTranslator, LiveGemini, YoutubeCaptionTimeline, createCaptionsBridgeClient, createGroqProvider, createLocalProvider, createPageRuntime, createRemoteCache, createWhisperAsr, createYandexProviders, diag, localAsrRegistry, localTtsRegistry, type CacheMessage, type CacheReply, type DubProvider, type FullTrackProber, type VoiceReport } from '@nvt/core';
 import { browser } from 'wxt/browser';
 import { createSwTransport, transportFetch } from '../utils/swTransport';
 import { VOICE_STATUS_KEY, YANDEX_AUTH_KEY, YANDEX_LOGIN_ERROR_KEY, loadSettings, onSettingsChanged } from '../utils/settings';
@@ -47,6 +47,7 @@ export default defineContentScript({
       version: NVT_VERSION,
       settingsHost: createBaseHost(),
       subtitleTransport: () => (subsTransport ??= createSwTransport()),
+      hlsTransport: () => (subsTransport ??= createSwTransport()),
       cache: createRemoteCache((m: CacheMessage) => browser.runtime.sendMessage(m) as Promise<CacheReply | undefined>),
       fullTrack: () => fullTrack,
       captions: () => reader,
@@ -56,6 +57,7 @@ export default defineContentScript({
         fullTrack = y.fullTrack;
         // D30 local tiers: engines register once per page; the Supertonic engine talks to the service worker / offscreen document
         const tts = registerExtensionLocalTts(getSettings);
+        localAsrRegistry.register(createWhisperAsr(undefined, () => getSettings().localAsrModel)); // first in DEFAULT_LOCAL_ASR_ORDER; unavailable until the user downloads a model
         localAsrRegistry.register(new ChromePromptAudioAsr());
         const chrome = new ChromeTextTranslator();
         // one batch store for both tiers: the caption track is translated 50 sentences per request, ahead of the playhead
@@ -64,7 +66,7 @@ export default defineContentScript({
         const pretranslate = new CaptionPretranslator({ translators, tier: 'groq' });
         const groq = createGroqProvider({ transport, getSettings, captions: youtubeCaptions, pretranslate });
         groqChat = new GroqChatTranslator(groq.client, groq.models);
-        const local = createLocalProvider({ captions: youtubeCaptions, translators, pretranslate });
+        const local = createLocalProvider({ captions: youtubeCaptions, translators, pretranslate, getSourceLang: () => getSettings().sourceLang, liveAsr: { groq: new GroqAsr(groq.client, groq.models), hasKey: () => groq.client.hasKey(), mode: () => getSettings().liveAsr } });
         // load the model + compile the shaders as soon as a local tier is in play and the model is already downloaded (no-op otherwise)
         const s = getSettings();
         if (s.voiceEnabled.groq !== false || s.voiceEnabled.local !== false) void tts.warmUp();

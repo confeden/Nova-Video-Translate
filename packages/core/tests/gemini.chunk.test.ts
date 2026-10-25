@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { diag } from '../src/diag';
+import type { SpeakerGender, VoiceInput } from '../src/providers/gemini/voices';
 import { GeminiProvider } from '../src/providers/gemini/provider';
 import { synthesizeRun, joinSentences } from '../src/providers/gemini/tts';
 import { GeminiClient } from '../src/providers/gemini/client';
@@ -205,9 +206,55 @@ describe('automatic voices (D20)', () => {
     expect(chooseVoices(seg, () => 104, mem)[0]?.voice).toBe(VOICE_TABLE.male.low[0]);
     expect(chooseVoices(seg, () => 108, mem)[0]?.voice).toBe(VOICE_TABLE.male.low[0]);
     expect(mem.centroids).toHaveLength(1);
+    // same speaker id, different gender label: the speaker keeps the voice it got first (gender never changes per id)
     const female = [{ start: 0, end: 5, gender: 'female' as const, speaker: 'S1' }];
-    expect(chooseVoices(female, () => 260, mem)[0]?.voice).toBe(VOICE_TABLE.female.high[0]);
-    expect(chooseVoices(female, () => 200, mem)[0]?.voice).toBe(VOICE_TABLE.female.mid[0]);
+    expect(chooseVoices(female, () => 260, mem)[0]?.voice).toBe(VOICE_TABLE.male.low[0]);
+    expect(chooseVoices(female, () => 200, mem)[0]?.voice).toBe(VOICE_TABLE.male.low[0]);
+    // a new speaker id is free to be female
+    const other = [{ start: 0, end: 5, gender: 'female' as const, speaker: 'S2' }];
+    expect(chooseVoices(other, () => 200, mem)[0]?.voice).toBe(VOICE_TABLE.female.mid[0]);
+  });
+
+  describe('speaker-sticky voices (D20b)', () => {
+    const seg = (speaker: string, gender: SpeakerGender, start: number): VoiceInput => ({
+      start,
+      end: start + 3,
+      speaker,
+      gender,
+    });
+
+    it('same speaker id with a stray child label keeps the male voice', () => {
+      const segs = [seg('S1', 'male', 0), seg('S1', 'male', 3), seg('S1', 'child', 6), seg('S1', 'male', 9), seg('S1', 'male', 12)];
+      const f0Of = (idx: number[]) => (idx.every((i) => segs[i]?.gender === 'child') ? 320 : 95);
+      const r = chooseVoices(segs, f0Of, newVoiceMemory());
+      expect(r.map((c) => c.voice)).toEqual(Array(5).fill(VOICE_TABLE.male.low[0]));
+      expect(r.every((c) => c.profile === 'male')).toBe(true);
+    });
+
+    it('a sustained child speaker with child-range f0 gets the child voice', () => {
+      const segs = [seg('S1', 'male', 0), seg('S2', 'child', 3), seg('S2', 'child', 6), seg('S2', 'child', 9)];
+      const f0Of = (idx: number[]) => (segs[idx[0]!]?.speaker === 'S2' ? 320 : 100);
+      const r = chooseVoices(segs, f0Of, newVoiceMemory());
+      expect(r.slice(1).map((c) => c.voice)).toEqual(['Leda', 'Leda', 'Leda']);
+      expect(r.slice(1).every((c) => c.profile === 'child')).toBe(true);
+      expect(r[0]?.profile).toBe('male');
+    });
+
+    it('a sustained child label with adult f0 is not honoured (speaker inherits the neighbour)', () => {
+      const segs = [seg('S1', 'male', 0), seg('S2', 'child', 3), seg('S2', 'child', 6), seg('S2', 'child', 9)];
+      const f0Of = (idx: number[]) => (segs[idx[0]!]?.speaker === 'S2' ? 150 : 100);
+      const r = chooseVoices(segs, f0Of, newVoiceMemory());
+      expect(r.slice(1).every((c) => c.profile === 'male' && c.voice !== 'Leda')).toBe(true);
+    });
+
+    it('an established speaker keeps its voice across chunks, whatever later labels say', () => {
+      const mem = newVoiceMemory();
+      const first = chooseVoices([seg('S1', 'male', 0)], () => 100, mem)[0]!;
+      const later = [seg('S1', 'child', 0), seg('S1', 'child', 3), seg('S1', 'child', 6), seg('S1', 'female', 9)];
+      const r = chooseVoices(later, () => 320, mem);
+      expect(r.map((c) => c.voice)).toEqual(Array(4).fill(first.voice));
+      expect(r.every((c) => c.profile === 'male')).toBe(true);
+    });
   });
 
   it('two same-gender speakers of different pitch get different voices; unknown f0 reuses the known one', () => {

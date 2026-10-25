@@ -7,6 +7,13 @@ export const YANDEX_AUTH_KEY = 'nvt.yandexAuth';
 export const OAUTH_PENDING_KEY = 'nvt.oauthPending';
 export const YANDEX_LOGIN_ERROR_KEY = 'nvt.yandexLoginError';
 export const VOICE_STATUS_KEY = 'nvt.voiceStatus';
+/** set once the stored dubLagSec 2 (old default) was moved to 1 */
+const DUB_LAG_KEY = 'nvt.dubLag1';
+
+/** set once the autoTranslate default was moved to 'on' for the stored settings (mirrors the extension) */
+const AUTO_DEFAULT_KEY = 'nvt.autoTranslateOnByDefault';
+/** set once the stored liveDelaySec 0 (old default) was moved to -1 = auto */
+const LIVE_AUTO_KEY = 'nvt.liveDelayAuto';
 
 export interface YandexAuth {
   token: string;
@@ -28,6 +35,26 @@ export function saveYandexAuth(a: YandexAuth | null): void {
 /** Stored settings + defaults + the Yandex token (unless expired); the token itself is not part of SETTINGS_KEY. */
 export function loadSettings(): Settings {
   const s = normalizeSettings(gmGet(SETTINGS_KEY));
+  if (gmGet(AUTO_DEFAULT_KEY) !== true) {
+    s.autoTranslate = 'on';
+    gmSet(SETTINGS_KEY, normalizeSettings(s));
+    gmSet(AUTO_DEFAULT_KEY, true);
+  }
+  if (gmGet(LIVE_AUTO_KEY) !== true) {
+    if (s.liveDelaySec === 0) {
+      s.liveDelaySec = -1;
+      gmSet(SETTINGS_KEY, normalizeSettings(s));
+    }
+    gmSet(LIVE_AUTO_KEY, true);
+  }
+  if (gmGet(DUB_LAG_KEY) !== true) {
+    // one-time: the old default dubLagSec 2 becomes the new default 1
+    if (s.dubLagSec === 2) {
+      s.dubLagSec = 1;
+      gmSet(SETTINGS_KEY, normalizeSettings(s));
+    }
+    gmSet(DUB_LAG_KEY, true);
+  }
   const auth = loadYandexAuth();
   if (auth && (auth.expiresAt === 0 || auth.expiresAt > Date.now())) s.yandexToken = auth.token;
   return s;

@@ -70,13 +70,21 @@ describe('trimEdges (never cuts speech)', () => {
     for (let i = 0; i < speech; i++) f[lead + i] = 0.5;
     return f;
   };
-  it('keeps <= 60 ms of leading silence, drops trailing digital silence > 150 ms, fades the end, keeps all speech', () => {
+  it('keeps <= 80 ms of leading silence, drops trailing digital silence > 150 ms, fades the end, keeps all speech', () => {
     const o = trimEdges(mk(500, 1000, 400), sr);
     expect(o.length).toBeLessThan(500 + 1000 + 400);
-    expect(o.length).toBeGreaterThanOrEqual(60 + 1000);
-    expect(o.length).toBeLessThanOrEqual(60 + 1000 + 20 + 1);
-    expect(o[60 + 100]).toBe(0.5); // speech untouched
+    expect(o.length).toBeGreaterThanOrEqual(80 + 1000);
+    expect(o.length).toBeLessThanOrEqual(80 + 1000 + 20 + 1);
+    expect(o[80 + 100]).toBe(0.5); // speech untouched
     expect(o[o.length - 1]).toBeLessThan(0.05); // faded
+  });
+  it('keeps >= 40 ms of pre-roll before the first voiced sample and never cuts a soft onset', () => {
+    const f = mk(500, 1000, 0);
+    for (let i = 0; i < 30; i++) f[500 + i] = 0.002 + (0.5 * i) / 30; // slow soft onset starting just above the threshold
+    const o = trimEdges(f, sr);
+    const first = o.findIndex((v) => Math.abs(v) >= 0.0015);
+    expect(first).toBeGreaterThanOrEqual(40);
+    expect(o.length - first).toBe(1000);
   });
   it('a short tail (<= 150 ms) is kept whole', () => {
     expect(trimEdges(mk(0, 1000, 100), sr).length).toBe(1100);

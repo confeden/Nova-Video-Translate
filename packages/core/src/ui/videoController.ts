@@ -1,9 +1,11 @@
-import { videoCacheKey, videoKey, withCache, type ResultCache } from '../cache';
+import { isLiveCacheTarget, videoCacheKey, videoKey, withCache, type ResultCache } from '../cache';
 import { createLangStore, detectVideoLanguage } from '../lang';
-import { createCapture } from '../capture';
+import { createCapture, fetchBroadcasterLanguage, isHlsHost, twitchChannelFromPath } from '../capture';
+import { getBroadcasterLang, hasBroadcasterLookup, localReasons, setBroadcasterLang, twitchLangToIso } from '../localasr';
 import { TranslationEngine, type EngineState, type EngineWarning, type LanguageInfo } from '../pipeline';
 import { GeminiProvider } from '../providers/gemini';
 import { diag } from '../diag';
+import { transportFetch } from '../providers/transportFetch';
 import type { CacheSignature, DubProvider, SubtitleCue, Transport } from '../providers/types';
 import type { FullTrackProber } from '../providers/yandex/fullTrack';
 import { KeyPool } from '../keypool';
@@ -23,21 +25,33 @@ import {
 } from '../subtitles';
 import { createAudioTracksBridgeClient, type AudioTracksController } from '../nativedub';
 import type { Settings } from '../types';
+import { isAutoExcluded, siteVoiceOverride, withSiteOverride } from '../settings';
 import { mountPlayerButton, watchVideos, type ButtonState, type PlayerButton } from './playerButton';
 import { openPagePanel, type PagePanelHandle } from './pagePanel';
 import type { SettingsPanelHost } from './settingsPanel';
 import { createSubtitleOverlay, SUBS_CSS, type SubtitleOverlay } from './subtitleOverlay';
 import { buildDiagReport, isActiveState, languageStatusText, laterName, providerName, sourceName, type TranslateStatus } from './status';
 
-const IDLE_TITLE = 'Перевести видео (NVT)';
-const TITLES: Record<string, string> = {
-  idle: IDLE_TITLE,
-  loading: 'Подготовка перевода… (нажмите, чтобы остановить)',
-  active: 'Перевод включён (нажмите, чтобы выключить)',
-  error: 'Ошибка перевода — нажмите, чтобы повторить',
-  ru: 'Видео уже на русском',
-  native: 'Используется родная русская дорожка (нажмите, чтобы выключить)',
+const IDLE_TITLE = 'NVT — перевести';
+const EMPTY_TITLE = 'NVT — речь не распознана';
+const SETTINGS_HINT = '· настройки';
+/** state text + what a click does when it TOGGLES translation (clickAction 'toggle', or no settings panel available) */
+const TITLES: Record<string, { text: string; toggle?: string }> = {
+  idle: { text: IDLE_TITLE },
+  loading: { text: 'NVT — подготовка', toggle: '· остановить' },
+  active: { text: 'NVT — перевод включён', toggle: '· выключить' },
+  error: { text: 'NVT — ошибка', toggle: '· повторить' },
+  ru: { text: 'NVT — видео на русском' },
+  native: { text: 'NVT — русская дорожка', toggle: '· выключить' },
+  empty: { text: EMPTY_TITLE, toggle: '· выключить' },
 };
+
+/** First tooltip line: the state text plus the hint for what a left click REALLY does. */
+export function buttonTitle(key: string, clickAction: 'settings' | 'toggle'): string {
+  const t = TITLES[key] ?? TITLES.idle!;
+  if (clickAction === 'settings') return `${t.text} ${SETTINGS_HINT}`;
+  return t.toggle ? `${t.text} ${t.toggle}` : t.text;
+}
 
 /** Who voiced the video: shown in the button tooltip and (via the host) the settings page. */
 export function voiceLabel(providerId: string, voice?: 'lively' | 'standard'): string {
@@ -120,6 +134,8 @@ export interface PageRuntimeHost {
   fullTrack?(): FullTrackProber | undefined;
   /** HTTP for the Yandex subtitle endpoint (same transport as the Yandex provider); absent = the Yandex subtitle source is skipped */
   subtitleTransport?: () => Transport;
+  /** HTTP for the Twitch audio_only HLS capture (extension: service worker; userscript: GM_xmlhttpRequest); absent = 'hls' is skipped */
+  hlsTransport?: () => Transport;
   /** reader of the page player's caption tracks; default: the postMessage bridge to the MAIN-world half */
   captions?: () => CaptionsReader;
   /** page-world reader / switcher of the YouTube audio tracks (native Russian dub); default: the postMessage bridge */
@@ -134,6 +150,8 @@ export interface VideoControllerHandle {
   readonly state: EngineState;
   /** the video already plays and the settings allow auto-start: start (called once the settings have loaded) */
   autoStartIfPlaying(): void;
+  /** redraw the button tooltip (the click behaviour depends on the loaded settings) */
+  refreshTitle(): void;
   readonly provider?: string;
   readonly active: boolean;
   toggle(): Promise<void>;
@@ -183,7 +201,10 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
   // a video that was already playing before the settings arrived gets its auto-start here (no 'play' event will come again)
   const ready = host.loadSettings().then((s) => {
     settings = s;
-    for (const c of controllers) c.autoStartIfPlaying();
+    for (const c of controllers) {
+      c.refreshTitle();
+      c.autoStartIfPlaying();
+    }
   });
   const controllers = new Set<VideoControllerHandle>();
   let audioCtx: AudioContext | undefined;
@@ -207,13 +228,14 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
 
   const getProviders = (): DubProvider[] => (providers ??= host.createProviders(() => settings!));
   /** per video: the cache key depends on the video identity */
-  const providersFor = (video: HTMLVideoElement): DubProvider[] => {
+  const providersFor = (video: HTMLVideoElement, isLive: () => boolean): DubProvider[] => {
     const base = getProviders();
     const cache = host.cache;
     if (!cache) return base;
     return base.map((p) =>
       withCache(p, cache, {
-        videoKey: () => videoCacheKey(video, location.href),
+        videoKey: () => videoCacheKey(video, location.href, { live: isLive }),
+        isLive: () => isLive() || isLiveCacheTarget(video, location.href),
         settings: () => settings!,
         onHit: (h) => note({ type: 'cache-hit', providerId: h.providerId, startSec: h.startSec }),
         log: (m) => note({ type: 'cache-log', msg: m }),
@@ -229,13 +251,14 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
   const makeSubtitleController = (
     video: HTMLVideoElement,
     cb: { onCues(c: SubtitleCue[]): void; onStatus(l: string | undefined): void; onFail(r: string): void },
+    isLive: () => boolean = () => false,
   ): SubtitleController => {
     const reader = getReader();
     const live = getProviders().find((p): p is LiveGemini => p instanceof LiveGemini);
     chromeTranslator ??= new ChromeCueTranslator();
     chromeAudio ??= new ChromeAudioChunkSource(chromeTranslator);
     if (live) geminiText ??= new GeminiText({ pool: () => live.pool(), fetch: live.fetch, modelOverride: () => settings?.geminiModels.translate });
-    const cache = host.cache ? new SubtitleCache({ cache: host.cache, settings: () => settings!, videoKey: () => videoCacheKey(video, location.href) }) : undefined;
+    const cache = host.cache ? new SubtitleCache({ cache: host.cache, settings: () => settings!, videoKey: () => videoCacheKey(video, location.href, { live: isLive }), isLive: () => isLive() || isLiveCacheTarget(video, location.href) }) : undefined;
     const whole: WholeSource[] = [];
     const transport = host.subtitleTransport?.();
     if (transport) {
@@ -335,6 +358,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
     /** problems the USER can fix (no Yandex login, bad Gemini key, no source at all): the only reason for the amber dot */
     private fixable = new Set<string>();
     private titleKey = 'idle';
+    private unsubReasons?: () => void;
     private voice?: string;
     private lang?: LanguageInfo;
     /** when the engine last skipped this video as Russian (a second click within 10 s forces translation) */
@@ -351,7 +375,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
     private pendingAuto = false;
 
     private canAutoStart(): boolean {
-      return settings?.autoTranslate === 'on' && !this.active && !this.userStopped && this.state !== 'skipped-ru';
+      return settings?.autoTranslate === 'on' && !isAutoExcluded(settings) && !this.active && !this.userStopped && this.state !== 'skipped-ru';
     }
 
     private readonly onPlay = (): void => {
@@ -428,6 +452,10 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
       this.onMediaReady();
     };
 
+    refreshTitle(): void {
+      this.refreshButton();
+    }
+
     autoStartIfPlaying(): void {
       if (!this.video.paused) this.onPlay();
     }
@@ -435,11 +463,13 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
     constructor(readonly video: HTMLVideoElement) {
       this.subs = createSubtitleOverlay(video, () => this.host());
       this.btn = mountPlayerButton(video, { onClick: () => this.onButton(), title: IDLE_TITLE });
+      this.refreshButton();
       video.addEventListener('play', this.onPlay);
       video.addEventListener('playing', this.onMediaReady);
       video.addEventListener('loadedmetadata', this.onMeta);
       video.addEventListener('emptied', this.onEmptied);
       video.addEventListener('loadstart', this.onLoadStart);
+      this.unsubReasons = localReasons.subscribe(() => this.refreshButton());
       if (!video.paused) this.onPlay();
     }
 
@@ -447,8 +477,13 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
       return this.state === 'starting' || this.state === 'translating' || this.state === 'buffering' || this.state === 'native-dub';
     }
 
+    /** what a left click on the button does: without a settings panel it can only toggle */
+    private clickMode(): 'settings' | 'toggle' {
+      return settings?.clickAction === 'toggle' || !host.settingsHost ? 'toggle' : 'settings';
+    }
+
     onButton(): void {
-      if (settings?.clickAction === 'toggle' || !host.settingsHost) void this.toggle();
+      if (this.clickMode() === 'toggle') void this.toggle();
       else if (panel?.isOpen && panelOwner === this) closePanel();
       else this.openPanel();
     }
@@ -471,6 +506,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
         etaSec: this.state === 'starting' && this.eta?.sec !== undefined ? Math.max(0, this.eta.sec - (Date.now() - this.eta.at) / 1000) : undefined,
         etaSource: this.state === 'starting' ? this.eta?.source : undefined,
         later: this.active ? this.later : undefined,
+        reason: this.reasonText(),
       };
     }
 
@@ -496,9 +532,19 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
     }
 
     /** Tooltip + warning dot on the player button: the only on-player status (no banners over the video). */
+    /** first blocking reason of the local tier, only while the session is on and nothing has been voiced yet */
+    private reasonText(): string | undefined {
+      if (this.voice || !(this.state === 'starting' || this.state === 'buffering' || this.state === 'translating' || this.state === 'error')) return undefined;
+      return localReasons.first()?.text;
+    }
+
     private refreshButton(): void {
-      const base = TITLES[this.titleKey] ?? IDLE_TITLE;
+      const reason = this.reasonText();
+      // chunks keep coming back without speech: do not promise a translation, say what is happening
+      const noSpeech = !!reason && localReasons.first()?.key === 'empty';
+      const base = buttonTitle(noSpeech ? 'empty' : this.titleKey, this.clickMode());
       const lines = [base];
+      if (reason) lines.push(reason);
       if (this.voice && (this.titleKey === 'active' || this.titleKey === 'loading')) lines.push(`Озвучка: ${this.voice}`);
       this.btn.el.title = lines.join(String.fromCharCode(10));
       if (this.fixable.size > 0) this.btn.el.dataset.warn = '1';
@@ -525,26 +571,29 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
       this.voice = undefined;
       this.warnings = [];
       this.fixable.clear();
+      localReasons.clearAll();
       this.refreshButton();
       this.lang = undefined;
-      if (settings.voiceEnabled['yandex-live'] !== false && !settings.yandexToken) {
+      if (withSiteOverride(settings, location.hostname).voiceEnabled['yandex-live'] !== false && !settings.yandexToken) {
         host.reportVoice?.({ at: Date.now(), providerId: 'yandex-live', outcome: 'no-token' });
         this.addWarning('Живые голоса: вы не вошли в Яндекс (Настройки → Яндекс)', 'yandex-login');
       }
+      const hlsT = host.hlsTransport?.();
+      const hlsFetch = hlsT ? transportFetch(hlsT) : undefined;
       audioCtx ??= new AudioContext();
       void audioCtx.resume().catch(() => {});
       this.engine?.stop();
       this.engine = new TranslationEngine({
         video: this.video,
         audioCtx,
-        providers: providersFor(this.video),
+        providers: providersFor(this.video, () => this.engine?.live === true),
         fullTrack: host.fullTrack?.(),
         audioTracks: getAudioTracks(),
         videoKey: () => videoKey(this.video, location.href),
         settings,
-        detectLanguage: () => detectVideoLanguage(this.video, document, { captions: getReader() }),
+        detectLanguage: () => detectVideoLanguage(this.video, document, { captions: getReader(), broadcasterLang: hlsFetch ? () => this.twitchLanguage(hlsFetch) : undefined }),
         langStore: host.cache ? createLangStore(host.cache, () => videoKey(this.video, location.href)) : undefined,
-        createCapture: host.createCapture ?? ((v, o) => createCapture(v, o)),
+        createCapture: (v, o) => (host.createCapture ?? createCapture)(v, hlsFetch && !o?.hlsFetch ? { ...o, hlsFetch } : o),
         events: {
           onState: (s, d) => {
             this.slow = d?.slow;
@@ -574,6 +623,19 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
       await this.engine.start({ force });
     }
 
+    /** Twitch: broadcast language of the channel in the address bar (one anonymous GQL call per channel, cached); undefined elsewhere */
+    private async twitchLanguage(fetchFn: (input: string, init?: RequestInit) => Promise<Response>): Promise<string | undefined> {
+      if (!isHlsHost(location.hostname)) return undefined;
+      const channel = twitchChannelFromPath(location.pathname);
+      if (!channel) return undefined;
+      if (!hasBroadcasterLookup(channel)) {
+        const iso = twitchLangToIso(await fetchBroadcasterLanguage(channel, fetchFn));
+        setBroadcasterLang(channel, iso);
+        diag.log('twitch-lang', { lang: iso ?? '?' });
+      }
+      return getBroadcasterLang(channel);
+    }
+
     private subsController(): SubtitleController {
       return (this.subsCtl ??= makeSubtitleController(this.video, {
         onCues: (c) => {
@@ -587,7 +649,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
         onFail: (r) => {
           this.addWarning(r);
         },
-      }));
+      }, () => this.engine?.live === true));
     }
 
     stop(byUser: boolean): void {
@@ -649,7 +711,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
           // not an error: the status line says the language is checked on the first result
           return;
         case 'no-provider':
-          text = 'Нет доступного источника озвучки — проверьте настройки';
+          text = !getProviders().some((p) => p.id === 'local') ? 'В userscript нет локальных моделей; для live/Twitch нужно расширение' : siteVoiceOverride(location.hostname) ? (localReasons.first()?.text ?? 'Для Twitch нужны локальные модели: скачайте Whisper в настройках') : 'Нет доступного источника озвучки — проверьте настройки';
           fixable = 'no-source';
           break;
         case 'capture-tainted':
@@ -691,10 +753,12 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
 
     private renderSubs(): void {
       const subsRunning = !!this.subsCtl && this.subsCtl.state !== 'idle' && this.subsCtl.state !== 'failed';
+      this.subs.setLang(settings?.subtitleLang === 'translation' ? 'translation' : 'original');
       this.subs.setEnabled(settings?.subtitles === 'on' && (this.active || subsRunning));
     }
 
     applySettings(s: Settings): void {
+      this.refreshButton();
       this.engine?.updateSettings(s);
       if (s.subtitles === 'on') {
         if ((this.active || this.state === 'error') && this.subsCtl?.state !== 'failed') this.subsController().applySettings(true);
@@ -703,6 +767,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
     }
 
     destroy(): void {
+      this.unsubReasons?.();
       this.subs.destroy();
     }
   }

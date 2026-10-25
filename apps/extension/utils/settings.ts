@@ -26,15 +26,27 @@ export async function loadYandexAuth(): Promise<YandexAuth | null> {
 
 /** set once the autoTranslate default was moved to 'on' for the stored settings (see loadSettings) */
 const AUTO_DEFAULT_KEY = 'nvt.autoTranslateOnByDefault';
+/** set once the stored liveDelaySec 0 (the old default, 0.2.28) was moved to -1 = auto */
+const LIVE_AUTO_KEY = 'nvt.liveDelayAuto';
+/** set once the stored dubLagSec 2 (the old default) was moved to 1 (new default for live translation) */
+const DUB_LAG_KEY = 'nvt.dubLag1';
 
 /** Full settings: stored values + defaults + the Yandex token (unless expired). The token is not part of SETTINGS_KEY. */
 export async function loadSettings(): Promise<Settings> {
-  const got = await browser.storage.local.get([SETTINGS_KEY, AUTO_DEFAULT_KEY]);
+  const got = await browser.storage.local.get([SETTINGS_KEY, AUTO_DEFAULT_KEY, LIVE_AUTO_KEY, DUB_LAG_KEY]);
   const s = normalizeSettings(got[SETTINGS_KEY]);
   if (got[AUTO_DEFAULT_KEY] !== true) {
     // one-time: settings saved before the default became 'on' still hold 'off' and would keep auto-translate off
     s.autoTranslate = 'on';
     await browser.storage.local.set({ [SETTINGS_KEY]: normalizeSettings(s), [AUTO_DEFAULT_KEY]: true });
+  }
+  if (got[LIVE_AUTO_KEY] !== true) {
+    if (s.liveDelaySec === 0) s.liveDelaySec = -1;
+    await browser.storage.local.set({ [SETTINGS_KEY]: normalizeSettings(s), [LIVE_AUTO_KEY]: true });
+  }
+  if (got[DUB_LAG_KEY] !== true) {
+    if (s.dubLagSec === 2) s.dubLagSec = 1;
+    await browser.storage.local.set({ [SETTINGS_KEY]: normalizeSettings(s), [DUB_LAG_KEY]: true });
   }
   const auth = await loadYandexAuth();
   if (auth && (auth.expiresAt === 0 || auth.expiresAt > Date.now())) s.yandexToken = auth.token;

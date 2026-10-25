@@ -1,6 +1,6 @@
 {
   "name": "@nvt/extension",
-  "version": "0.2.26",
+  "version": "0.2.47",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "typecheck": "wxt prepare && tsc --noEmit"
   },
   "dependencies": {
+    "@huggingface/transformers": "3.7.6",
     "@nvt/core": "*"
   },
   "devDependencies": {

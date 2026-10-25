@@ -1,4 +1,4 @@
-import { LOCAL_TTS_ENGINE_IDS, createRemoteEngine, localTtsRegistry, resolveVoice, type LocalTtsEngineId, type RemoteEngine, type Settings } from '@nvt/core';
+import { LOCAL_TTS_ENGINE_IDS, VOICE_CALIB_STORAGE_KEY, createRemoteEngine, localTtsRegistry, resolveVoice, type LocalTtsEngineId, type RemoteEngine, type Settings, type VoiceCalibration } from '@nvt/core';
 
 /**
  * The in-browser LocalTtsEngines for extension contexts (content script, options page): thin clients that talk to the service
@@ -22,9 +22,21 @@ export const createExtensionSupertonicEngine = (): RemoteEngine => extensionLoca
  */
 export function registerExtensionLocalTts(getSettings: () => Settings): { warmUp(): Promise<void> } {
   for (const id of LOCAL_TTS_ENGINE_IDS) localTtsRegistry.register(extensionLocalTtsEngine(id));
+  // voice calibration (adult-sounding male / female voice by f0) is cached between sessions, keyed by engine + pinned model revision
+  localTtsRegistry.setCalibrationStore({
+    async get(key) {
+      const got = await browser.storage.local.get(VOICE_CALIB_STORAGE_KEY);
+      const all = got[VOICE_CALIB_STORAGE_KEY] as Record<string, VoiceCalibration> | undefined;
+      return all?.[key];
+    },
+    async set(key, value) {
+      const got = await browser.storage.local.get(VOICE_CALIB_STORAGE_KEY);
+      await browser.storage.local.set({ [VOICE_CALIB_STORAGE_KEY]: { ...((got[VOICE_CALIB_STORAGE_KEY] as Record<string, VoiceCalibration> | undefined) ?? {}), [key]: value } });
+    },
+  });
   localTtsRegistry.setPreference(() => {
     const s = getSettings();
-    return { engine: s.localTtsEngine, voice: s.localTtsVoice };
+    return { engine: s.localTtsEngine, voice: s.localTtsVoice, voiceMale: s.localTtsVoiceMale, voiceFemale: s.localTtsVoiceFemale };
   });
   return {
     async warmUp() {
@@ -34,6 +46,7 @@ export function registerExtensionLocalTts(getSettings: () => Settings): { warmUp
         if (!e) return;
         const pref = localTtsRegistry.preference();
         await e.warmUp(pref?.voice ? resolveVoice(e.id, pref.voice) : undefined);
+        void localTtsRegistry.calibrate(e.id); // background, once per engine revision
       } catch {
         /* warm-up is best effort */
       }

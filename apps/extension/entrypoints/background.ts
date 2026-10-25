@@ -1,8 +1,10 @@
 import { browser, type Browser } from 'wxt/browser';
-import { diag, buildAuthUrl, checkYandexToken, createCodeVerifier, createState, createYandexProviders, describeLoginError, exchangeCode, handleCacheMessage, IdbCache, isCacheMessage, startCacheMaintenance, YANDEX_OAUTH } from '@nvt/core';
+import { diag, isKeyPageUrl, buildAuthUrl, checkYandexToken, createCodeVerifier, createState, createYandexProviders, describeLoginError, exchangeCode, handleCacheMessage, IdbCache, isCacheMessage, startCacheMaintenance, YANDEX_OAUTH } from '@nvt/core';
 import { fromB64, logPath, swFetchTransport, toB64, type SwState, type WireReq, type WireRes } from '../utils/swTransport';
 import { YANDEX_AUTH_KEY, YANDEX_LOGIN_ERROR_KEY, type YandexAuth } from '../utils/settings';
-import { handleLocalTtsMessage } from '../utils/localtts/background';
+import { handleLocalAsrMessage } from '../utils/localasr/background';
+import { clearAllLocalModels, handleLocalTtsMessage } from '../utils/localtts/background';
+import { UPDATE_ALARM, openReleasePage, runUpdateCheck, scheduleUpdateCheck } from '../utils/updateCheck';
 
 /**
  * Yandex's balancer answers HTTP 402 to any request carrying Origin or Sec-Fetch-Mode: cors (gotcha G4).
@@ -151,6 +153,11 @@ const resultCache = new IdbCache();
 
 export default defineBackground(() => {
   startCacheMaintenance(resultCache);
+  // update check (GitHub latest release, every 8 h; the alarm only re-evaluates the due check, retries after failures hourly)
+  scheduleUpdateCheck();
+  browser.alarms.onAlarm.addListener((a) => {
+    if (a.name === UPDATE_ALARM) void runUpdateCheck(false);
+  });
   // debugging / verification hook (used for the DNR header-rewrite test over CDP)
   (globalThis as unknown as { nvtTransport?: unknown }).nvtTransport = swFetchTransport;
   (globalThis as unknown as { __nvtSwDiag?: unknown }).__nvtSwDiag = diag;
@@ -158,6 +165,11 @@ export default defineBackground(() => {
 
   browser.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg?.type === 'nvt-ltts') return handleLocalTtsMessage(msg, _sender, sendResponse);
+    if (msg?.type === 'nvt-clear-models' && _sender.id === browser.runtime.id) {
+      void clearAllLocalModels().then(sendResponse, () => sendResponse({ freedBytes: -1 }));
+      return true;
+    }
+    if (msg?.type === 'nvt-lasr') return handleLocalAsrMessage(msg, _sender, sendResponse);
     if (isCacheMessage(msg)) {
       void handleCacheMessage(resultCache, msg).then(sendResponse);
       return true;
@@ -210,6 +222,22 @@ export default defineBackground(() => {
     }
     if (msg?.type === 'nvt-oauth-logout') {
       void browser.storage.local.remove(YANDEX_AUTH_KEY).then(() => sendResponse({ ok: true }));
+      return true;
+    }
+    if (msg?.type === 'nvt-update-check') {
+      void runUpdateCheck(true).then(sendResponse);
+      return true;
+    }
+    if (msg?.type === 'nvt-update-open') {
+      void openReleasePage(msg.url).then((ok) => sendResponse({ ok }), () => sendResponse({ ok: false }));
+      return true;
+    }
+    if (msg?.type === 'nvt-open-key-page') {
+      if (!isKeyPageUrl(msg.url)) {
+        sendResponse({ ok: false });
+        return false;
+      }
+      void browser.tabs.create({ url: msg.url }).then(() => sendResponse({ ok: true }), () => sendResponse({ ok: false }));
       return true;
     }
     if (msg?.type === 'nvt-http-abort' && typeof msg.id === 'string') {

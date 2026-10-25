@@ -6,6 +6,8 @@ export interface SourceSegment {
   start: number;
   end: number;
   text: string;
+  /** confirmed class of the original speaker, set by the cascade after ASR (see audio/speakerGender) */
+  gender?: 'm' | 'f';
 }
 
 const SENTENCE_END = /[.!?…。！？]["')\]»”]*$/;

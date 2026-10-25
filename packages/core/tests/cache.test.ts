@@ -12,6 +12,7 @@ import {
   muxOggOpus,
   parseOggOpus,
   sha256Hex,
+  isLiveCacheTarget,
   videoCacheKey,
   videoKey,
   withCache,
@@ -303,6 +304,50 @@ describe('withCache', () => {
     await w.translateChunk(chunk(0), ctx());
     await w.idle();
     expect(seen).toEqual([{ ttlMs: 2 * DAY, maxBytes: 1048576 }]);
+  });
+});
+
+describe('live streams never touch the result cache', () => {
+  const yt = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+  it('videoCacheKey: finite-duration YouTube live (DVR) is excluded by the live predicate, /live/ path, Twitch', () => {
+    const v = { currentSrc: '', duration: 46800 };
+    expect(videoCacheKey(v, yt)).toBe('yt:dQw4w9WgXcQ|d46800');
+    expect(videoCacheKey(v, yt, { live: () => true })).toBeUndefined();
+    expect(videoCacheKey(v, 'https://www.youtube.com/live/dQw4w9WgXcQ')).toBeUndefined();
+    expect(videoCacheKey(v, 'https://www.twitch.tv/somebody')).toBeUndefined();
+    expect(videoCacheKey({ ...v, seekable: { length: 1, end: () => 1073741824 } }, yt)).toBeUndefined();
+    expect(isLiveCacheTarget({ duration: Infinity }, yt)).toBe(true);
+    expect(isLiveCacheTarget(v, yt)).toBe(false);
+  });
+
+  it('withCache with isLive: no hit, no put; the provider is called even if the cache holds the same id/cell', async () => {
+    let live = false;
+    const { w, provider, cache, hits } = setup({}, { isLive: () => live });
+    await w.translateChunk(chunk(15), ctx());
+    await w.idle();
+    expect((await cache.stats()).entries).toBe(1);
+    live = true;
+    await w.translateChunk(chunk(15), ctx());
+    await w.translateChunk(chunk(30), ctx());
+    await w.idle();
+    expect(provider.calls).toBe(3);
+    expect(hits).toEqual([]);
+    expect((await cache.stats()).entries).toBe(1);
+  });
+
+  it('the live flag arriving while the request is in flight cancels the write', async () => {
+    let live = false;
+    const slow = new FakeGemini();
+    const orig = slow.translateChunk.bind(slow);
+    slow.translateChunk = async (c, x) => {
+      const r = await orig(c, x);
+      live = true;
+      return r;
+    };
+    const { w, cache } = setup({}, { isLive: () => live }, slow);
+    await w.translateChunk(chunk(15), ctx());
+    await w.idle();
+    expect((await cache.stats()).entries).toBe(0);
   });
 });
 

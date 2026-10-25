@@ -1,14 +1,20 @@
 import { CascadeProvider, type CascadeOptions } from '../cascade/provider';
 import { ChromeTextTranslator, type TextTranslator } from '../cascade/translate';
 import { LocalAsrStage } from './asr';
+import { HybridLiveAsr, type LiveAsrMode } from './liveAsr';
+import type { AsrStage } from '../cascade/provider';
 import type { LocalAsrRegistry } from '../../localasr/registry';
 import type { LocalAsrEngineId } from '../../localasr/types';
 
 export interface LocalProviderOptions extends Partial<Omit<CascadeOptions, 'id' | 'label' | 'asr' | 'translators'>> {
   asrRegistry?: LocalAsrRegistry;
   asrOrder?: readonly LocalAsrEngineId[];
+  /** settings.sourceLang: an explicit source language beats every automatic one */
+  getSourceLang?: () => string | undefined;
   /** text translators in order: default Chrome Translator; apps may add Groq chat when a key exists */
   translators?: () => TextTranslator[];
+  /** cloud recognizer for LIVE chunks (Groq Whisper); absent = always local */
+  liveAsr?: { groq: AsrStage; hasKey(): boolean; mode(): LiveAsrMode };
 }
 
 /**
@@ -22,7 +28,7 @@ export function createLocalProvider(o: LocalProviderOptions = {}): CascadeProvid
     ...o,
     id: 'local',
     label: 'Локальные модели',
-    asr: new LocalAsrStage(o.asrRegistry, o.asrOrder),
+    asr: ((local) => (o.liveAsr ? new HybridLiveAsr({ local, ...o.liveAsr }) : local))(new LocalAsrStage(o.asrRegistry, o.asrOrder, o.getSourceLang)),
     translators: o.translators ?? (() => [chrome]),
   });
 }

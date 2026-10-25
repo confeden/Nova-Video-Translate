@@ -62,6 +62,8 @@ export interface ChainContext {
   cooldownMs?: number;
   /** latest settings (the user may change tiers while a chunk is in flight) */
   getSettings?(): Settings;
+  /** the video is a live stream (stamped into ProviderContext.live: the local tier may use cloud ASR there) */
+  isLive?(): boolean;
   /** called when a tier attempt starts (abort = cancel just that attempt) and with undefined when it ends */
   onAttempt?(id: ProviderId, abort: (() => void) | undefined): void;
   /** a tier answered with a rate-limit-like signal (HTTP 429 / 402 / 503 or kind 'quota'): the engine backs off */
@@ -85,6 +87,8 @@ export interface ChainContext {
   onHint?(id: ProviderId, remainingSec: number): void;
   /** a tier attempt finished OK after `ms`, or was cut off by its deadline (censored) */
   onLatency?(id: ProviderId, ms: number, censored: boolean): void;
+  /** a tier attempt ended for good (success, or a failure / timeout that was not a cancellation): used for per-request evidence */
+  onTierResult?(id: ProviderId, ok: boolean, ms: number): void;
   /** a higher-priority racer finished after a lower-priority one had already been delivered */
   onLate?(win: { providerId: ProviderId; result: ChunkResult; latencyMs: number }): void;
 }
@@ -303,7 +307,7 @@ async function tryTier(
         p,
         hedge ? tiers : [p],
         chunk,
-        { targetLang: 'ru', sourceLang: ctx.sourceLang, wantSubtitles: cur.subtitles === 'on' },
+        { targetLang: 'ru', sourceLang: ctx.sourceLang, wantSubtitles: cur.subtitles === 'on', live: ctx.isLive?.() === true },
         ac,
         ctx,
         state,
@@ -316,6 +320,7 @@ async function tryTier(
       const dubSec = result.segments.reduce((n, s) => n + Math.max(0, s.end - s.start), 0);
       diag.log('tier-ok', { ...cell, tier: providerId, ms: latencyMs, segments: result.segments.length, dubSec, voice: result.voice, lang: result.sourceLang });
       ctx.onLatency?.(providerId, latencyMs, false);
+      ctx.onTierResult?.(providerId, true, latencyMs);
       return { ok: true, providerId, result, latencyMs };
     } catch (e) {
       if (ctx.signal.aborted) throw e;
@@ -325,6 +330,7 @@ async function tryTier(
         diag.log('tier-cancelled', { ...cell, tier: p.id, ms: ctx.now() - t0 });
         break;
       }
+      ctx.onTierResult?.(p.id, false, ctx.now() - t0);
       const kind = e instanceof ProviderUnavailableError ? e.kind : 'failed';
       const status = /HTTP (\d{3})/.exec(msg)?.[1];
       if (kind === 'quota' || status === '429' || status === '402' || status === '503') ctx.onRateSignal?.(p.id, status ? Number(status) : undefined);

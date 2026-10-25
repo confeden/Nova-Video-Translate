@@ -8,7 +8,7 @@ import { mountSettingsPanel, type SettingsPanelHandle, type SettingsPanelHost } 
 
 const CSS = `
 :host{all:initial}
-.pop{position:fixed;z-index:2147483647;box-sizing:border-box;width:300px;max-width:calc(100vw - 16px);overflow:auto;overscroll-behavior:contain;
+.pop{position:fixed;z-index:2147483647;box-sizing:border-box;width:460px;max-width:calc(100vw - 16px);overflow:auto;overscroll-behavior:contain;
  border-radius:12px;box-shadow:0 10px 40px rgba(0,0,0,.55);background:#181a1c;color:#f1f1f1;border:1px solid #2b2f33;color-scheme:dark;
  font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 .x{position:absolute;top:6px;right:8px;border:0;background:none;color:inherit;font-size:22px;line-height:1;cursor:pointer;opacity:.6;z-index:2}
@@ -60,7 +60,7 @@ export function openPagePanel(opts: OpenPagePanelOptions): PagePanelHandle {
     const vw = doc.documentElement.clientWidth || window.innerWidth;
     const vh = doc.documentElement.clientHeight || window.innerHeight;
     const margin = 8;
-    const width = Math.min(300, vw - 2 * margin);
+    const width = Math.min(460, vw - 2 * margin);
     pop.style.width = `${width}px`;
     const a = opts.anchor?.isConnected ? opts.anchor.getBoundingClientRect() : null;
     pop.style.top = pop.style.bottom = pop.style.left = pop.style.right = '';

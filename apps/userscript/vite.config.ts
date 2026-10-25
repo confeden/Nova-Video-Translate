@@ -20,7 +20,7 @@ export default defineConfig({
         'run-at': 'document-start',
         grant: ['GM_xmlhttpRequest', 'GM_getValue', 'GM_setValue', 'GM_registerMenuCommand', 'GM_addValueChangeListener', 'GM_info', 'unsafeWindow'],
         // Only these hosts are ever contacted from the script. Nothing else is needed (no '*').
-        connect: ['api.browser.yandex.ru', 'mds.yandex.net', 'generativelanguage.googleapis.com', 'api.groq.com', 'oauth.yandex.ru', 'login.yandex.ru'],
+        connect: ['api.browser.yandex.ru', 'mds.yandex.net', 'generativelanguage.googleapis.com', 'api.groq.com', 'oauth.yandex.ru', 'login.yandex.ru', 'api.github.com', 'gql.twitch.tv', 'usher.ttvnw.net', '*.ttvnw.net', '*.live-video.net'],
       },
     }),
   ],

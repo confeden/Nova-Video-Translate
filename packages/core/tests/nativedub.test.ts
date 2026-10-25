@@ -356,7 +356,8 @@ describe('engine: native Russian dub', () => {
     const e = setup(t, { prefer: false });
     await e.engine.start();
     await flush();
-    expect(t.listCalls).toBe(0);
+    expect(t.selected).toEqual([]); // live detection may read the list, but the track is never switched
+    expect(evs('native-dub-probe')).toHaveLength(0);
     expect(e.caps).toHaveLength(1);
     e.engine.stop();
   });

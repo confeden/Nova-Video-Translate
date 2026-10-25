@@ -69,7 +69,8 @@ const storeFor = (u: LocalTtsUnit): OpfsModelStore => {
 
 // ---- idle auto-close ----
 let idleTimer: ReturnType<typeof setTimeout> | undefined;
-function touch(): void {
+/** keeps the offscreen document alive (also called by the local-ASR runtime sharing this document) */
+export function touch(): void {
   clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
     if (downloads.size > 0 || queue.size > 0) return touch();
@@ -161,13 +162,24 @@ async function startDownload(engine: LocalTtsEngineId, voice: string | undefined
     const store = storeFor(unit);
     await navigator.storage.persist?.().catch(() => false);
     await store.pruneOld().catch(() => {});
-    const r = await downloadModel({
-      files: unit.files,
-      baseUrl,
-      store,
-      signal: ac.signal,
-      onProgress: (p) => emit({ ev: 'progress', unit: unit.id, loaded: p.loaded, total: p.total }),
-    });
+    // primary base URL first (an override replaces the whole list), then the unit's fallbacks; the last error is surfaced
+    const bases = baseUrlOverride ? [baseUrlOverride] : [baseUrl, ...(unit.fallbackBaseUrls ?? [])];
+    let r!: Awaited<ReturnType<typeof downloadModel>>;
+    for (let i = 0; i < bases.length; i++) {
+      try {
+        r = await downloadModel({
+          files: unit.files,
+          baseUrl: bases[i]!,
+          store,
+          signal: ac.signal,
+          onProgress: (p) => emit({ ev: 'progress', unit: unit.id, loaded: p.loaded, total: p.total }),
+        });
+        break;
+      } catch (e) {
+        if ((e as Error).name === 'AbortError' || i === bases.length - 1) throw e;
+        console.warn(`[nvt-tts] ${bases[i]} failed (${String((e as Error).message ?? e).slice(0, 120)}), trying the next base URL`);
+      }
+    }
     emit({ ev: 'downloaded', unit: unit.id, bytes: r.bytes, fetchedBytes: r.fetchedBytes, ms: Date.now() - t0 });
   } catch (e) {
     if ((e as Error).name === 'AbortError') emit({ ev: 'error', unit: unit.id, message: 'скачивание отменено' });
@@ -254,6 +266,31 @@ async function deleteUnit(engine: LocalTtsEngineId, voice: string | undefined): 
   return { ok: true };
 }
 
+async function dirBytes(d: FileSystemDirectoryHandle): Promise<number> {
+  let n = 0;
+  for await (const [, h] of (d as unknown as { entries(): AsyncIterable<[string, FileSystemHandle]> }).entries()) {
+    if (h.kind === 'file') n += (await (h as FileSystemFileHandle).getFile()).size;
+    else n += await dirBytes(h as FileSystemDirectoryHandle);
+  }
+  return n;
+}
+
+/** "Delete all models": stops downloads, releases the engine, removes every nvt-* OPFS pack */
+async function clearAll(): Promise<LttsReply<{ freedBytes: number }>> {
+  for (const c of downloads.values()) c.abort();
+  await queue.run(() => disposeLoaded());
+  stores.clear();
+  let freed = 0;
+  const root = (await navigator.storage.getDirectory()) as FileSystemDirectoryHandle & { keys(): AsyncIterable<string> };
+  const names: string[] = [];
+  for await (const k of root.keys()) if (k.startsWith('nvt-')) names.push(k);
+  for (const k of names) {
+    freed += await dirBytes(await root.getDirectoryHandle(k)).catch(() => 0);
+    await root.removeEntry(k, { recursive: true });
+  }
+  return { ok: true, freedBytes: freed };
+}
+
 export function startOffscreenRuntime(): void {
   browser.runtime.onMessage.addListener((raw: unknown, _sender: unknown, sendResponse: (r: unknown) => void) => {
     const msg = raw as LttsRequest | undefined;
@@ -281,6 +318,8 @@ export function startOffscreenRuntime(): void {
       }
       case 'delete':
         return reply(deleteUnit(msg.engine ?? DEFAULT_ENGINE, msg.voice));
+      case 'clear-all':
+        return reply(clearAll());
       case 'warm': {
         const engine = msg.engine ?? DEFAULT_ENGINE;
         return reply(queue.run(async () => {

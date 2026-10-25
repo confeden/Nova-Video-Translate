@@ -74,8 +74,8 @@ export function b64ToInt16(b64: string): Int16Array {
  * gets a `fadeSec` fade-out. Nothing above the silence threshold is ever removed.
  */
 export function trimEdges(f: Float32Array, sr: number, o: { eps?: number; leadKeepSec?: number; tailMinSec?: number; fadeSec?: number } = {}): Float32Array {
-  const eps = o.eps ?? 0.003;
-  const keepLead = Math.round((o.leadKeepSec ?? 0.06) * sr);
+  const eps = o.eps ?? 0.0015;
+  const keepLead = Math.round((o.leadKeepSec ?? 0.08) * sr);
   const tailMin = Math.round((o.tailMinSec ?? 0.15) * sr);
   const fade = Math.round((o.fadeSec ?? 0.06) * sr);
   let a = 0;

@@ -162,6 +162,14 @@ export const PITCH_HYSTERESIS_HZ = 8;
 const SAME_SPEAKER_LOG = 0.2;
 const MAX_CENTROIDS = 4;
 const CHILD_VOICE = 'Leda';
+/**
+ * A translate-model 'child' label is honoured for a speaker id only when it is sustained (>= CHILD_MIN_RUN consecutive
+ * segments, or >= CHILD_MIN_SHARE of that speaker's segments with at least CHILD_MIN_RUN of them) AND the measured f0
+ * of those segments is at least CHILD_MIN_F0_HZ. Adult female speech stays below this; children typically above it.
+ */
+export const CHILD_MIN_RUN = 3;
+export const CHILD_MIN_SHARE = 0.6;
+export const CHILD_MIN_F0_HZ = 280;
 
 export function classifyPitch(gender: VoiceGender, f0: number, prev?: PitchClass): PitchClass {
   const [a, b] = PITCH_BOUNDS[gender];
@@ -189,6 +197,16 @@ export interface VoiceMemory {
   centroids: PitchCentroid[];
   /** gender of the most recent confident segment; resolves leading 'unknown' speakers of the next chunk */
   lastGender?: VoiceGender;
+  /**
+   * speaker id ('S1', ...) -> profile and voice fixed on the speaker's first confident segments. A speaker id never
+   * changes profile or voice again for the rest of the video (optional: memories saved by older versions lack it).
+   */
+  speakers?: Record<string, SpeakerEntry>;
+}
+
+export interface SpeakerEntry {
+  profile: ProfileKind;
+  voice: string;
 }
 
 export function newVoiceMemory(): VoiceMemory {
@@ -258,14 +276,87 @@ export function resolveSpeakerVoice(
 }
 
 export interface AutoVoiceResult extends VoiceChoice {
-  /** measured f0 of this segment's speaker, Hz (0 = unknown) */
+  /**
+   * measured f0 of this segment's speaker, Hz (0 = unknown). 0 also for a speaker whose voice was fixed on an earlier
+   * chunk (no new measurement was made for it).
+   */
   f0: number;
   cls?: PitchClass;
+}
+
+interface ResolvedSpeaker extends SpeakerEntry {
+  f0: number;
+  cls?: PitchClass;
+}
+
+/** A 'child' label counts only when sustained: a run of consecutive segments, or a clear share of the speaker's segments. */
+function childLabelSustained(idx: number[], childIdx: number[]): boolean {
+  let run = 1;
+  let maxRun = 1;
+  for (let k = 1; k < childIdx.length; k++) {
+    run = childIdx[k] === childIdx[k - 1]! + 1 ? run + 1 : 1;
+    maxRun = Math.max(maxRun, run);
+  }
+  if (maxRun >= CHILD_MIN_RUN) return true;
+  return childIdx.length >= CHILD_MIN_RUN && childIdx.length / idx.length >= CHILD_MIN_SHARE;
+}
+
+/**
+ * Fixes the profile and voice of every labelled speaker id that is not yet known to the memory. A speaker id already
+ * in `memory.speakers` is returned unchanged (its gender and voice never change). A new speaker gets:
+ * - 'child' when the child label is sustained and its f0 is in the child range;
+ * - otherwise the majority of its male/female labels in this chunk (a tie or no label leaves it unresolved, so its
+ *   segments inherit the neighbouring voice).
+ */
+function resolveSpeakers(
+  segs: VoiceInput[],
+  f0Of: (indexes: number[]) => number,
+  memory: VoiceMemory,
+): Map<string, ResolvedSpeaker> {
+  if (!memory.speakers) memory.speakers = {};
+  const known = memory.speakers;
+  const bySpeaker = new Map<string, number[]>();
+  segs.forEach((s, i) => {
+    if (!s.speaker) return;
+    const g = bySpeaker.get(s.speaker);
+    if (g) g.push(i);
+    else bySpeaker.set(s.speaker, [i]);
+  });
+  const out = new Map<string, ResolvedSpeaker>();
+  for (const [id, idx] of bySpeaker) {
+    const prev = known[id];
+    if (prev) {
+      out.set(id, { ...prev, f0: 0 });
+      continue;
+    }
+    const childIdx = idx.filter((i) => segs[i]?.gender === 'child');
+    if (childIdx.length > 0 && childLabelSustained(idx, childIdx)) {
+      const childF0 = f0Of(childIdx);
+      if (childF0 >= CHILD_MIN_F0_HZ) {
+        const entry: SpeakerEntry = { profile: 'child', voice: CHILD_VOICE };
+        known[id] = entry;
+        out.set(id, { ...entry, f0: childF0 });
+        continue;
+      }
+    }
+    const males = idx.filter((i) => segs[i]?.gender === 'male');
+    const females = idx.filter((i) => segs[i]?.gender === 'female');
+    if (males.length === females.length) continue; // no confident label, or a tie
+    const gender: VoiceGender = males.length > females.length ? 'male' : 'female';
+    const r = resolveSpeakerVoice(memory, gender, f0Of(gender === 'male' ? males : females));
+    const entry: SpeakerEntry = { profile: gender, voice: r.voice };
+    known[id] = entry;
+    out.set(id, { ...entry, f0: r.f0, cls: r.cls });
+  }
+  return out;
 }
 
 /**
  * Automatic per-segment voices for one chunk. `f0Of(indexes)` measures the original speech of those segments
  * (Hz, 0 = unknown). `override` (internal / tests) bypasses pitch analysis and uses assignVoices with that map.
+ *
+ * Speaker-sticky (D20b): a segment with a speaker id gets the profile and voice fixed for that id (see resolveSpeakers);
+ * a gender label that differs from it is ignored. Unlabelled segments and unresolved speakers keep the assignVoices logic.
  */
 export function chooseVoices(
   segs: VoiceInput[],
@@ -276,31 +367,45 @@ export function chooseVoices(
   if (override && Object.values(override).some((v) => v !== undefined)) {
     return assignVoices(segs, override).map((c) => ({ ...c, f0: 0 }));
   }
+  const speakers = resolveSpeakers(segs, f0Of, memory);
+  // effective label per segment: a labelled segment takes its speaker's fixed profile (or none = inherit);
+  // an unlabelled 'child' label cannot be verified, so it is unknown
+  const prepared: VoiceInput[] = segs.map((s) => {
+    const { gender, ...rest } = s;
+    if (s.speaker) {
+      const sp = speakers.get(s.speaker);
+      return sp ? { ...rest, gender: sp.profile } : rest;
+    }
+    if (gender === undefined) return rest;
+    return { ...rest, gender: gender === 'child' ? 'unknown' : gender };
+  });
   // leading speakers of unknown gender inherit the previous chunk's gender (consistency across chunks)
-  const prepared = segs.map((s) => ({ ...s }));
   if (memory.lastGender) {
     for (const s of prepared) {
       if (s.gender === 'male' || s.gender === 'female' || s.gender === 'child') break;
       s.gender = memory.lastGender;
     }
   }
-  const base = assignVoices(prepared);
-  const groups = new Map<string, number[]>();
-  base.forEach((c, i) => {
-    const key = `${segs[i]?.speaker ?? ''}|${c.profile}`;
-    const g = groups.get(key);
-    if (g) g.push(i);
-    else groups.set(key, [i]);
-  });
+  const base = assignVoices(prepared, { child: CHILD_VOICE });
   const out: AutoVoiceResult[] = new Array(segs.length);
-  for (const [key, idx] of groups) {
-    const profile = key.slice(key.lastIndexOf('|') + 1) as ProfileKind;
+  const groups = new Map<ProfileKind, number[]>();
+  segs.forEach((s, i) => {
+    const sp = s.speaker ? speakers.get(s.speaker) : undefined;
+    if (sp) {
+      out[i] = { voice: sp.voice, profile: sp.profile, f0: sp.f0, ...(sp.cls ? { cls: sp.cls } : {}) };
+      return;
+    }
+    const profile = base[i]!.profile;
+    const g = groups.get(profile);
+    if (g) g.push(i);
+    else groups.set(profile, [i]);
+  });
+  for (const [profile, idx] of groups) {
     if (profile === 'child') {
       for (const i of idx) out[i] = { voice: CHILD_VOICE, profile, f0: 0 };
       continue;
     }
-    const f0 = f0Of(idx);
-    const r = resolveSpeakerVoice(memory, profile, f0);
+    const r = resolveSpeakerVoice(memory, profile, f0Of(idx));
     for (const i of idx) out[i] = { voice: r.voice, profile, f0: r.f0, cls: r.cls };
   }
   return out;

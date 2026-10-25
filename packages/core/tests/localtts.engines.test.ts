@@ -73,7 +73,8 @@ describe('catalog', () => {
 
   it('Silero is published on the VPS and the size total matches the file list', () => {
     expect(unitFor('silero-cpu')!.published).toBe(true);
-    expect(unitFor('silero-cpu')!.baseUrl).toBe('http://212.116.115.237:8081/silero/');
+    expect(unitFor('silero-cpu')!.baseUrl).toBe('https://s3.ru1.storage.beget.cloud/b04f36843373-decisive-daly/nvt-models/silero/');
+    expect(unitFor('silero-cpu')!.fallbackBaseUrls).toEqual(['http://212.116.115.237:8081/silero/']);
     expect(SILERO_FILES.reduce((a, f) => a + f.size, 0)).toBe(unitFor('silero-cpu')!.total);
   });
 

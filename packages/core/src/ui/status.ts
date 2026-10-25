@@ -27,6 +27,8 @@ export interface TranslateStatus {
   etaSource?: string;
   /** the user's top tier takes over later than the one voicing now (Russian name, e.g. 'живые голоса') */
   later?: string;
+  /** why the local tier produced nothing audible yet (first blocking reason, Russian); absent when there is none */
+  reason?: string;
 }
 
 export function isActiveState(s: EngineState): boolean {
@@ -41,15 +43,15 @@ const STATE_TEXT: Record<EngineState, string> = {
   translating: 'Идёт перевод',
   error: 'Ошибка перевода',
   'skipped-ru': 'Видео уже на русском',
-  'native-dub': 'Используется родная русская дорожка',
+  'native-dub': 'Родная русская дорожка',
 };
 
 /** Panel line about the spoken language of the video. */
 export function languageStatusText(l: LanguageInfo | undefined): string | undefined {
   if (!l) return undefined;
   const name = langName(l.lang);
-  if (l.unverified) return l.lang ? `Язык оригинала: возможно ${name} — проверю по первому фрагменту` : 'Язык оригинала: не определён — проверю по первому фрагменту';
-  const tail = l.skipped ? ` — перевод не нужен (отключить: «Не переводить видео на русском»)` : '';
+  if (l.unverified) return l.lang ? `Язык оригинала: возможно ${name}` : 'Язык оригинала: не определён';
+  const tail = l.skipped ? ` — перевод не нужен` : '';
   return `Язык оригинала: ${name} (${howLabel(l.how)})${tail}`;
 }
 

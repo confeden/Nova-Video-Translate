@@ -187,7 +187,7 @@ export interface PlanTier {
   expectedSec: number;
 }
 
-export type PlanReason = 'preferred-in-time' | 'preferred-late-fallback' | 'none-in-time-fastest' | 'single' | 'no-tier' | 'full-track';
+export type PlanReason = 'preferred-in-time' | 'preferred-late-fallback' | 'none-in-time-fastest' | 'single' | 'no-tier' | 'full-track' | 'live-quality';
 
 export interface CellPlan {
   /** tiers to start now, highest priority first */

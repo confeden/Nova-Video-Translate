@@ -10,7 +10,11 @@ import type { VoiceReport } from './videoController';
 import { SOURCE_LANG_OPTIONS } from '../lang/names';
 import { isActiveState, stateText, voiceLine, type TranslateStatus } from './status';
 import { DEFAULT_SETTINGS, type Settings } from '../types';
+import { normHost } from '../settings';
+import { GEMINI_KEYS_URL, GROQ_KEYS_URL, openKeyPage } from './keyLinks';
+import { localAsrSection, type LocalAsrPanelHost } from './localAsrSection';
 import { localTtsSection, type LocalTtsPanelHost } from './localTtsSection';
+import { isReleasePageUrl, type UpdateCheckResult, type UpdateInfo } from '../update';
 
 export interface YandexAccountInfo {
   login?: string;
@@ -25,7 +29,7 @@ export interface VoiceStatus {
   voiced?: VoiceReport;
 }
 
-export interface SettingsPanelHost extends LocalTtsPanelHost {
+export interface SettingsPanelHost extends LocalTtsPanelHost, LocalAsrPanelHost {
   getSettings(): Promise<Settings>;
   saveSettings(patch: Partial<Settings>): Promise<void>;
   /** ListModels with this key; rejects when the key is invalid / unreachable */
@@ -42,6 +46,8 @@ export interface SettingsPanelHost extends LocalTtsPanelHost {
   /** result cache statistics / reset; omitted = the cache block shows only the settings */
   cacheStats?(): Promise<{ entries: number; bytes: number }>;
   cacheClear?(): Promise<void>;
+  /** deletes every downloaded local model (Whisper cache, TTS packs, calibrations); omitted = no button */
+  clearLocalModels?(): Promise<{ freedBytes: number }>;
   /** build version shown at the bottom ("Версия X.Y.Z") */
   version?: string;
   /** state of the video this panel controls; null = no video here; omitted = no translate block at all */
@@ -55,6 +61,14 @@ export interface SettingsPanelHost extends LocalTtsPanelHost {
   clearDiag?(): Promise<void>;
   /** shows a test subtitle on the page's player; false = no player */
   showTestCue?(text: string): Promise<boolean>;
+  /** the stored newer release (shown as a banner only when present); omitted = no update notice */
+  getUpdate?(): Promise<UpdateInfo | null>;
+  /** user click: checks GitHub now and returns the outcome */
+  checkUpdateNow?(): Promise<UpdateCheckResult>;
+  /** opens the release page (https://github.com/confeden/Nova-Video-Translate/ only); omitted = window.open */
+  openUpdatePage?(url: string): Promise<void>;
+  /** opens an API-key page (GEMINI_KEYS_URL / GROQ_KEYS_URL only) in a new tab; omitted = window.open */
+  openKeyPage?(url: string): Promise<void>;
 }
 
 export interface SettingsPanelHandle {
@@ -67,7 +81,7 @@ export const PROVIDER_LABELS: Record<ProviderId, string> = {
   yandex: 'Яндекс — обычные',
   groq: 'Groq (распознавание и перевод) + локальный голос',
   local: 'Локальные модели (без интернета-сервисов)',
-  gemini: 'Gemini (запасной, выключен)',
+  gemini: 'Gemini',
 };
 
 
@@ -116,6 +130,13 @@ const CSS = `
 .nvt-sp .top .sub.bad{color:var(--bad)}
 .nvt-sp .top .sub.ok{color:var(--acc)}
 .nvt-sp .ver{color:var(--mut);font-size:11px;text-align:center;margin:2px 0 0}
+.nvt-sp .foot{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:6px 0 0;font-size:11px;color:var(--mut)}
+.nvt-sp .foot a{color:var(--mut);text-decoration:underline;margin-left:auto}
+.nvt-sp .foot a:hover{color:var(--acc)}
+.nvt-sp .upd{border:1px solid var(--acc);background:#16301f;border-radius:8px;padding:8px 10px;margin:0 0 8px}
+.nvt-sp .upd .upd-t{font-weight:600;margin-bottom:6px}
+.nvt-sp button.link{border:0;background:none;color:var(--acc);padding:0;font-size:11px;text-decoration:underline}
+.nvt-sp button.link:hover:not(:disabled){background:none;border:0;text-decoration:none}
 .nvt-sp textarea{width:100%;box-sizing:border-box;height:80px;font:11px ui-monospace,Consolas,monospace;background:var(--inp);color:var(--fg);border:1px solid var(--ctl);border-radius:6px}
 `;
 
@@ -177,6 +198,9 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
   let statusBusy = false;
   let diagMsg = '';
   let diagText = '';
+  let update: UpdateInfo | null = null;
+  let updateMsg = '';
+  let updateBusy = false;
 
   const save = async (patch: Partial<Settings>): Promise<void> => {
     s = { ...s, ...patch };
@@ -208,18 +232,20 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
 
   const voicesSection = (): HTMLElement => {
     const list = h('div');
-    s.voiceOrder.forEach((id, i) => {
+    // no getLocalAsrInfo => no local tiers on this host (userscript): Groq and the on-device tier are not offered
+    const order = host.getLocalAsrInfo ? s.voiceOrder : s.voiceOrder.filter((id) => id !== 'groq' && id !== 'local');
+    order.forEach((id, i) => {
       const cb = h('input', {
         type: 'checkbox',
         checked: s.voiceEnabled[id] !== false,
         onchange: () => void save({ voiceEnabled: { ...s.voiceEnabled, [id]: cb.checked } }),
       });
       const move = (d: number) => async (): Promise<void> => {
-        const o = [...s.voiceOrder];
+        const o = [...order];
         const j = i + d;
         if (j < 0 || j >= o.length) return;
         [o[i], o[j]] = [o[j]!, o[i]!];
-        await save({ voiceOrder: o });
+        await save({ voiceOrder: host.getLocalAsrInfo ? o : [...o, ...s.voiceOrder.filter((x) => !o.includes(x))] });
         render();
       };
       list.append(
@@ -229,7 +255,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
           cb,
           h('span', { class: 'name' }, `${i + 1}. ${PROVIDER_LABELS[id]}`),
           h('button', { title: 'Выше', disabled: i === 0, onclick: move(-1) }, '↑'),
-          h('button', { title: 'Ниже', disabled: i === s.voiceOrder.length - 1, onclick: move(1) }, '↓'),
+          h('button', { title: 'Ниже', disabled: i === order.length - 1, onclick: move(1) }, '↓'),
         ),
       );
       if (id === 'yandex-live') list.append(yandexRow());
@@ -278,9 +304,14 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
         h('select', { disabled: true }, h('option', {}, 'Русский')),
       ),
       toggle('Субтитры', s.subtitles === 'on', (v) => void save({ subtitles: v ? 'on' : 'off' })),
+      (() => {
+        const sel = h('select', { onchange: () => void save({ subtitleLang: sel.value === 'translation' ? 'translation' : 'original' }) },
+          h('option', { value: 'original' }, 'Оригинал'), h('option', { value: 'translation' }, 'Перевод'));
+        sel.value = s.subtitleLang === 'translation' ? 'translation' : 'original';
+        return h('div', { class: 'row' }, h('label', {}, 'Язык субтитров'), sel);
+      })(),
       toggle('Использовать родной русский дубляж, если есть', s.preferNativeDub !== false, (v) => void save({ preferNativeDub: v })),
       toggle('Не переводить видео на русском', s.skipRussian !== 'off', (v) => void save({ skipRussian: v ? 'on' : 'off' })),
-      toggle('Ждать конца ячейки перед озвучкой (меньше обрывов фраз, больше задержка)', s.holdCellsToEnd === true, (v) => void save({ holdCellsToEnd: v })),
       (() => {
         const sel = h('select', { class: 'grow', onchange: () => void save({ sourceLang: sel.value }) });
         for (const [code, label] of SOURCE_LANG_OPTIONS) sel.append(h('option', { value: code }, label));
@@ -289,7 +320,21 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
         return h('div', { class: 'row' }, h('label', {}, 'Язык оригинала'), sel);
       })(),
       toggle('Переводить автоматически', s.autoTranslate === 'on', (v) => void save({ autoTranslate: v ? 'on' : 'off' })),
-      toggle('Ждать перевод: ставить видео на паузу, пока не готов первый фрагмент', s.prerollPause === 'on', (v) => void save({ prerollPause: v ? 'on' : 'off' })),
+      (() => {
+        const host = normHost(status?.page || location.hostname);
+        if (!host) return h('div');
+        return toggle(`Не переводить автоматически на ${host}`, s.autoTranslateExcluded.includes(host), (v) =>
+          void save({ autoTranslateExcluded: v ? [...new Set([...s.autoTranslateExcluded, host])] : s.autoTranslateExcluded.filter((x) => x !== host) }));
+      })(),
+      (() => {
+        const inp = h('input', { type: 'number', min: '-1', max: '60', step: '1', value: String(s.liveDelaySec ?? -1), onchange: () => void save({ liveDelaySec: Math.max(-1, Math.min(60, Math.round(Number(inp.value) || 0))) }) }) as HTMLInputElement;
+        return h('div', { class: 'row' }, h('label', {}, 'Задержка эфира, с (-1 авто)'), inp);
+      })(),
+      (() => {
+        const inp = h('input', { type: 'number', min: '0', max: '6', step: '0.5', value: String(s.dubLagSec ?? 1), onchange: () => void save({ dubLagSec: Math.max(0, Math.min(6, Number(inp.value) || 0)) }) }) as HTMLInputElement;
+        return h('div', { class: 'row' }, h('label', {}, 'Задержка озвучки, с'), inp);
+      })(),
+      toggle('Пауза, пока не готов первый фрагмент', s.prerollPause === 'on', (v) => void save({ prerollPause: v ? 'on' : 'off' })),
       (() => {
         const sel = h('select', { class: 'grow', onchange: () => void save({ clickAction: sel.value === 'toggle' ? 'toggle' : 'settings' }) },
           h('option', { value: 'settings' }, 'открывать настройки'),
@@ -372,7 +417,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
       'gem',
       'Gemini',
       keysBox,
-      h('div', { class: 'row' }, newKey, h('button', { class: 'primary', onclick: () => void add() }, 'Добавить')),
+      h('div', { class: 'row' }, newKey, h('button', { class: 'primary', onclick: () => void add() }, 'Добавить'), h('button', { onclick: () => void openKeyPage(host, GEMINI_KEYS_URL) }, 'Получить ключ')),
       h('div', { class: 'row' }, h('label', {}, 'Модель перевода'), modelSelect('translate')),
       h('div', { class: 'row' }, h('label', {}, 'Модель озвучки'), modelSelect('tts')),
       modelsMsg ? h('div', { class: 'hint bad' }, modelsMsg) : null,
@@ -441,7 +486,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
 
   const groqRow = (): HTMLElement => {
     const input = h('input', { type: 'password', class: 'grow', placeholder: 'Ключ Groq (вставьте сюда)', autocomplete: 'off', value: s.groqApiKey });
-    const getBtn = h('button', { onclick: () => window.open('https://console.groq.com/keys', '_blank', 'noopener') }, 'Получить ключ');
+    const getBtn = h('button', { onclick: () => void openKeyPage(host, GROQ_KEYS_URL) }, 'Получить ключ');
     const saved = h('span', { class: 'ok' }, '✓');
     const sync = (): void => {
       const has = input.value.trim() !== '';
@@ -548,6 +593,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
   // ---- translate toggle + status (top of the panel) ----
 
   const topBox = h('div', { class: 'top' });
+  let lastTopSig = '';
   const renderTop = (): void => {
     const st = status;
     const active = !!st && (isActiveState(st.state) || st.state === 'native-dub');
@@ -577,12 +623,18 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
       if (st.language) lines.push(h('div', { class: st.state === 'skipped-ru' ? 'sub' : 'hint' }, st.language));
       if (st.voice) lines.push(h('div', { class: 'sub ok' }, voiceLine(st.voice, st.later)));
       if (st.subtitles) lines.push(h('div', { class: 'sub ok' }, st.subtitles));
-      // problem / warning lines are NOT shown here (owner decision): they live in the diagnostics report only
-      if (st.page) lines.push(h('div', { class: 'hint' }, `Вкладка: ${st.page}`));
+      // problem / warning lines are NOT shown here (owner decision): they live in the diagnostics report only.
+      // The one exception is the first blocking reason of the local tier (nothing audible yet): one line, no banner
+      if (st.reason) lines.push(h('div', { class: 'sub bad', 'data-reason': '1' }, st.reason));
     } else if (st === null) {
-      lines.push(h('div', { class: 'hint' }, 'Откройте страницу с видео — здесь появится управление переводом.'));
+      lines.push(h('div', { class: 'hint' }, 'Нет видео на странице'));
     }
-    topBox.replaceChildren(btn, ...(lines.filter(Boolean) as Node[]));
+    const kids = [btn, ...(lines.filter(Boolean) as Node[])];
+    // identical render (the 1 s poll with an unchanged status) must not swap the nodes: no twitch, hover / focus kept
+    const sig = kids.map((k) => (k as Element).outerHTML ?? k.textContent ?? '').join('');
+    if (sig === lastTopSig && topBox.childNodes.length === kids.length) return;
+    lastTopSig = sig;
+    topBox.replaceChildren(...kids);
   };
   const pollStatus = async (): Promise<void> => {
     if (destroyed || statusBusy || !host.getTranslateStatus) return;
@@ -669,7 +721,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
                 } catch {
                   r = null;
                 }
-                if (!r) return set('Нет данных: откройте страницу с видео и повторите.');
+                if (!r) return set('Нет данных: откройте страницу с видео.');
                 const lines = r.text.split('\n').length;
                 const from = r.source ? ` (вкладка ${r.source})` : '';
                 const saved = await saveReport(r.text);
@@ -690,7 +742,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
           ? h('button', {
               onclick: async () => {
                 const ok = await host.showTestCue?.('Тестовый субтитр: так выглядят субтитры NVT').catch(() => false);
-                set(ok ? 'Тестовый субтитр показан на плеере (6 секунд).' : 'На странице нет плеера с видео.');
+                set(ok ? 'Субтитр показан.' : 'На странице нет плеера с видео.');
               },
             }, 'Показать тестовый субтитр')
           : null,
@@ -700,20 +752,113 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
     );
   };
 
+  const openUpdate = async (url: string): Promise<void> => {
+    if (!isReleasePageUrl(url)) return;
+    if (host.openUpdatePage) await host.openUpdatePage(url).catch(() => window.open(url, '_blank', 'noopener'));
+    else window.open(url, '_blank', 'noopener');
+  };
+
+  const checkNow = async (): Promise<void> => {
+    if (!host.checkUpdateNow || updateBusy) return;
+    updateBusy = true;
+    updateMsg = 'Проверяем…';
+    render();
+    try {
+      const r = await host.checkUpdateNow();
+      update = r.update;
+      updateMsg = r.failed ? 'Не удалось проверить, попробуйте позже' : r.update ? '' : 'Установлена последняя версия';
+    } catch {
+      updateMsg = 'Не удалось проверить, попробуйте позже';
+    } finally {
+      updateBusy = false;
+      render();
+    }
+  };
+
+  /** prominent row at the top, only while a newer release is stored */
+  const updateBanner = (): Node | null => {
+    if (!update) return null;
+    const cur = update;
+    return h(
+      'div',
+      { class: 'upd' },
+      h('div', { class: 'upd-t' }, `Доступна новая версия ${cur.version} (у вас ${host.version ?? '—'})`),
+      h('button', { class: 'primary', onclick: () => void openUpdate(cur.url) }, 'Открыть страницу релиза'),
+    );
+  };
+
+  /** version line with the forced-check link (only when the host can check) */
+  const versionLine = (): Node | null => {
+    const kids: Child[] = [];
+    if (host.version) kids.push(`Версия ${host.version}`);
+    if (host.checkUpdateNow) {
+      kids.push(
+        host.version ? ' · ' : null,
+        h('button', { class: 'link', disabled: updateBusy, onclick: () => void checkNow() }, 'Проверить обновления'),
+        updateMsg ? ` ${updateMsg}` : null,
+      );
+    }
+    return kids.length ? h('div', { class: 'ver' }, ...kids) : null;
+  };
+
+  // two-step wipe of the local models: 1st click arms for 4 s, 2nd click runs it (no dialog)
+  let clearStep: 'idle' | 'armed' | 'busy' = 'idle';
+  let clearMsg = '';
+  let clearTimer: ReturnType<typeof setTimeout> | undefined;
+  const fmtBytes = (n: number): string => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} ГБ` : `${Math.max(0, Math.round(n / 1e6))} МБ`);
+  const onClear = async (): Promise<void> => {
+    if (clearStep === 'busy' || !host.clearLocalModels) return;
+    if (clearStep === 'idle') {
+      clearStep = 'armed';
+      clearMsg = '';
+      clearTimer = setTimeout(() => {
+        clearStep = 'idle';
+        render();
+      }, 4000);
+      render();
+      return;
+    }
+    clearTimeout(clearTimer);
+    clearStep = 'busy';
+    render();
+    try {
+      const r = await host.clearLocalModels();
+      clearMsg = `Удалено: ${fmtBytes(r.freedBytes)}`;
+    } catch {
+      clearMsg = 'Ошибка';
+    }
+    clearStep = 'idle';
+    render();
+  };
+  const footer = (): Node => {
+    const kids: Child[] = [];
+    if (host.clearLocalModels) {
+      kids.push(
+        h('button', { class: 'clear-models', disabled: clearStep === 'busy', onclick: () => void onClear() }, clearStep === 'armed' ? 'Точно удалить?' : 'Удалить все модели'),
+        clearMsg ? h('span', {}, clearMsg) : null,
+      );
+    }
+    kids.push(h('a', { href: 'https://t.me/nova_txt', target: '_blank', rel: 'noopener' }, 'Telegram: t.me/nova_txt'));
+    return h('div', { class: 'foot' }, ...kids);
+  };
+
   function render(): void {
     if (destroyed) return;
     renderTop();
     const kids: Child[] = [
       h('h1', {}, 'Nova Video Translate'),
+      updateBanner(),
       host.getTranslateStatus ? topBox : null,
       mixSection(),
       voicesSection(),
       geminiSection(),
-      chromeAiSection(),
+      host.getLocalAsrInfo ? chromeAiSection() : null,
       host.getLocalTtsInfo ? localTtsSection(host) : null,
+      host.getLocalAsrInfo ? localAsrSection(host) : null,
       cacheSection(),
       diagSection(),
-      host.version ? h('div', { class: 'ver' }, `Версия ${host.version}`) : null,
+      versionLine(),
+      footer(),
     ];
     root.replaceChildren(...(kids.filter(Boolean) as Node[]));
   }
@@ -723,6 +868,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
     yandex = await host.getYandexAccount();
     loginError = (await host.getYandexLoginError?.().catch(() => undefined)) ?? undefined;
     voiceStatus = (await host.getVoiceStatus?.().catch(() => ({}))) ?? {};
+    update = (await host.getUpdate?.().catch(() => null)) ?? null;
     render();
     await loadModels();
     render();

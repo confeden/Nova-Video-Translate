@@ -127,9 +127,9 @@ describe('adaptive ducking (D22)', () => {
     expect(video.volume).toBeCloseTo(0.3);
     await run(2.5); // vt 4.5: inside the 2 s gap
     expect(video.volume).toBeCloseTo(0.3);
-    await run(3); // vt 7.5: 5 s gap after the second segment
+    await run(3.3); // vt 7.5: 5 s gap after the second segment
     expect(video.volume).toBe(1);
-    await run(4.5); // vt 12
+    await run(4.2); // vt 12
     expect(video.volume).toBeCloseTo(0.3);
   });
 
@@ -277,11 +277,11 @@ describe('no ducking before a dub is actually audible (planner / late arrivals)'
     expect(video.volume).toBe(1);
   });
 
-  it('a dub that arrives when >= 70% of its slot is gone (skipped) never lowers the original', async () => {
+  it('a dub that arrives more than 4 s behind its slot (skipped whole) never lowers the original', async () => {
     sch = new DubScheduler(video as unknown as HTMLVideoElement, ctx as unknown as AudioContext, {});
     sch.start();
-    await run(8.6);
-    sch.addSegments([seg(5, 'SSSS')]); // slot 5..9, now 8.6: 90% gone, < 3 s left
+    await run(9.6);
+    sch.addSegments([seg(5, 'SSSS')]); // slot 5..9, now 9.6: 4.6 s late > 4 s slip cap
     await run(1.5);
     expect(video.volume).toBe(1);
   });

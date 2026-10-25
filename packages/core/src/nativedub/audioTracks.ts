@@ -26,6 +26,8 @@ export interface AudioTracksState {
   currentId?: string;
   /** setAudioTrack can be called for the listed tracks (the player exposes the track objects) */
   canSelect: boolean;
+  /** the player shows a live stream right now (videoDetails.isLive / getVideoData().isLive) */
+  live?: boolean;
 }
 
 export interface AudioTracksController {
@@ -66,7 +68,7 @@ interface PlayerLike {
   getAudioTrack?: () => unknown;
   setAudioTrack?: (t: unknown) => unknown;
   getPlayerResponse?: () => unknown;
-  getVideoData?: () => { video_id?: string };
+  getVideoData?: () => { video_id?: string; isLive?: boolean };
 }
 
 const s = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
@@ -222,8 +224,15 @@ export function readAudioTracks(doc: { getElementById(id: string): unknown }, wi
   } catch {
     /* ignore */
   }
-  if (tracks.size === 0 && !currentId) return null;
-  return { videoId: videoId ?? respVideo, tracks: [...tracks.values()], currentId, canSelect: live.length > 0 && typeof player?.setAudioTrack === 'function' };
+  let isLive = (resp as { videoDetails?: { isLive?: unknown } } | undefined)?.videoDetails?.isLive === true;
+  try {
+    const vd = player?.getVideoData?.() as { isLive?: unknown } | undefined;
+    if (vd?.isLive === true) isLive = true;
+  } catch {
+    /* ignore */
+  }
+  if (tracks.size === 0 && !currentId && !isLive) return null;
+  return { videoId: videoId ?? respVideo, tracks: [...tracks.values()], currentId, canSelect: live.length > 0 && typeof player?.setAudioTrack === 'function', ...(isLive ? { live: true } : {}) };
 }
 
 /** Switches the player to the track with this id. false = not possible / the player threw. */

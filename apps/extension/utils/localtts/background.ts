@@ -4,7 +4,7 @@
  * Hook: handleLocalTtsMessage() in background.ts.
  */
 import { browser } from 'wxt/browser';
-import { LTTS_ENV_KEY, LTTS_MSG, allUnits, diag, engineInfo, initialState, unitById, unitFor, unitStateKey, type LocalTtsEngineId, type LttsEnv, type LttsEvent, type LttsReply, type LttsRequest, type LttsState } from '@nvt/core';
+import { LASR_MSG, LTTS_ENV_KEY, LTTS_MSG, VOICE_CALIB_STORAGE_KEY, WHISPER_MODELS, lasrStateKey, allUnits, diag, engineInfo, initialState, unitById, unitFor, unitStateKey, type LocalTtsEngineId, type LttsEnv, type LttsEvent, type LttsReply, type LttsRequest, type LttsState } from '@nvt/core';
 
 /** chrome.storage.local key of dev/mirror base-URL overrides: { [unitId]: baseUrl } (e.g. a self-hosted copy of the Silero files) */
 export const LTTS_BASEURLS_KEY = 'nvt.localtts.baseUrls';
@@ -13,9 +13,9 @@ interface OffscreenApi {
   createDocument(o: { url: string; reasons: string[]; justification: string }): Promise<void>;
   closeDocument(): Promise<void>;
 }
-const offscreenApi = (): OffscreenApi | undefined => (browser as unknown as { offscreen?: OffscreenApi }).offscreen;
+export const offscreenApi = (): OffscreenApi | undefined => (browser as unknown as { offscreen?: OffscreenApi }).offscreen;
 const OFFSCREEN_PATH = 'offscreen.html';
-const offscreenUrl = (): string => browser.runtime.getURL(`/${OFFSCREEN_PATH}` as never);
+export const offscreenUrl = (): string => browser.runtime.getURL(`/${OFFSCREEN_PATH}` as never);
 
 // ---- persisted state (one record per download unit; serialised read-modify-write) ----
 let chain: Promise<unknown> = Promise.resolve();
@@ -61,7 +61,7 @@ async function baseUrlOverride(unitId: string): Promise<string | undefined> {
 // ---- offscreen document lifecycle ----
 let creating: Promise<void> | undefined;
 
-async function hasOffscreen(): Promise<boolean> {
+export async function hasOffscreen(): Promise<boolean> {
   const rt = browser.runtime as unknown as { getContexts?: (f: { contextTypes: string[] }) => Promise<unknown[]> };
   if (!rt.getContexts) return false;
   try {
@@ -71,12 +71,12 @@ async function hasOffscreen(): Promise<boolean> {
   }
 }
 
-async function ensureOffscreen(): Promise<void> {
+export async function ensureOffscreen(): Promise<void> {
   const api = offscreenApi();
   if (!api) throw new Error('chrome.offscreen недоступен в этом браузере');
   if (await hasOffscreen()) return;
   creating ??= api
-    .createDocument({ url: OFFSCREEN_PATH, reasons: ['WORKERS'], justification: 'Local text-to-speech models (onnxruntime-web / WebGPU / WASM) and their OPFS model cache' })
+    .createDocument({ url: OFFSCREEN_PATH, reasons: ['WORKERS'], justification: 'Local speech models (text-to-speech and Whisper recognition; onnxruntime-web / WebGPU / WASM) and their model caches' })
     .catch((e: Error) => {
       if (!/single offscreen|already exist/i.test(String(e?.message))) throw e;
     })
@@ -95,12 +95,12 @@ async function closeOffscreen(): Promise<void> {
 }
 
 /** sends to the offscreen document; retries while its listener is still registering */
-async function toOffscreen<T>(msg: object): Promise<LttsReply<T>> {
+export async function toOffscreen<T>(msg: object, type: string = LTTS_MSG): Promise<LttsReply<T>> {
   await ensureOffscreen();
   let last = 'no answer';
   for (let i = 0; i < 8; i++) {
     try {
-      const r = (await browser.runtime.sendMessage({ ...msg, type: LTTS_MSG, to: 'offscreen' })) as LttsReply<T> | undefined;
+      const r = (await browser.runtime.sendMessage({ ...msg, type, to: 'offscreen' })) as LttsReply<T> | undefined;
       if (r) return r;
     } catch (e) {
       last = String((e as Error)?.message ?? e);
@@ -197,6 +197,8 @@ export function handleLocalTtsMessage(raw: unknown, sender: { id?: string; url?:
       })());
     case 'delete':
       return answer(toOffscreen({ op: 'delete', engine: engineOf(msg), voice: msg.voice }));
+    case 'clear-all':
+      return false; // only clearAllLocalModels() sends it, straight to the offscreen document
     default:
       // warm / synth / abort / selftest: straight to the offscreen document
       if (msg.op === 'abort') {
@@ -212,4 +214,22 @@ export function handleLocalTtsMessage(raw: unknown, sender: { id?: string; url?:
         return toOffscreen({ ...msg });
       })());
   }
+}
+
+/** "Delete all models": offscreen stops downloads / releases engines / wipes OPFS + Cache API, then the persisted states and voice calibrations go */
+export async function clearAllLocalModels(): Promise<{ freedBytes: number }> {
+  let freed = 0;
+  await ensureOffscreen();
+  for (const type of [LTTS_MSG, LASR_MSG]) {
+    const r = await toOffscreen<{ freedBytes: number }>({ op: 'clear-all' }, type);
+    if (!r.ok) throw new Error(r.error);
+    freed += r.freedBytes;
+  }
+  const keys = [VOICE_CALIB_STORAGE_KEY, ...allUnits().map((u) => unitStateKey(u.id)), ...WHISPER_MODELS.map((m) => lasrStateKey(m.id))];
+  await chain.catch(() => undefined);
+  await browser.storage.local.remove(keys);
+  await closeOffscreen();
+  await new Promise((r) => setTimeout(r, 300)); // late events of the cancelled downloads
+  await browser.storage.local.remove(keys);
+  return { freedBytes: freed };
 }

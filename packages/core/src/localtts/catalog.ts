@@ -6,7 +6,7 @@
  */
 import type { LocalTtsEngineId, LocalTtsVoiceInfo } from './types';
 import { MODEL_FILES, SUPERTONIC_BASE_URL, SUPERTONIC_REVISION, type ModelFile } from './supertonic/constants';
-import { SILERO_BASE_URL, SILERO_DEFAULT_VOICE, SILERO_FILES, SILERO_REVISION, SILERO_VOICES } from './silero/constants';
+import { SILERO_BASE_URL, SILERO_FALLBACK_BASE_URL, SILERO_DEFAULT_VOICE, SILERO_FILES, SILERO_REVISION, SILERO_VOICES } from './silero/constants';
 import { PIPER_COMMON_FILES, PIPER_DEFAULT_VOICE, PIPER_REVISION, PIPER_VOICES, PIPER_VOICES_BASE_URL, piperVoiceFiles } from './piper/constants';
 
 export type LocalTtsGroup = 'gpu' | 'cpu';
@@ -31,6 +31,8 @@ export interface LocalTtsUnit {
   pack: 'supertonic' | 'silero' | 'piper';
   rev: string;
   baseUrl: string;
+  /** tried in order when the download from baseUrl fails */
+  fallbackBaseUrls?: readonly string[];
   files: readonly ModelFile[];
   total: number;
   /** false = files cannot be fetched yet (no base URL and no absolute file URLs) */
@@ -80,7 +82,7 @@ export function unitFor(id: LocalTtsEngineId, voice?: string): LocalTtsUnit | un
     case 'supertonic-wasm':
       return { id: 'supertonic', pack: 'supertonic', rev: SUPERTONIC_REVISION, baseUrl: SUPERTONIC_BASE_URL, files: MODEL_FILES, total: sum(MODEL_FILES), published: true };
     case 'silero-cpu':
-      return { id: 'silero', pack: 'silero', rev: SILERO_REVISION, baseUrl: SILERO_BASE_URL, files: SILERO_FILES, total: sum(SILERO_FILES), published: isPublished(SILERO_BASE_URL, SILERO_FILES) };
+      return { id: 'silero', pack: 'silero', rev: SILERO_REVISION, baseUrl: SILERO_BASE_URL, fallbackBaseUrls: [SILERO_FALLBACK_BASE_URL], files: SILERO_FILES, total: sum(SILERO_FILES), published: isPublished(SILERO_BASE_URL, SILERO_FILES) };
     case 'piper-wasm': {
       const v = resolveVoice(id, voice);
       const files = [...PIPER_COMMON_FILES, ...piperVoiceFiles(v)];

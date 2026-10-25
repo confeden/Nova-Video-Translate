@@ -5,6 +5,7 @@
  * work unchanged.
  */
 import { diag } from '../../diag';
+import { localReasons, reasonText } from '../../localasr/localReason';
 import type { LocalTtsEngine, LocalTtsEngineId } from '../../localtts/types';
 import { localTtsRegistry, type LocalTtsRegistry } from '../../localtts/registry';
 import type { FitOptions } from '../gemini/sync';
@@ -15,6 +16,7 @@ import { budgetFor, type SourceSegment } from './segments';
 import type { CaptionPretranslator } from './pretranslate';
 import { translateWithFailover, type TextItem, type TextTranslator } from './translate';
 import { voiceSegments } from './voice';
+import { SpeakerTracker, sentencePitch } from '../../audio/speakerGender';
 
 /** Audio -> timed source sentences (absolute video seconds). */
 export interface AsrStage {
@@ -23,7 +25,7 @@ export interface AsrStage {
   available(): Promise<boolean>;
   /** cache-key ingredient: the recognition model / engine in use */
   model(): string | Promise<string>;
-  transcribe(chunk: AudioChunk, ctx: { signal: AbortSignal; sourceLang?: string }): Promise<{ segments: SourceSegment[]; sourceLang?: string }>;
+  transcribe(chunk: AudioChunk, ctx: { signal: AbortSignal; sourceLang?: string; live?: boolean }): Promise<{ segments: SourceSegment[]; sourceLang?: string; speechBursts?: { start: number; end: number }[] }>;
 }
 
 export interface CascadeOptions {
@@ -58,6 +60,8 @@ export class CascadeProvider implements DubProvider {
   readonly label: string;
   private ready = false;
   private engine?: LocalTtsEngine;
+  /** session speaker class (male / female-or-child) of the ORIGINAL audio, with hysteresis */
+  private readonly speaker = new SpeakerTracker();
 
   constructor(protected readonly o: CascadeOptions) {
     this.id = o.id;
@@ -86,6 +90,7 @@ export class CascadeProvider implements DubProvider {
       return;
     }
     this.engine = await this.tts.pick(this.o.ttsOrder);
+    if (!this.engine && this.id === 'local') this.noTts();
     let source = false;
     let asrOk = false;
     if (this.o.asr) {
@@ -114,9 +119,17 @@ export class CascadeProvider implements DubProvider {
     diag.log(`${this.id}-probe`, { tts: this.engine?.id, asr: asrOk, captions: !!cap?.peek(), translate, usable: this.ready });
   }
 
+  private noTts(): void {
+    localReasons.set('tts', reasonText.tts());
+    diag.log('local-reason', { why: 'tts' });
+  }
+
   async cacheSignature(): Promise<CacheSignature> {
     const engine = this.engine ?? (await this.tts.pick(this.o.ttsOrder));
-    return { translateModel: this.o.asr ? await this.o.asr.model() : 'captions', ttsModel: engine?.id ?? 'none', voice: this.o.voice ?? 'standard' };
+    // the user's pinned male / female voices change the audio, so they are part of the key (auto = unchanged key)
+    const pref = this.tts.preference();
+    const pinned = [pref?.voiceMale, pref?.voiceFemale].map((v) => (v && v !== 'auto' ? v : '')).join('/');
+    return { translateModel: this.o.asr ? await this.o.asr.model() : 'captions', ttsModel: engine?.id ?? 'none', voice: (this.o.voice ?? 'standard') + (pinned !== '/' ? `+${pinned}` : '') };
   }
 
   async translateChunk(chunk: AudioChunk, ctx: ProviderContext): Promise<ChunkResult> {
@@ -139,16 +152,41 @@ export class CascadeProvider implements DubProvider {
     }
   }
 
+  /** per sentence: the speaker class after hearing it ('m' until a confident female phrase); never throws */
+  private classifySpeakers(chunk: AudioChunk, segs: readonly SourceSegment[], bursts?: readonly { start: number; end: number }[]): ('m' | 'f')[] {
+    const cls = (): 'm' | 'f' => (this.speaker.state === 'female_or_child' ? 'f' : 'm');
+    const out: ('m' | 'f')[] = [];
+    if (chunk.pcm.length === 0) return segs.map(cls);
+    let top: { f0: number; voicedSec: number; tilt?: number; gender: string } | undefined;
+    for (const s of segs) {
+      try {
+        const p = sentencePitch(chunk.pcm, chunk.sampleRate, chunk.startSec, s, bursts);
+        const u = this.speaker.update(p.f0, p.voicedSec, p.tilt, s.end);
+        out.push(cls());
+        if (!top || p.voicedSec > top.voicedSec) top = { f0: p.f0, voicedSec: p.voicedSec, tilt: p.tilt, gender: u.gender };
+      } catch {
+        out.push(cls());
+      }
+    }
+    if (top) diag.log('speaker', { f0Hz: Math.round(top.f0), voicedSec: Math.round(top.voicedSec * 10) / 10, ...(top.tilt !== undefined ? { tilt: top.tilt } : {}), gender: top.gender, state: this.speaker.state });
+    return out;
+  }
+
   private async run(chunk: AudioChunk, ctx: ProviderContext): Promise<ChunkResult> {
     const id = this.id;
     const t0 = Date.now();
     const end = chunk.startSec + chunk.durationSec;
     const engine = this.engine ?? (await this.tts.pick(this.o.ttsOrder));
-    if (!engine) throw new ProviderUnavailableError('no local TTS engine available', id, 'unsupported');
+    if (!engine) {
+      if (id === 'local') this.noTts();
+      throw new ProviderUnavailableError('no local TTS engine available', id, 'unsupported');
+    }
+    if (id === 'local') localReasons.clear('tts');
     this.engine = engine;
 
     // 1. source sentences: captions shortcut first, else ASR
     let segs: SourceSegment[] = [];
+    let bursts: { start: number; end: number }[] | undefined;
     let sourceLang = ctx.sourceLang ?? '';
     let from: 'captions' | 'asr' = 'asr';
     let nextStart: number | undefined;
@@ -166,8 +204,9 @@ export class CascadeProvider implements DubProvider {
     } else if (this.o.asr) {
       const a0 = Date.now();
       diag.log(`${id}-asr-start`, { asr: this.o.asr.id, chunkSec: Math.round(chunk.durationSec * 10) / 10 });
-      const r = await this.o.asr.transcribe(chunk, { signal: ctx.signal, sourceLang: ctx.sourceLang });
+      const r = await this.o.asr.transcribe(chunk, { signal: ctx.signal, sourceLang: ctx.sourceLang, live: ctx.live });
       segs = r.segments;
+      bursts = r.speechBursts;
       sourceLang = r.sourceLang || sourceLang;
       diag.log(`${id}-asr-ok`, { from, asr: this.o.asr.id, sentences: segs.length, lang: sourceLang, ms: Date.now() - a0 });
     } else {
@@ -226,16 +265,19 @@ export class CascadeProvider implements DubProvider {
         diag.log(`${id}-translate-ok`, { by: 'tlang', n: segs.length, chars: texts.reduce((a, x) => a + x.length, 0) });
       }
     }
-    const items = segs.map((s, i) => ({ start: s.start, end: s.end, src: s.text, ru: (texts[i] ?? '').trim() })).filter((x) => x.ru);
+    const genders = this.classifySpeakers(chunk, segs, bursts);
+    const items = segs.map((s, i) => ({ start: s.start, end: s.end, src: s.text, ru: (texts[i] ?? '').trim(), gender: genders[i] })).filter((x) => x.ru);
     if (items.length === 0) throw new ProviderUnavailableError('translation is empty', id, 'failed');
 
     // 3. voice + fit
-    const v = await voiceSegments(items, { engine, tier: id, signal: ctx.signal, voice: this.o.voice, concurrency: this.o.ttsConcurrency, timeoutMs: this.o.ttsTimeoutMs, sync: this.o.sync, limitEnd: nextStart ?? end });
+    void this.tts.calibrate(engine.id);
+    const v = await voiceSegments(items, { engine, tier: id, signal: ctx.signal, voice: this.o.voice, voiceFor: (g) => this.tts.voiceFor(engine.id, g), concurrency: this.o.ttsConcurrency, timeoutMs: this.o.ttsTimeoutMs, sync: this.o.sync, limitEnd: nextStart ?? end });
     if (v.segments.length === 0) {
       const first = v.errors[0];
       throw first instanceof Error ? first : new ProviderUnavailableError('tts failed for every sentence', id, 'failed');
     }
     const result: ChunkResult = { segments: v.segments.map((s) => ({ ...s, providerId: id })), sourceLang: ruTrackAsTranslation ? (track?.audioLang ?? 'en') : sourceLang || undefined };
+    if (bursts && bursts.length) result.speechBursts = bursts;
     if (ctx.wantSubtitles) result.subtitles = items.map((x) => ({ start: x.start, end: x.end, src: x.src, text: x.ru }));
     if (v.failed.length > 0) {
       result.failedSegments = v.failed;

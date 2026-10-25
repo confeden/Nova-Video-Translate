@@ -48,6 +48,8 @@ export type LttsOp =
   | { op: 'download'; engine?: LocalTtsEngineId; voice?: string; baseUrl?: string }
   | { op: 'download-cancel'; engine?: LocalTtsEngineId; voice?: string }
   | { op: 'delete'; engine?: LocalTtsEngineId; voice?: string }
+  /** offscreen only: stop downloads, release the engine, wipe every nvt-* OPFS pack; replies { freedBytes } */
+  | { op: 'clear-all' }
   | { op: 'warm'; engine?: LocalTtsEngineId; voice?: string }
   | { op: 'synth'; id: string; text: string; engine?: LocalTtsEngineId; voice?: string; targetSec?: number; steps?: number }
   | { op: 'abort'; id: string }

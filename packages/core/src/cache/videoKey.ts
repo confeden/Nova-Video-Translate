@@ -45,13 +45,39 @@ export function videoKey(video: { currentSrc?: string }, pageUrl: string): strin
   return `u:${u.origin}${u.pathname}${kept.length ? `?${kept.join('&')}` : ''}`;
 }
 
+const LIVE_PATH = /^\/live(?:\/|$)/;
+const TWITCH_HOST = /(?:^|\.)twitch\.tv$/;
+
+/**
+ * A live stream that must never touch the result cache: its currentTime is a DVR-window position (a finite, growing duration on
+ * YouTube) that does not identify a moment of the stream, so an entry cached in an earlier session would be served for other speech.
+ * Non-finite duration, an absurd seekable end (Twitch), a Twitch host or a /live/ path.
+ */
+export function isLiveCacheTarget(video: { duration?: number; seekable?: { length: number; end(i: number): number } }, pageUrl: string): boolean {
+  const d = video.duration;
+  if (d !== undefined && !Number.isNaN(d) && !Number.isFinite(d)) return true;
+  const s = video.seekable;
+  try {
+    if (s && s.length > 0 && s.end(s.length - 1) > 1e8) return true;
+  } catch {
+    /* detached */
+  }
+  const u = parse(pageUrl);
+  return !!u && (TWITCH_HOST.test(u.hostname.toLowerCase()) || LIVE_PATH.test(u.pathname));
+}
+
 /**
  * videoKey + the media duration (whole seconds). The duration guards against a different clip played in the same
  * <video> on the same URL (YouTube ads, playlist autoplay). Live / unknown duration => undefined (never cached).
  */
-export function videoCacheKey(video: { currentSrc?: string; duration?: number }, pageUrl: string): string | undefined {
+export function videoCacheKey(
+  video: { currentSrc?: string; duration?: number; seekable?: { length: number; end(i: number): number } },
+  pageUrl: string,
+  opts: { live?: () => boolean } = {},
+): string | undefined {
   const d = video.duration;
   if (d === undefined || !Number.isFinite(d) || d <= 0) return undefined;
+  if (isLiveCacheTarget(video, pageUrl) || opts.live?.()) return undefined;
   const k = videoKey(video, pageUrl);
   return k ? `${k}|d${Math.round(d)}` : undefined;
 }

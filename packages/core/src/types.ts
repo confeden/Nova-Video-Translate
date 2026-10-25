@@ -1,3 +1,4 @@
+import type { LocalAsrModelChoice } from './localasr/whisperModels';
 import type { LocalTtsChoice } from './localtts/catalog';
 import type { ProviderId } from './providers/types';
 
@@ -22,6 +23,8 @@ export interface Settings {
   /** Volume of the translated voice-over (0..1). */
   translationVolume: number;
   subtitles: 'off' | 'on';
+  /** which text the subtitle line shows: the original speech (default) or the translation */
+  subtitleLang: 'original' | 'translation';
   /** Voice source priority (D15), highest first. */
   voiceOrder: ProviderId[];
   /** per-source switch; a missing id counts as enabled */
@@ -35,6 +38,8 @@ export interface Settings {
   /** Yandex OAuth token of the user's own account (D12); needed by 'yandex-live'. */
   yandexToken?: string;
   autoTranslate: 'off' | 'on';
+  /** Hostnames (no leading www.) where auto-translate is off; matches the exact host only, other sites are untouched. */
+  autoTranslateExcluded: string[];
   /** What a click on the in-player NVT button does: open the settings panel or start/stop translation at once. */
   clickAction: 'settings' | 'toggle';
   /**
@@ -42,12 +47,30 @@ export interface Settings {
    * paused it and the user has not touched it); 'off' = the original plays at full volume until the dub joins.
    */
   prerollPause: 'off' | 'on';
+  /**
+   * Live streams (no finite duration): the playhead is moved this many seconds behind the live edge at the start, so the
+   * capture has lookahead. 0 = off, -1 = auto (15 s while the 'hls' capture runs, i.e. twitch.tv live; 0 elsewhere).
+   */
+  liveDelaySec: number;
+  /**
+   * EXPERIMENTAL live-stream mode. 'fast' (default) = local tier only, one rewind of ~10 s. 'quality' = Yandex tiers are also tried on
+   * live videos (a larger delay, the local tier always runs as the safety net; a Yandex dub replaces it only when it arrives in time).
+   */
+  liveMode: 'fast' | 'quality';
+  /**
+   * Speech recognition of LIVE streams in the local tier: 'auto' (default) = Groq Whisper when a Groq key exists and Groq is healthy / not slower
+   * than the local engine, else local; 'local' = never send audio to Groq; 'groq' = Groq whenever possible (a failure still falls back to local).
+   */
+  liveAsr: 'auto' | 'local' | 'groq';
+  /** Seconds the dub of every phrase starts AFTER the original phrase (0-6, default 2): a constant shift of the whole dub timeline; it also gives the pipeline that much more time. */
+  dubLagSec: number;
   /** 'on' (default): a video detected as Russian is not translated (a second click within 10 s forces it). */
   skipRussian: 'on' | 'off';
   /** true (default): a YouTube video that already has a Russian audio track is switched to it instead of being translated (D28). */
   preferNativeDub: boolean;
   /** false (default): a chunk cell that is not complete is sent as a partial piece once it has been quiet for a while.
-   *  true: a cell is held until playback has passed its end, so the rest of its audio can still arrive (later voice, fewer cut phrases). */
+   *  true: a cell is held until playback has passed its end, so the rest of its audio can still arrive. REALTIME captures only: the
+   *  'hls' capture has lookahead (cells arrive complete), so the setting is ignored there and has no UI toggle. */
   holdCellsToEnd: boolean;
   /** Spoken language of the videos: 'auto' = detect (language gate), else an ISO code that bypasses the gate and is passed to providers. */
   sourceLang: string;
@@ -61,8 +84,14 @@ export interface Settings {
   cacheMaxMB: number;
   /** Local voice engine for the 'groq' / 'local' tiers: 'auto' = best available by the registry order. */
   localTtsEngine: LocalTtsChoice;
-  /** Voice id of the chosen engine; '' = the engine's default. */
+  /** Legacy single voice id of the chosen engine ('' = default); only picks the Piper download unit now. Migrated into the slots below. */
   localTtsVoice: string;
+  /** Voice for MALE source speakers: 'auto' = the calibrated adult-sounding one, else a voice id of the engine. */
+  localTtsVoiceMale: string;
+  /** Voice for FEMALE / child source speakers: 'auto' = calibrated, else a voice id. */
+  localTtsVoiceFemale: string;
+  /** Whisper checkpoint of the local ASR engine ('whisper-webgpu'): 'auto' = best downloaded model for the stream language. */
+  localAsrModel: LocalAsrModelChoice;
   /** Providers whose output is cached (Yandex is cached server-side by Yandex). */
   cacheProviders: ProviderId[];
 }
@@ -72,6 +101,7 @@ export const DEFAULT_SETTINGS: Settings = {
   originalVolume: 0.3,
   translationVolume: 1.0,
   subtitles: 'off',
+  subtitleLang: 'original',
   // D30: Gemini stays in the code but is OFF by default and last
   voiceOrder: ['yandex-live', 'yandex', 'local', 'groq', 'gemini'],
   voiceEnabled: { 'yandex-live': true, yandex: true, groq: true, local: true, gemini: false },
@@ -80,9 +110,14 @@ export const DEFAULT_SETTINGS: Settings = {
   groqModels: { asr: '', chat: '' },
   groqApiKey: '',
   autoTranslate: 'on',
+  autoTranslateExcluded: [],
   clickAction: 'settings',
   prerollPause: 'off',
   skipRussian: 'on',
+  liveDelaySec: -1,
+  liveMode: 'fast',
+  liveAsr: 'auto',
+  dubLagSec: 1,
   preferNativeDub: true,
   holdCellsToEnd: false,
   sourceLang: 'auto',
@@ -93,6 +128,9 @@ export const DEFAULT_SETTINGS: Settings = {
   cacheProviders: ['gemini', 'groq', 'local'],
   localTtsEngine: 'auto',
   localTtsVoice: '',
+  localTtsVoiceMale: 'auto',
+  localTtsVoiceFemale: 'auto',
+  localAsrModel: 'auto',
 };
 
 /** One timed piece of source speech and its translation. Times are in seconds. */

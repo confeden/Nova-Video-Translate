@@ -5,7 +5,8 @@ const NAMES: Record<string, string> = {
   fr: 'французский', pt: 'португальский', it: 'итальянский', tr: 'турецкий', uk: 'украинский', pl: 'польский',
   be: 'белорусский', bg: 'болгарский', ar: 'арабский', he: 'иврит', el: 'греческий', th: 'тайский', hi: 'хинди',
   nl: 'нидерландский', id: 'индонезийский', vi: 'вьетнамский', sv: 'шведский', sr: 'сербский', mk: 'македонский',
-  fa: 'персидский', ur: 'урду', cs: 'чешский',
+  fa: 'персидский', ur: 'урду', cs: 'чешский', da: 'датский', no: 'норвежский', fi: 'финский', hu: 'венгерский', ro: 'румынский',
+  hr: 'хорватский', sk: 'словацкий', lt: 'литовский', lv: 'латышский', et: 'эстонский', ca: 'каталанский',
 };
 
 const ALIASES: Record<string, string> = { iw: 'he', in: 'id', ji: 'yi', nb: 'no', nn: 'no', jp: 'ja', cn: 'zh', ua: 'uk', 'ru-ru': 'ru' };
@@ -44,6 +45,7 @@ const HOW: Record<string, string> = {
   'html-lang': 'по языку страницы',
   'og-locale': 'по метаданным страницы',
   track: 'по дорожке субтитров',
+  'twitch-lang': 'по языку трансляции Twitch',
   provider: 'по ответу сервиса перевода',
   settings: 'выбран в настройках',
   cache: 'из кэша',
@@ -52,3 +54,6 @@ const HOW: Record<string, string> = {
 export function howLabel(how: string): string {
   return HOW[how] ?? how;
 }
+
+/** languages offered next to the Chrome Translator pair row (code order = popularity on live streams) */
+export const TRANSLATOR_SOURCE_LANGS: readonly string[] = ['en', 'da', 'sv', 'no', 'fi', 'de', 'fr', 'es', 'pt', 'it', 'pl', 'tr', 'uk', 'cs', 'nl', 'ja', 'ko', 'zh'];

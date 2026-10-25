@@ -41,6 +41,8 @@ interface Cell {
   cov: Array<[number, number]>;
   sampleRate: number;
   touched: number;
+  /** some audio of the cell was stamped with a provisional clock offset */
+  prov?: boolean;
 }
 
 /** total hole length inside a cell that still counts as complete */
@@ -103,6 +105,7 @@ export class Rechunker {
         this.cells.set(k, cell);
       }
       cell.touched = touched;
+      if (c.provisional) cell.prov = true;
       // source sample for cell sample `from`
       const srcOff = Math.round((cellStart + from / sr - t0) * sr);
       const lo = Math.max(0, srcOff);
@@ -165,6 +168,7 @@ export class Rechunker {
         durationSec: this.opts.chunkSec,
         sampleRate: cell.sampleRate,
         pcm: cell.buf,
+        ...(cell.prov ? { provisional: true } : {}),
       });
       return;
     }
@@ -197,6 +201,7 @@ export class Rechunker {
       const a = cov[0]![0];
       let b = cov[cov.length - 1]![1];
       let pcm = cell.buf.slice(a, b);
+      let prov = !!cell.prov;
       const next = this.cells.get(cell.index + 1);
       if (next && next.sampleRate === sr && b >= n - tol && list.includes(next) && next.cov.length > 0 && next.cov[0]![0] <= tol && n - a + next.cov[next.cov.length - 1]![1] <= n) {
         // contiguous across the boundary and still within one cell length: one request for both pieces
@@ -209,6 +214,7 @@ export class Rechunker {
         merged.set(next.buf.subarray(0, nb), pcm.length);
         pcm = merged;
         b = n + nb;
+        if (next.prov) prov = true;
       }
       if ((b - a) / sr < this.minPartialSec) continue;
       this.opts.emit({
@@ -217,6 +223,7 @@ export class Rechunker {
         sampleRate: sr,
         pcm,
         partial: true,
+        ...(prov ? { provisional: true } : {}),
       });
     }
   }

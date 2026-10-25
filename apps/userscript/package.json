@@ -1,6 +1,6 @@
 {
   "name": "@nvt/userscript",
-  "version": "0.2.26",
+  "version": "0.2.47",
   "private": true,
   "type": "module",
   "scripts": {

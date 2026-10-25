@@ -31,7 +31,7 @@ export const PASS_CONFIDENCE = 0.7;
 
 const TIER: Record<string, number> = {
   provider: 4, settings: 4, cache: 4,
-  'yt-audio': 3, 'yt-asr': 3,
+  'yt-audio': 3, 'yt-asr': 3, 'twitch-lang': 3,
   'yt-text': 2, 'page-text': 2, 'in-language': 2,
   'yt-track': 1, 'html-lang': 1, 'og-locale': 1, track: 1,
 };
@@ -131,6 +131,8 @@ export interface DetectOptions {
   /** wait for the MAIN-world player reader (ms) */
   captionsTimeoutMs?: number;
   captionsRetryMs?: number;
+  /** Twitch: the channel's broadcaster language (ISO code or undefined); asked only when given */
+  broadcasterLang?: () => Promise<string | undefined>;
 }
 
 const YT_HOST = /(^|\.)(youtube\.com|youtube-nocookie\.com)$/;
@@ -212,6 +214,13 @@ export async function detectVideoLanguage(
       }
     } catch {
       /* the reader is optional */
+    }
+  }
+  if (opts.broadcasterLang) {
+    try {
+      add(sig(await opts.broadcasterLang(), 0.95, 'twitch-lang'));
+    } catch {
+      /* optional */
     }
   }
   const htmlLang = doc.documentElement?.getAttribute('lang');

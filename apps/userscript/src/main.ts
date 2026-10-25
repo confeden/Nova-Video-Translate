@@ -6,6 +6,7 @@ import { createSettingsHost } from './panelHost';
 import { NVT_VERSION } from './version';
 import { VOICE_STATUS_KEY, loadSettings, onSettingsChanged } from './storage';
 import { installTap, runPageTapOnly } from './tap';
+import { runUpdateCheck } from './updateCheck';
 
 function main(): void {
   // copy of this script injected into the page world: install the MSE tap and nothing else
@@ -22,6 +23,9 @@ function main(): void {
       .catch((e) => console.error('NVT: OAuth exchange failed', e instanceof Error ? e.message : 'error'));
     return;
   }
+
+  // update check on page load (8 h gating, GM storage); top window only so iframes do not each ask GitHub
+  if (window.top === window) void runUpdateCheck(false);
 
   // The tap must be in place before the page creates its SourceBuffers: install it right now (document-start).
   const tap = installTap();
@@ -48,6 +52,7 @@ function main(): void {
       version: NVT_VERSION,
       cache,
       subtitleTransport: () => transport,
+      hlsTransport: () => transport,
       captions: () => tap.captions(),
       audioTracks: () => tap.audioTracks(),
       reportVoice(r: VoiceReport) {

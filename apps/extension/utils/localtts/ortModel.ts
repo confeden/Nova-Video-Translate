@@ -27,7 +27,8 @@ export function loadOrt(): Promise<Ort> {
     // never let Chrome pick a low-power adapter for the TTS (hybrid-GPU laptops); harmless on a single-GPU desktop
     (ort.env as unknown as { webgpu: { powerPreference?: string } }).webgpu.powerPreference = 'high-performance';
     // WASM engines (Silero / Piper / Supertonic CPU) scale with threads; the WebGPU EP only runs tiny CPU ops (measured: no change)
-    ort.env.wasm.numThreads = Math.min(4, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 2)));
+    // capped low: the video decoder and the page need the other cores (CPU-jank report)
+    ort.env.wasm.numThreads = Math.min(2, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 4)));
     return ort;
   })().catch((e) => {
     ortPromise = undefined;

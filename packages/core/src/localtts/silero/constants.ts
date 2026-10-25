@@ -5,15 +5,18 @@
  */
 import type { LocalTtsVoiceInfo } from '../types';
 import type { ModelFile } from '../supertonic/constants';
+import { MODEL_MIRROR_BASE } from '../../localasr/mirror';
 
 /** version tag of the converted set (bump when the files change) */
 export const SILERO_REVISION = 'v5_ru-onnx-2026-10-22';
 
 /**
- * Base URL the files are fetched from (path appended): nginx on the owner's VPS (see kb/server.md), plain HTTP, port 8081.
- * Licence of the files: CC BY-NC-SA 4.0 (NOTICE.txt is served next to them).
+ * Base URL the files are fetched from (path appended): the public-read S3 model mirror (localasr/mirror.ts). Licence of the
+ * files: CC BY-NC-SA 4.0 (NOTICE.txt is stored next to them).
  */
-export const SILERO_BASE_URL = 'http://212.116.115.237:8081/silero/';
+export const SILERO_BASE_URL = `${MODEL_MIRROR_BASE}silero/`;
+/** fallback while the mirror is new: nginx on the owner's VPS (see kb/server.md), plain HTTP, port 8081; drop once the mirror is proven */
+export const SILERO_FALLBACK_BASE_URL = 'http://212.116.115.237:8081/silero/';
 
 export const SILERO_ACOUSTIC = 'silero_v5_acoustic.onnx';
 export const SILERO_VOCODER = 'silero_v5_vocoder_fp16w.onnx';

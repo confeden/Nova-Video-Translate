@@ -1,11 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeSettings } from '../src/settings';
+import { liveVideoVoiceOverride, normalizeSettings, withSiteOverride } from '../src/settings';
 import { DEFAULT_SETTINGS } from '../src/types';
 import { diag } from '../src/diag';
 import { buildDiagReport, settingsSummary } from '../src/ui/status';
 import { LiveGemini } from '../src/ui/videoController';
 
 describe('settings', () => {
+  it('autoTranslate: empty storage gives the default (on), only an explicit off stays off', () => {
+    expect(normalizeSettings(undefined).autoTranslate).toBe('on');
+    expect(normalizeSettings({}).autoTranslate).toBe('on');
+    expect(normalizeSettings({ autoTranslate: 'junk' }).autoTranslate).toBe('on');
+    expect(normalizeSettings({ autoTranslate: 'off' }).autoTranslate).toBe('off');
+    expect(normalizeSettings({ autoTranslate: 'on' }).autoTranslate).toBe('on');
+  });
+  it('live-video override keeps cloud tiers when the host has no local provider', () => {
+    expect(liveVideoVoiceOverride()).toMatchObject({ gemini: false, local: true });
+    expect(liveVideoVoiceOverride(false)).toEqual({});
+    expect(withSiteOverride(DEFAULT_SETTINGS, 'www.youtube.com', true, false).voiceEnabled).toEqual(DEFAULT_SETTINGS.voiceEnabled);
+  });
   it('prerollPause defaults to off and only accepts on/off', () => {
     expect(normalizeSettings({}).prerollPause).toBe('off');
     expect(normalizeSettings({ prerollPause: 'on' }).prerollPause).toBe('on');

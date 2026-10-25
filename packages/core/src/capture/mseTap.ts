@@ -13,7 +13,7 @@
  */
 import type { AudioChunk } from '../providers/types';
 import { TARGET_RATE, TimelineRing, makeChunk } from './audio';
-import { concatBytes, decodeToPcm16k, type Decoder } from './decode';
+import { concatBytes, decodeToPcm16k, yieldToMain, type Decoder } from './decode';
 import { fragmentTiming, isMp4, mp4StartsUnit, mp4UnitComplete, parseMp4Init, splitMp4, type Mp4Track } from './mp4';
 import { isWebm, parseWebmClusters, parseWebmInit, webmStartsUnit, webmUnitLength, type WebmInit } from './webm';
 
@@ -191,6 +191,7 @@ export function installMseTap(onChunk: (c: AudioChunk) => void, opts: MseTapOpti
       while (queue.length && active && myEpoch === epoch) {
         const seg = queue.shift()!;
         try {
+          await yieldToMain(); // one heavy decode per task: keep the page responsive between segments
           const pcm = await decoder(concatBytes(seg.init, seg.data));
           if (myEpoch !== epoch) break;
           if (pcm.length === 0) throw new Error('empty decode');

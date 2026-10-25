@@ -1,7 +1,11 @@
 import type { LocalAsr, LocalAsrEngineId } from './types';
 
-/** Default preference: the helper (fastest, GPU), WASM Whisper, then Chrome's Prompt API (needs a 4 GB model, English only). */
-export const DEFAULT_LOCAL_ASR_ORDER: LocalAsrEngineId[] = ['helper-faster-whisper', 'whisper-wasm', 'chrome-prompt-audio'];
+/**
+ * Default preference: in-extension Whisper (WebGPU, WASM fallback; user-downloaded, no install), the helper (not registered
+ * by the extension yet, so skipped), WASM Whisper, then Chrome's Prompt API (needs a 4 GB model, English only).
+ * pick() skips ids nobody registered and engines whose isAvailable() is false (model not downloaded), so the order is safe.
+ */
+export const DEFAULT_LOCAL_ASR_ORDER: LocalAsrEngineId[] = ['whisper-webgpu', 'helper-faster-whisper', 'whisper-wasm', 'chrome-prompt-audio'];
 
 export class LocalAsrRegistry {
   private readonly engines = new Map<LocalAsrEngineId, LocalAsr>();

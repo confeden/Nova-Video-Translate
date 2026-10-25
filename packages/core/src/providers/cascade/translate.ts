@@ -3,6 +3,7 @@ import { diag } from '../../diag';
 import { ChromeCueTranslator } from '../../subtitles/chromeAi';
 import type { ProviderId } from '../types';
 import { ProviderUnavailableError } from '../types';
+import { localReasons, reasonText } from '../../localasr/localReason';
 
 export interface TextItem {
   text: string;
@@ -23,8 +24,9 @@ export class ChromeTextTranslator implements TextTranslator {
   readonly id = 'chrome-translator';
   constructor(private readonly chrome: ChromeCueTranslator = new ChromeCueTranslator()) {}
 
-  isAvailable(sourceLang: string): Promise<boolean> {
-    return this.chrome.isAvailable(sourceLang);
+  /** a downloaded direct pair, or a pivot source->en->ru when both halves are downloaded (a 'downloadable' pair is never created here: it needs a click in the panel) */
+  async isAvailable(sourceLang: string): Promise<boolean> {
+    return (await this.chrome.route(sourceLang)) !== undefined;
   }
 
   async translate(items: readonly TextItem[], sourceLang: string, signal: AbortSignal): Promise<string[]> {
@@ -52,6 +54,7 @@ export async function translateWithFailover(
   tier: ProviderId,
 ): Promise<TranslateOutcome> {
   let last: unknown;
+  let anyAvailable = false;
   for (const t of translators) {
     if (signal.aborted) throw new DOMException('aborted', 'AbortError');
     let ok = false;
@@ -61,17 +64,23 @@ export async function translateWithFailover(
       ok = false;
     }
     if (!ok) continue;
+    anyAvailable = true;
     const t0 = Date.now();
     try {
       const texts = await t.translate(items, sourceLang, signal);
       if (texts.length !== items.length || texts.every((x) => !x.trim())) throw new ProviderUnavailableError(`${t.id}: incomplete translation`, tier, 'failed');
       diag.log(`${tier}-translate-ok`, { by: t.id, n: items.length, chars: texts.reduce((a, x) => a + x.length, 0), ms: Date.now() - t0 });
+      if (tier === 'local') localReasons.clear('translator');
       return { texts, by: t.id };
     } catch (e) {
       if (signal.aborted) throw e;
       last = e;
       diag.log(`${tier}-translate-fail`, { by: t.id, ms: Date.now() - t0, kind: e instanceof ProviderUnavailableError ? e.kind : 'error', msg: String((e as Error)?.message ?? e).slice(0, 100) });
     }
+  }
+  if (!anyAvailable && tier === 'local') {
+    localReasons.set('translator', reasonText.translator(sourceLang));
+    diag.log('local-reason', { why: 'translator', lang: sourceLang });
   }
   throw last ?? new ProviderUnavailableError('no text translator available', tier, 'unsupported');
 }

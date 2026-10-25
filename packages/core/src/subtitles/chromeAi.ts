@@ -8,7 +8,7 @@ import { SubtitleUnavailable, type ChunkSource, type CueTranslator } from './typ
 export interface ChromeAiEnv {
   Translator?: {
     availability(o: { sourceLanguage: string; targetLanguage: string }): Promise<string>;
-    create(o: { sourceLanguage: string; targetLanguage: string }): Promise<{ translate(text: string): Promise<string>; destroy?(): void }>;
+    create(o: { sourceLanguage: string; targetLanguage: string; monitor?(m: { addEventListener(type: 'downloadprogress', cb: (e: { loaded: number }) => void): void }): void }): Promise<{ translate(text: string): Promise<string>; destroy?(): void }>;
   };
   LanguageDetector?: {
     availability(): Promise<string>;
@@ -83,17 +83,41 @@ export class ChromeCueTranslator implements CueTranslator {
     }
   }
 
-  private translatorFor(lang: string): Promise<{ translate(text: string): Promise<string> }> {
-    let p = this.cache.get(lang);
+  /** a ready pair only: 'downloadable' / 'downloading' need a user gesture and are never created here */
+  async pairReady(src: string, tgt: string): Promise<boolean> {
+    const T = this.getEnv().Translator;
+    if (!T || !src || src === tgt) return false;
+    try {
+      return (await T.availability({ sourceLanguage: src, targetLanguage: tgt })) === 'available';
+    } catch {
+      return false;
+    }
+  }
+
+  /** how to reach Russian from `src`: the direct pair, a pivot through English when both halves are downloaded, else undefined */
+  async route(src: string): Promise<'direct' | 'pivot' | undefined> {
+    if (await this.pairReady(src, 'ru')) return 'direct';
+    if (src !== 'en' && (await this.pairReady(src, 'en')) && (await this.pairReady('en', 'ru'))) return 'pivot';
+    return undefined;
+  }
+
+  private translatorFor(lang: string, tgt = 'ru'): Promise<{ translate(text: string): Promise<string> }> {
+    const key = `${lang}>${tgt}`;
+    let p = this.cache.get(key);
     if (!p) {
-      p = this.getEnv().Translator!.create({ sourceLanguage: lang, targetLanguage: 'ru' });
-      p.catch(() => this.cache.delete(lang));
-      this.cache.set(lang, p);
+      p = this.getEnv().Translator!.create({ sourceLanguage: lang, targetLanguage: tgt });
+      p.catch(() => this.cache.delete(key));
+      this.cache.set(key, p);
     }
     return p;
   }
 
   async translateText(text: string, sourceLang: string): Promise<string> {
+    const route = await this.route(sourceLang);
+    if (route === 'pivot') {
+      const en = (await (await this.translatorFor(sourceLang, 'en')).translate(text)).trim();
+      return en ? (await this.translatorFor('en')).translate(en) : '';
+    }
     return (await this.translatorFor(sourceLang)).translate(text);
   }
 

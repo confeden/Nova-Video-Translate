@@ -20,6 +20,8 @@ export interface LocalTtsRequest {
   voice?: string;
   /** desired speaking duration (seconds): the engine adjusts speed to hit it when it can; the caller still measures */
   targetSec?: number;
+  /** the voice was chosen by the SOURCE speaker's gender (voiceMap): the post-synthesis child-voice guard is skipped */
+  srcGender?: 'm' | 'f';
   signal?: AbortSignal;
 }
 
@@ -27,6 +29,10 @@ export interface LocalTtsResult {
   sampleRate: number;
   samples: Int16Array;
   durationSec: number;
+  /** median f0 (Hz) of a male-voice take measured by the child-voice guard (absent = not measured) */
+  f0Hz?: number;
+  /** the take was re-synthesized with the female voice by the guard */
+  voiceFallback?: boolean;
 }
 
 export interface LocalTtsEngine {

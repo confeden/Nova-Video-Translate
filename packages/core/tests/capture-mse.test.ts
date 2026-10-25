@@ -31,7 +31,10 @@ function fakeMse() {
 }
 
 const fakeDecoder = async (b: Uint8Array): Promise<Int16Array> => new Int16Array(Math.min(b.length, 160000)).fill(7);
-const tick = () => new Promise((r) => setTimeout(r, 0));
+// the MSE drain yields to the main thread (yieldToMain) before each decode: flush several macrotasks
+const tick = async () => {
+  for (let i = 0; i < 4; i++) await new Promise((r) => setTimeout(r, 0));
+};
 
 describe('classifyMime', () => {
   it('detects audio / video / combined', () => {

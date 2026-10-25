@@ -12,6 +12,8 @@ export interface AudioChunk {
    * video/stream ended). Partial chunks are translated but never cached.
    */
   partial?: boolean;
+  /** 'hls' capture: stamped with a PROVISIONAL clock offset (no correlation yet); the engine re-times its dubs when the real one arrives */
+  provisional?: boolean;
 }
 
 export type DubAudio =
@@ -53,6 +55,8 @@ export interface ProviderContext {
   sourceLang?: string;
   /** subtitles are opt-in (invariant I4): providers must NOT spend quota on them unless true */
   wantSubtitles: boolean;
+  /** the video is a live stream (set by the engine) */
+  live?: boolean;
   /** dynamic whole-job deadline (ms) chosen by the planner (Yandex); absent = the provider's default */
   deadlineMs?: number;
   /** the server's own estimate (s) of the remaining time: a noisy hint for the latency model, never a deadline */
@@ -70,6 +74,8 @@ export interface ChunkResult {
    * holds only the voiced ones; such a result is incomplete and must not be cached as final.
    */
   failedSegments?: { start: number; end: number }[];
+  /** real speech bursts of the chunk (VIDEO seconds) from the local VAD; additive, optional */
+  speechBursts?: { start: number; end: number }[];
 }
 
 export type ProviderId = 'yandex-live' | 'yandex' | 'groq' | 'local' | 'gemini';

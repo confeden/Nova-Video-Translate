@@ -1,5 +1,7 @@
 import { diag } from '../diag';
-import { AUTO_ENGINE_ORDER, hasVoice, isLocalTtsEngineId, type LocalTtsChoice } from './catalog';
+import { AUTO_ENGINE_ORDER, engineInfo, hasVoice, isLocalTtsEngineId, type LocalTtsChoice } from './catalog';
+import { VoiceGuard, measureVoicedF0 } from './voiceGuard';
+import { CALIBRATED_ENGINES, VoicePlanner, applyCalibrationRule, calibKey, calibrateVoices, type CalibrationStore, type VoiceCalibration, type TtsGender } from './voiceMap';
 import type { LocalTtsEngine, LocalTtsEngineId } from './types';
 
 /**
@@ -9,10 +11,16 @@ import type { LocalTtsEngine, LocalTtsEngineId } from './types';
  */
 export const DEFAULT_LOCAL_TTS_ORDER: LocalTtsEngineId[] = [...AUTO_ENGINE_ORDER];
 
-/** the user's choice from the settings (`localTtsEngine` / `localTtsVoice`) */
+const genderOf = (id: LocalTtsEngineId, voice: string): 'm' | 'f' | undefined => engineInfo(id)?.voices.find((v) => v.id === voice)?.gender;
+
+/** the user's choice from the settings (`localTtsEngine` / `localTtsVoiceMale` / `localTtsVoiceFemale`) */
 export interface LocalTtsPreference {
   engine: LocalTtsChoice;
+  /** legacy single voice: only the default for a synth call that names no voice */
   voice: string;
+  /** voice id for male speakers; 'auto' / '' / absent = the calibrated one */
+  voiceMale?: string;
+  voiceFemale?: string;
 }
 
 /**
@@ -41,6 +49,13 @@ export class LocalTtsRegistry {
   private readonly health = new Map<LocalTtsEngineId, Health>();
   now: () => number = () => Date.now();
   private readonly engines = new Map<LocalTtsEngineId, LocalTtsEngine>();
+  /** backstop child-voice guard: only for phrases whose source gender is unknown */
+  readonly voiceGuard = new VoiceGuard();
+  /** voice choice by the source speaker's gender (v0.2.44) */
+  readonly planner = new VoicePlanner();
+  private calibStore: CalibrationStore | undefined;
+  private readonly calib = new Map<LocalTtsEngineId, VoiceCalibration>();
+  private readonly calibRuns = new Map<LocalTtsEngineId, { promise?: Promise<void>; retryAt: number; done: boolean }>();
   private prefSource: (() => LocalTtsPreference | undefined) | undefined;
 
   /** adds (or replaces) an engine; returns a function that removes it again */
@@ -75,6 +90,9 @@ export class LocalTtsRegistry {
   clear(): void {
     this.engines.clear();
     this.health.clear();
+    this.planner.reset();
+    this.calib.clear();
+    this.calibRuns.clear();
     this.prefSource = undefined;
   }
 
@@ -121,6 +139,52 @@ export class LocalTtsRegistry {
     this.health.set(id, h);
   }
 
+  /** where calibrations are cached between sessions (extension storage); optional */
+  setCalibrationStore(store: CalibrationStore | undefined): void {
+    this.calibStore = store;
+  }
+
+  /** the voice for a source speaker class on this engine (user's explicit voice / calibrated / catalog default); undefined = none of that gender */
+  voiceFor(engine: LocalTtsEngineId, gender: TtsGender): string | undefined {
+    const p = this.preference();
+    const pick = gender === 'm' ? p?.voiceMale : p?.voiceFemale;
+    return this.planner.voiceFor(engine, gender, { userVoice: pick && pick !== 'auto' ? pick : undefined, calibrated: this.calib.get(engine) });
+  }
+
+  /** the calibration of an engine as the pipeline uses it (selection rule applied); undefined until measured / loaded */
+  calibration(engine: LocalTtsEngineId): VoiceCalibration | undefined {
+    return this.calib.get(engine);
+  }
+
+  /**
+   * One-time background calibration of the engine's voices (adult-sounding f0 per gender, see pickCalibrated). The measured f0
+   * table is cached in the store keyed by engine + pinned model revision (the selection rule is re-applied on every load); failures are retried at most every 2 minutes. Never throws, never blocks the caller.
+   */
+  calibrate(id: LocalTtsEngineId): Promise<void> {
+    const e = this.engines.get(id);
+    if (!e || !CALIBRATED_ENGINES.includes(id)) return Promise.resolve();
+    const run = this.calibRuns.get(id) ?? { retryAt: 0, done: false };
+    this.calibRuns.set(id, run);
+    if (run.done || run.promise || this.now() < run.retryAt) return run.promise ?? Promise.resolve();
+    const key = calibKey(id);
+    run.promise = (async () => {
+      try {
+        let c = await this.calibStore?.get(key).catch(() => undefined);
+        if (!c || c.key !== key) {
+          c = await calibrateVoices(e, key);
+          await this.calibStore?.set(key, c).catch(() => undefined);
+        }
+        this.calib.set(id, applyCalibrationRule(id, c));
+        run.done = true;
+      } catch {
+        run.retryAt = this.now() + 120_000;
+      } finally {
+        run.promise = undefined;
+      }
+    })();
+    return run.promise;
+  }
+
   private withVoice(e: LocalTtsEngine, pref: LocalTtsPreference | undefined): LocalTtsEngine {
     const userVoice = pref?.voice && hasVoice(e.id, pref.voice) ? pref.voice : undefined;
     return {
@@ -129,7 +193,25 @@ export class LocalTtsRegistry {
       voices: () => e.voices(),
       synth: async (req) => {
         const t0 = this.now();
-        const r = await e.synth(userVoice && !hasVoice(e.id, req.voice) ? { ...req, voice: userVoice } : req);
+        if (req.srcGender && hasVoice(e.id, req.voice)) {
+          // voice chosen by the source speaker: no post-synthesis judgement, the f0 is only measured for the diag
+          const r = await e.synth(req);
+          const m = measureVoicedF0(r.samples, r.sampleRate);
+          const out = m.f0 > 0 ? { ...r, f0Hz: Math.round(m.f0) } : r;
+          this.noteSynth(e.id, this.now() - t0, out.durationSec);
+          return out;
+        }
+        const base = userVoice && !hasVoice(e.id, req.voice) ? { ...req, voice: userVoice } : req;
+        const info = engineInfo(e.id);
+        const voice = hasVoice(e.id, req.voice) ? req.voice! : (userVoice ?? info?.defaultVoice ?? '');
+        const female = userVoice && genderOf(e.id, userVoice) === 'f' ? userVoice : (this.calib.get(e.id)?.female ?? info?.voices.find((v) => v.gender === 'f')?.id);
+        const r = await this.voiceGuard.run({
+          voice,
+          isMale: genderOf(e.id, voice) === 'm',
+          femaleVoice: female,
+          chars: req.text.length,
+          synth: (v) => e.synth(v === voice ? base : { ...req, voice: v }),
+        });
         this.noteSynth(e.id, this.now() - t0, r.durationSec);
         return r;
       },

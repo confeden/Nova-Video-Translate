@@ -3,13 +3,16 @@ import type { ResultCache } from '../cache/types';
 import type { SubtitleCue } from '../providers/types';
 import type { Settings } from '../types';
 
-const KEY_VERSION = 'sub1';
+/** sub2: sub1 entries may belong to live streams (DVR-position cells) */
+const KEY_VERSION = 'sub2';
 
 export interface SubtitleCacheOptions {
   cache: ResultCache;
   settings: () => Settings;
   /** identity of the video (cache/videoKey.ts videoCacheKey); undefined = live / unknown => never cached */
   videoKey: () => string | undefined;
+  /** live stream right now (re-checked on every get/put) => never read or written */
+  isLive?: () => boolean;
 }
 
 /**
@@ -21,6 +24,7 @@ export class SubtitleCache {
   constructor(private readonly o: SubtitleCacheOptions) {}
 
   private async key(kind: string, cell: number | 'whole'): Promise<string | undefined> {
+    if (this.o.isLive?.()) return undefined;
     const vk = this.o.videoKey();
     if (!vk) return undefined;
     const s = this.o.settings();
