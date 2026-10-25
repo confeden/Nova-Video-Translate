@@ -16,7 +16,7 @@
 
 ### Расширение для Chrome
 
-1. Скачайте актуальный архив (например `Nova_Video_Translate_v0.2.26.zip`) из [релиза](https://github.com/confeden/Nova-Video-Translate/releases).
+1. Скачайте актуальный архив (например `Nova_Video_Translate_v0.2.47.zip`) из [релиза](https://github.com/confeden/Nova-Video-Translate/releases).
 2. Распакуйте архив в удобное место.
 3. Перейдите в `chrome://extensions/`.
 4. Включите **«Режим разработчика»** (Developer mode).
