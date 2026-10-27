@@ -381,8 +381,8 @@ describe('engine: Yandex full track', () => {
     other.engine.stop();
   });
 
-  it('a found track voices cells instantly, Gemini is never started, even when Gemini is the first tier', async () => {
-    const e = setup({ order: ['gemini', 'yandex', 'yandex-live'] });
+  it('a found track voices cells instantly, Gemini is never started, when the track tier is first in voiceOrder', async () => {
+    const e = setup({ order: ['yandex', 'yandex-live', 'gemini'] });
     e.prober.auto.set('yandex', track('yandex', 120));
     e.prober.auto.set('yandex-live', undefined);
     await e.engine.start();
@@ -528,7 +528,7 @@ describe('engine: full track hold while the mp3 downloads, and track-fed cells',
 
   it('a FINISHED url keeps the hold open past the race window: the first audible cell comes from the track, not Gemini', async () => {
     const t = timers();
-    const e = setup({ order: ['gemini', 'yandex', 'yandex-live'], hint: t.hint });
+    const e = setup({ order: ['yandex-live', 'yandex', 'gemini'], hint: t.hint });
     await e.engine.start();
     e.prober.first('yandex-live', 6);
     e.prober.download('yandex'); // status FINISHED + url: the mp3 download starts, no onFirst yet
@@ -812,8 +812,8 @@ describe('engine: background watcher and immediate full-track switch (D29)', () 
     e.engine.stop();
   });
 
-  it('standard first, live later wins regardless of voiceOrder; a late standard never downgrades live', async () => {
-    const e = setup({ order: ['yandex', 'yandex-live', 'gemini'] });
+  it('standard first, live later wins (live ranked first); a late standard never downgrades live', async () => {
+    const e = setup({ order: ['yandex-live', 'yandex', 'gemini'] });
     e.prober.auto.set('yandex', track('yandex', 200));
     await e.engine.start();
     e.prober.first('yandex-live', 2);
@@ -827,7 +827,7 @@ describe('engine: background watcher and immediate full-track switch (D29)', () 
     expect(providerIds(e.scheds[0]!)).toContain('yandex-live@15');
     expect(providerIds(e.scheds[0]!)).not.toContain('yandex@15');
     // the other way round: live first, a standard track later does nothing
-    const f = setup({ order: ['yandex', 'yandex-live', 'gemini'] });
+    const f = setup({ order: ['yandex-live', 'yandex', 'gemini'] });
     f.prober.auto.set('yandex-live', track('yandex-live', 200));
     await f.engine.start();
     f.prober.first('yandex', 2);

@@ -11,7 +11,7 @@ import { localTtsRegistry, type LocalTtsRegistry } from '../../localtts/registry
 import type { FitOptions } from '../gemini/sync';
 import type { AudioChunk, CacheSignature, ChunkResult, DubProvider, ProviderContext, ProviderId, SubtitleCue } from '../types';
 import { ProviderUnavailableError } from '../types';
-import { alignTlang, type CaptionTimeline } from './captions';
+import { alignTlang, censoredInRange, type CaptionTimeline } from './captions';
 import { budgetFor, type SourceSegment } from './segments';
 import type { CaptionPretranslator } from './pretranslate';
 import { translateWithFailover, type TextItem, type TextTranslator } from './translate';
@@ -191,7 +191,12 @@ export class CascadeProvider implements DubProvider {
     let from: 'captions' | 'asr' = 'asr';
     let nextStart: number | undefined;
     const cap = this.o.captions?.();
-    const track = cap ? await cap.get(ctx.signal, this.o.captionWaitMs ?? 2500) : undefined;
+    const rawTrack = cap ? await cap.get(ctx.signal, this.o.captionWaitMs ?? 2500) : undefined;
+    // 0.3.6 censorship bypass: platform captions write a bleeped word as [ __ ] (the audio still has it). A chunk with such a
+    // placeholder is transcribed from the audio instead, when an ASR is available (Groq Whisper / local Whisper).
+    const censored = !!rawTrack && censoredInRange(rawTrack.sentences, chunk.startSec, end - chunk.startSec);
+    const track = censored && this.o.asr ? undefined : rawTrack;
+    if (censored) diag.log(`${id}-censor-bypass`, { cell: chunk.startSec, asr: !!this.o.asr });
     if (track) {
       from = 'captions';
       sourceLang = track.lang || sourceLang;

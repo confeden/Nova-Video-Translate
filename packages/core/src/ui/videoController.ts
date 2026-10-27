@@ -130,6 +130,8 @@ export interface PageRuntimeHost {
   reportVoice?(r: VoiceReport): void;
   /** settings storage / account operations; with it a click on the player button opens the in-page panel */
   settingsHost?: SettingsPanelHost;
+  /** 0.3.6: true when the platform captions of [startSec, startSec+durSec) carry a censored word (Yandex voices it without the word: that tier is skipped there) */
+  censored?(startSec: number, durSec: number): boolean;
   /** Yandex full-track prober (created together with the Yandex providers); absent = chunk mode only */
   fullTrack?(): FullTrackProber | undefined;
   /** HTTP for the Yandex subtitle endpoint (same transport as the Yandex provider); absent = the Yandex subtitle source is skipped */
@@ -461,7 +463,12 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
     }
 
     constructor(readonly video: HTMLVideoElement) {
-      this.subs = createSubtitleOverlay(video, () => this.host());
+      this.subs = createSubtitleOverlay(
+        video,
+        () => this.host(),
+        (st) => void host.settingsHost?.saveSettings({ subStyle: st }),
+        (l) => void host.settingsHost?.saveSettings({ subtitleLang: l }),
+      );
       this.btn = mountPlayerButton(video, { onClick: () => this.onButton(), title: IDLE_TITLE });
       this.refreshButton();
       video.addEventListener('play', this.onPlay);
@@ -590,6 +597,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
         fullTrack: host.fullTrack?.(),
         audioTracks: getAudioTracks(),
         videoKey: () => videoKey(this.video, location.href),
+        censored: (s, d) => host.censored?.(s, d) ?? false,
         settings,
         detectLanguage: () => detectVideoLanguage(this.video, document, { captions: getReader(), broadcasterLang: hlsFetch ? () => this.twitchLanguage(hlsFetch) : undefined }),
         langStore: host.cache ? createLangStore(host.cache, () => videoKey(this.video, location.href)) : undefined,
@@ -754,6 +762,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
     private renderSubs(): void {
       const subsRunning = !!this.subsCtl && this.subsCtl.state !== 'idle' && this.subsCtl.state !== 'failed';
       this.subs.setLang(settings?.subtitleLang === 'translation' ? 'translation' : 'original');
+      if (settings) this.subs.setStyle(settings.subStyle);
       this.subs.setEnabled(settings?.subtitles === 'on' && (this.active || subsRunning));
     }
 

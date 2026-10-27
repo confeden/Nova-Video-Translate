@@ -1,6 +1,7 @@
 import type { LocalAsrModelChoice } from './localasr/whisperModels';
 import type { LocalTtsChoice } from './localtts/catalog';
 import type { ProviderId } from './providers/types';
+import { DEFAULT_SUB_STYLE, type SubStyle } from './ui/subtitleStyle';
 
 export interface GeminiModels {
   /** Empty string = resolved at runtime from the model registry (ListModels + preferences). */
@@ -25,6 +26,8 @@ export interface Settings {
   subtitles: 'off' | 'on';
   /** which text the subtitle line shows: the original speech (default) or the translation */
   subtitleLang: 'original' | 'translation';
+  /** look of the subtitle line (0.3.0): size, font, colour, lines, ticker, word highlight */
+  subStyle: SubStyle;
   /** Voice source priority (D15), highest first. */
   voiceOrder: ProviderId[];
   /** per-source switch; a missing id counts as enabled */
@@ -102,6 +105,7 @@ export const DEFAULT_SETTINGS: Settings = {
   translationVolume: 1.0,
   subtitles: 'off',
   subtitleLang: 'original',
+  subStyle: DEFAULT_SUB_STYLE,
   // D30: Gemini stays in the code but is OFF by default and last
   voiceOrder: ['yandex-live', 'yandex', 'local', 'groq', 'gemini'],
   voiceEnabled: { 'yandex-live': true, yandex: true, groq: true, local: true, gemini: false },

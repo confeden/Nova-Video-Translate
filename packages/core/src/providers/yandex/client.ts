@@ -10,6 +10,9 @@ import { concat, decode, fBool, fBytes, fDbl, fStr, fVar, getNum, getStr } from 
  * the Transport's job, this client only states the intended headers.
  */
 
+/** Full-track download range (bytes): under the 64 MiB service-worker message limit, large enough to keep requests few */
+export const MP3_RANGE_BYTES = 16 * 1024 * 1024;
+
 export const YANDEX_STATUS = {
   FAILED: 0,
   FINISHED: 1,
@@ -592,7 +595,11 @@ export class YandexClient {
     return out;
   }
 
-  private async fetchAudioHops(url: string, signal?: AbortSignal): Promise<Uint8Array> {
+  /**
+   * One GET with redirects followed (max 5 hops). Returns the final reply and the url it came from.
+   * `range` = an HTTP Range header value (`bytes=a-b`) or undefined for the whole file.
+   */
+  private async getAudioHop(url: string, range: string | undefined, signal?: AbortSignal): Promise<{ status: number; headers: Record<string, string>; body: Uint8Array; url: string }> {
     let cur = url;
     for (let hop = 0; hop < 5; hop++) {
       let res;
@@ -600,7 +607,7 @@ export class YandexClient {
         res = await this.transport({
           url: cur,
           method: 'GET',
-          headers: { 'User-Agent': this.o.userAgent, Accept: '*/*', 'Sec-Fetch-Mode': 'no-cors' },
+          headers: { 'User-Agent': this.o.userAgent, Accept: '*/*', 'Sec-Fetch-Mode': 'no-cors', ...(range ? { Range: range } : {}) },
           signal,
         });
       } catch (e) {
@@ -612,10 +619,43 @@ export class YandexClient {
         cur = new URL(loc, cur).toString();
         continue;
       }
-      if (res.status !== 200) throw new YandexError(`mp3 download: HTTP ${res.status}`, 'failed', res.status);
-      return res.body;
+      return { status: res.status, headers: res.headers, body: res.body, url: cur };
     }
     throw new YandexError('mp3 download: too many redirects', 'failed');
+  }
+
+  /**
+   * Full-track mp3 download. The service worker hands a reply to the page in one message, and that message is capped at
+   * 64 MiB (owner diag 0.3.0: "mp3 download: Message exceeded maximum allowed size of 64MiB" on every long video), so the file
+   * is fetched in MP3_RANGE_BYTES ranges when the host answers 206. A host without Range support answers 200 with the whole file.
+   */
+  private async fetchAudioHops(url: string, signal?: AbortSignal): Promise<Uint8Array> {
+    let cur = url;
+    const parts: Uint8Array[] = [];
+    let from = 0;
+    let total = Infinity;
+    while (from < total) {
+      const r = await this.getAudioHop(cur, `bytes=${from}-${from + MP3_RANGE_BYTES - 1}`, signal);
+      cur = r.url;
+      if (r.status === 200 && from === 0) return r.body; // no Range support: the whole file in one reply
+      if (r.status !== 206) throw new YandexError(`mp3 download: HTTP ${r.status}`, 'failed', r.status);
+      const cr = r.headers['content-range'] ?? r.headers['Content-Range'];
+      const m = cr ? /^bytes (\d+)-(\d+)\/(\d+|\*)$/.exec(cr) : null;
+      if (!m || Number(m[1]) !== from) throw new YandexError('mp3 download: bad Content-Range', 'failed');
+      if (m[3] !== '*') total = Number(m[3]);
+      if (r.body.length === 0) throw new YandexError('mp3 download: empty range', 'failed');
+      parts.push(r.body);
+      from += r.body.length;
+      // a host that reports an unknown total: the last range is shorter than asked for
+      if (m[3] === '*' && r.body.length < MP3_RANGE_BYTES) break;
+    }
+    const out = new Uint8Array(from);
+    let at = 0;
+    for (const p of parts) {
+      out.set(p, at);
+      at += p.length;
+    }
+    return out;
   }
 
   /** Full flow: PCM in, mp3 bytes out. */

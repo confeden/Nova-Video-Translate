@@ -1,6 +1,7 @@
-import { CaptionPretranslator, ChromePromptAudioAsr, ChromeTextTranslator, GroqAsr, GroqChatTranslator, LiveGemini, YoutubeCaptionTimeline, createCaptionsBridgeClient, createGroqProvider, createLocalProvider, createPageRuntime, createRemoteCache, createWhisperAsr, createYandexProviders, diag, localAsrRegistry, localTtsRegistry, type CacheMessage, type CacheReply, type DubProvider, type FullTrackProber, type VoiceReport } from '@nvt/core';
+import { censoredInRange, devAudio, CaptionPretranslator, ChromePromptAudioAsr, ChromeTextTranslator, GroqAsr, GroqChatTranslator, LiveGemini, YoutubeCaptionTimeline, createCaptionsBridgeClient, createGroqProvider, createLocalProvider, createPageRuntime, createRemoteCache, createWhisperAsr, createYandexProviders, diag, localAsrRegistry, localTtsRegistry, type CacheMessage, type CacheReply, type DubProvider, type FullTrackProber, type VoiceReport } from '@nvt/core';
 import { browser } from 'wxt/browser';
 import { createSwTransport, transportFetch } from '../utils/swTransport';
+import { NVT_DEVLOG } from '../utils/version';
 import { VOICE_STATUS_KEY, YANDEX_AUTH_KEY, YANDEX_LOGIN_ERROR_KEY, loadSettings, onSettingsChanged } from '../utils/settings';
 import { createBaseHost } from '../utils/panelHost';
 import { registerExtensionLocalTts } from '../utils/localtts/engine';
@@ -51,6 +52,11 @@ export default defineContentScript({
       cache: createRemoteCache((m: CacheMessage) => browser.runtime.sendMessage(m) as Promise<CacheReply | undefined>),
       fullTrack: () => fullTrack,
       captions: () => reader,
+      // 0.3.6: a cell whose platform captions carry a bleeped word is voiced without Yandex when another tier can (engine censor skip)
+      censored: (startSec, durSec) => {
+        const p = youtubeCaptions()?.peek();
+        return !!p && censoredInRange(p.sentences, startSec, durSec);
+      },
       createProviders(getSettings) {
         const transport = createSwTransport();
         const y = createYandexProviders(transport, { getToken: () => getSettings().yandexToken });
@@ -80,10 +86,21 @@ export default defineContentScript({
     runtime.watch(document);
 
     // local log sink (tools/diag-server.mjs): new diagnostics go to the background every 3 s; no sink running = nothing sent
-    setInterval(() => {
-      const entries = diag.drainUnsent();
-      if (entries.length > 0) void browser.runtime.sendMessage({ type: 'nvt-diag-push', page: location.hostname, entries }).catch(() => {});
-    }, 3000);
+    if (NVT_DEVLOG) {
+      // 0.3.9: noisy decoded dubs as 16-bit PCM for the local sink (tools/diag-server.mjs /audio), devlog only
+      devAudio.dump = (name, data, sampleRate) => {
+        const pcm = new Int16Array(data.length);
+        for (let i = 0; i < data.length; i++) pcm[i] = Math.max(-32768, Math.min(32767, Math.round(data[i]! * 32767)));
+        const bytes = new Uint8Array(pcm.buffer);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        void browser.runtime.sendMessage({ type: 'nvt-audio-push', name, sampleRate, pcm16: btoa(bin) }).catch(() => {});
+      };
+      setInterval(() => {
+        const entries = diag.drainUnsent();
+        if (entries.length > 0) void browser.runtime.sendMessage({ type: 'nvt-diag-push', page: location.hostname, entries }).catch(() => {});
+      }, 3000);
+    }
 
     // the Yandex login finishes in another tab: redraw an open in-page panel
     browser.storage.onChanged.addListener((c, area) => {

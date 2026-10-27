@@ -39,7 +39,7 @@ export default defineConfig({
   },
   // core's dist/ is extensionless ESM (fine for bundlers, not for WXT's node-side entrypoint import): use the sources
   vite: () => ({
-    define: { __NVT_VERSION__: JSON.stringify(VERSION) },
+    define: { __NVT_VERSION__: JSON.stringify(VERSION), __NVT_DEVLOG__: JSON.stringify(process.env.NVT_DEVLOG === '1') },
     resolve: { alias: { '@nvt/core': decodeURIComponent(new URL('../../packages/core/src/index.ts', import.meta.url).pathname).replace(/^\/(?=[A-Za-z]:)/, '') } },
   }),
   manifest: {

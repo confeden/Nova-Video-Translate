@@ -486,3 +486,26 @@ describe('engine: deadline-driven tier racing', () => {
     engine.stop();
   });
 });
+
+describe('planCell: local-first (D32)', () => {
+  const L = { id: 'local' as const, expectedSec: 8 };
+  it('local starts with the cloud plan when a Yandex tier is preferred', () => {
+    const p = planCell({ timeToSlot: 120, tiers: [{ id: 'yandex-live', expectedSec: 90 }, { id: 'yandex', expectedSec: 50 }, L], localFirst: true });
+    expect(p.start).toEqual(['local', 'yandex-live']);
+    expect(p.reason).toBe('local-first');
+    expect(p.preferred).toBe('yandex-live');
+  });
+  it('local is started also when the cloud tier is late', () => {
+    const p = planCell({ timeToSlot: 30, tiers: [{ id: 'yandex', expectedSec: 50 }, L], localFirst: true });
+    expect(p.start[0]).toBe('local');
+    expect(p.start).toContain('yandex');
+  });
+  it('local preferred or no local tier: plan unchanged', () => {
+    const cloud = [{ id: 'yandex' as const, expectedSec: 50 }];
+    expect(planCell({ timeToSlot: 120, tiers: [L, ...cloud], localFirst: true }).reason).toBe('preferred-in-time');
+    expect(planCell({ timeToSlot: 120, tiers: cloud, localFirst: true }).reason).toBe('single');
+  });
+  it('off by default', () => {
+    expect(planCell({ timeToSlot: 120, tiers: [{ id: 'yandex', expectedSec: 50 }, L] }).start).toEqual(['yandex']);
+  });
+});

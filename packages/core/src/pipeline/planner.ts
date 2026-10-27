@@ -187,7 +187,7 @@ export interface PlanTier {
   expectedSec: number;
 }
 
-export type PlanReason = 'preferred-in-time' | 'preferred-late-fallback' | 'none-in-time-fastest' | 'single' | 'no-tier' | 'full-track' | 'live-quality';
+export type PlanReason = 'preferred-in-time' | 'preferred-late-fallback' | 'none-in-time-fastest' | 'single' | 'no-tier' | 'full-track' | 'live-quality' | 'local-first';
 
 export interface CellPlan {
   /** tiers to start now, highest priority first */
@@ -209,11 +209,24 @@ export interface CellPlan {
  *     (a non-Gemini tier beats Gemini: Gemini only when it is the only tier in time, quota discipline);
  *  3. nobody in time -> the fastest tier alone (a late dub still serves rewinds and the rest of the slot).
  */
-export function planCell(o: { timeToSlot: number; tiers: PlanTier[]; marginSec?: number }): CellPlan {
+export function planCell(o: { timeToSlot: number; tiers: PlanTier[]; marginSec?: number; localFirst?: boolean }): CellPlan {
   const margin = o.marginSec ?? PLAN_MARGIN_SEC;
   const tiers = o.tiers;
   if (tiers.length === 0) return { start: [], reason: 'no-tier', inTime: [], late: true };
   const pref = tiers[0]!;
+  const local = tiers.find((t) => t.id === 'local');
+  if (o.localFirst && local && pref.id !== 'local' && tiers.length > 1) {
+    // owner D32: the on-device voice starts for every cell at once (it fills the gaps where cloud audio has not arrived);
+    // the cloud plan runs next to it, and a cloud dub that lands in time replaces the local one (upgrade rules, UPGRADE_LEAD_SEC)
+    const cloud = planCell({ ...o, localFirst: false, tiers: tiers.filter((t) => t.id !== 'local') });
+    return {
+      start: ['local', ...cloud.start],
+      preferred: pref.id,
+      reason: 'local-first',
+      inTime: cloud.inTime,
+      late: cloud.late && local.expectedSec + margin > o.timeToSlot,
+    };
+  }
   const inTime = tiers.filter((t) => t.expectedSec + margin <= o.timeToSlot);
   const ids = inTime.map((t) => t.id);
   if (tiers.length === 1) return { start: [pref.id], preferred: pref.id, reason: 'single', inTime: ids, late: inTime.length === 0 };

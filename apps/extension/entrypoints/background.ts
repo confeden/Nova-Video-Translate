@@ -178,6 +178,14 @@ export default defineBackground(() => {
       void handleHttp(msg.req as WireReq).then(sendResponse);
       return true; // async response
     }
+    if (msg?.type === 'nvt-audio-push' && typeof msg.pcm16 === 'string') {
+      void fetch(DIAG_SINK.replace('/log', '/audio'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: browser.runtime.getManifest().version, name: msg.name, sampleRate: msg.sampleRate, pcm16: msg.pcm16 }),
+      }).catch(() => {});
+      return false;
+    }
     if (msg?.type === 'nvt-diag-push' && Array.isArray(msg.entries)) {
       // the page's diagnostics go to the local sink; the sink wipes its file on a version change or after 24 h
       void fetch(DIAG_SINK, {

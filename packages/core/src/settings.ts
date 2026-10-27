@@ -1,6 +1,7 @@
 import { isWhisperModelId } from './localasr/whisperModels';
 import { LOCAL_TTS_ENGINES, hasVoice, isLocalTtsEngineId, type LocalTtsChoice } from './localtts/catalog';
 import type { ProviderId } from './providers/types';
+import { normalizeSubStyle } from './ui/subtitleStyle';
 import { DEFAULT_SETTINGS, type Settings } from './types';
 
 const IDS: ProviderId[] = ['yandex-live', 'yandex', 'groq', 'local', 'gemini'];
@@ -79,6 +80,7 @@ export function normalizeSettings(raw: unknown): Settings {
     translationVolume: num(r.translationVolume, DEFAULT_SETTINGS.translationVolume, 0, 1),
     subtitles: r.subtitles === 'on' ? 'on' : 'off',
     subtitleLang: r.subtitleLang === 'translation' ? 'translation' : 'original',
+    subStyle: normalizeSubStyle(r.subStyle),
     voiceOrder,
     voiceEnabled,
     geminiKeys: Array.isArray(r.geminiKeys) ? [...new Set((r.geminiKeys as unknown[]).filter((k): k is string => typeof k === 'string').map((k) => k.trim()).filter(Boolean))] : [],

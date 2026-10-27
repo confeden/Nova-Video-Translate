@@ -128,6 +128,14 @@ export const sentencesFromJson3 = (input: string | unknown): SourceSegment[] => 
 
 const isRu = (lang: string): boolean => /^ru(-|$)/i.test(lang);
 
+/** the bleeped-word placeholder of platform captions: [ __ ], [ ___ ], [ ** ] (0.3.6) */
+export const CENSOR_PLACEHOLDER = /\[\s*_{2,}\s*\]|\[\s*\*{2,}\s*\]/;
+
+/** true when a caption sentence that starts inside [startSec, startSec+durSec) carries a censor placeholder */
+export function censoredInRange(sentences: readonly { start: number; text: string }[], startSec: number, durSec: number): boolean {
+  return sentences.some((s) => s.start >= startSec && s.start < startSec + durSec && CENSOR_PLACEHOLDER.test(s.text));
+}
+
 export interface CaptionTimeline {
   /** cheap, no waiting: sentences if already loaded */
   peek(): { sentences: SourceSegment[]; lang: string; audioLang?: string } | undefined;

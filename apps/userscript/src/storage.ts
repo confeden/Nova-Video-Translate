@@ -9,6 +9,10 @@ export const YANDEX_LOGIN_ERROR_KEY = 'nvt.yandexLoginError';
 export const VOICE_STATUS_KEY = 'nvt.voiceStatus';
 /** set once the stored dubLagSec 2 (old default) was moved to 1 */
 const DUB_LAG_KEY = 'nvt.dubLag1';
+/** set once the Gemini tier was switched off for the stored settings (0.3.0: Gemini is off by default, mirrors the extension) */
+const GEMINI_OFF_KEY = 'nvt.geminiOffByDefault';
+/** set once the subtitle transparency defaults moved to text 20% / background 25% (0.3.9, mirrors the extension) */
+const SUB_DEFAULTS_KEY = 'nvt.subStyleDefaults39';
 
 /** set once the autoTranslate default was moved to 'on' for the stored settings (mirrors the extension) */
 const AUTO_DEFAULT_KEY = 'nvt.autoTranslateOnByDefault';
@@ -54,6 +58,21 @@ export function loadSettings(): Settings {
       gmSet(SETTINGS_KEY, normalizeSettings(s));
     }
     gmSet(DUB_LAG_KEY, true);
+  }
+  if (gmGet(GEMINI_OFF_KEY) !== true) {
+    // one-time: profiles saved while Gemini was on by default keep it on; 0.3.0 makes it off by default (the user turns it on by hand)
+    s.voiceEnabled = { ...s.voiceEnabled, gemini: false };
+    gmSet(SETTINGS_KEY, normalizeSettings(s));
+    gmSet(GEMINI_OFF_KEY, true);
+  }
+  if (gmGet(SUB_DEFAULTS_KEY) !== true) {
+    // one-time: untouched transparency (the old defaults 0 / 45) moves to the new defaults; a changed value stays
+    const st = s.subStyle;
+    if (st.textTransparency === 0 && st.bgTransparency === 45) {
+      s.subStyle = { ...st, textTransparency: 20, bgTransparency: 25 };
+    }
+    gmSet(SETTINGS_KEY, normalizeSettings(s));
+    gmSet(SUB_DEFAULTS_KEY, true);
   }
   const auth = loadYandexAuth();
   if (auth && (auth.expiresAt === 0 || auth.expiresAt > Date.now())) s.yandexToken = auth.token;

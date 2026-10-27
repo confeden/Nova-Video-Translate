@@ -89,3 +89,6 @@ try {
 } catch {
   /* frozen global: ignore */
 }
+
+/** devlog builds only: a decoded dub is handed to the local sink as audio (set by the content script; absent = nothing) */
+export const devAudio: { dump?: (name: string, data: Float32Array, sampleRate: number) => void } = {};

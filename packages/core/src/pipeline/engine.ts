@@ -58,6 +58,8 @@ export const HEALTH_EVERY_MS = 30_000;
 export const STALL_LATE_DUBS = 3;
 /** the ads state held longer than this is treated as stuck (the DOM evidence is polled every 500 ms, so a real break never lasts this long) */
 export const ADS_STUCK_SEC = 300;
+/** a playlist 'gap' (stitched-ad segments skipped while the player shows no ad) longer than this is not waiting for an ad to end: restart for a new usher session. Stitched ads are ~30 s, so 5 min of silence was the bug */
+export const GAP_STUCK_SEC = 45;
 /** chunk RMS above this counts as speech for the 'no dub although speech exists' watchdog */
 export const SPEECH_RMS = 0.01;
 
@@ -126,6 +128,8 @@ export interface SchedulerLike {
 }
 
 export interface EngineDeps {
+  /** 0.3.6: the cell's source words are censored (captions placeholder): the Yandex tiers are not used there when another tier exists */
+  censored?: (startSec: number, durSec: number) => boolean;
   /** page host for per-site tier overrides (default location.hostname) */
   host?: string;
   video: HTMLVideoElement;
@@ -1288,7 +1292,7 @@ export class TranslationEngine {
     // healthy and the player shows no ad. Restarting would only create a new anonymous usher session (another preroll ad + a re-alignment).
     if ((what === 'no-chunks' || what === 'no-dubs') && this.capture.inGap?.()) {
       w.gapSince ??= t;
-      if ((t - w.gapSince) / 1000 <= ADS_STUCK_SEC) {
+      if ((t - w.gapSince) / 1000 <= GAP_STUCK_SEC) {
         if (!w.gapLogged) {
           w.gapLogged = true;
           diag.log('stall', { what: 'gap', sinceSec: Math.round(sinceSec * 10) / 10, gaps: this.capture.gapCount?.() ?? 0, ...this.stallFlags() });
@@ -1685,17 +1689,22 @@ export class TranslationEngine {
     const c = task.chunk;
     const tts = c.startSec + this.lagSec() - this.deps.video.currentTime;
     const ft = this.trackTierFor(c);
-    if (ft) return { plan: { start: [ft], preferred: ft, reason: 'full-track', inTime: [ft], late: false }, blocked: false, tts };
+    if (ft && !this.higherTierInTime(ft, tts)) return { plan: { start: [ft], preferred: ft, reason: 'full-track', inTime: [ft], late: false }, blocked: false, tts };
     const all = eligibleProviders(this.deps.providers, this.settings, this.chain, now);
     const free = all.filter((p) => this.tierActive(p.id) < this.tierCap(p.id));
+    // 0.3.6 censorship: Yandex voices a bleeped word as silence. Where the captions mark one, Yandex is left out while another tier can voice the cell
+    const censoredCell = this.deps.censored?.(c.startSec, c.durationSec) === true;
+    const censorSkip: ProviderId[] = censoredCell && free.some((p) => !TranslationEngine.isYandexId(p.id)) ? free.filter((p) => TranslationEngine.isYandexId(p.id)).map((p) => p.id) : [];
+    if (censorSkip.length > 0) diag.log('censor-skip-yandex', { cell: c.startSec, tiers: censorSkip });
     if (all.length === 0) return { plan: { start: [], reason: 'no-tier', inTime: [], late: true }, blocked: false, tts }; // the chain reports "no tier"
     if (free.length === 0) return { plan: { start: [], reason: 'no-tier', inTime: [], late: true }, blocked: true, tts };
+    if (censorSkip.length > 0) free.splice(0, free.length, ...free.filter((p) => !censorSkip.includes(p.id)));
     if (this.qualityLive() && !task.revoice && all.some((p) => p.id === 'local')) return this.planLiveQuality(task, all, free, tts);
     // a pinned (full-track) tier is fast only for the cells its track covers; this cell is not covered, so it runs at its chunk-mode speed
     // D26 live policy (chunk mode): the live tier starts only for a cell whose slot is at least its expected latency away
     // (the server ETA of a live job is 500-750 s); it never runs as the fall-through of a cell it was gated out of
     const liveGated = free.some((p) => p.id === 'yandex-live') && all.some((p) => p.id !== 'yandex-live') && tts < this.model.expectedSec('yandex-live', c.durationSec);
-    const skip: ProviderId[] = liveGated ? ['yandex-live'] : [];
+    const skip: ProviderId[] = [...(liveGated ? ['yandex-live' as ProviderId] : []), ...censorSkip];
     if (liveGated) {
       const rest = free.filter((p) => p.id !== 'yandex-live');
       if (rest.length === 0) {
@@ -1705,7 +1714,7 @@ export class TranslationEngine {
       free.splice(0, free.length, ...rest);
     }
     const tiers = free.map((p) => ({ id: p.id, expectedSec: this.tracks.get(p.id)?.complete ? Math.max(this.model.expectedSec(p.id), this.model.prior(p.id) * 0.5) : this.model.expectedSec(p.id) }));
-    let plan = planCell({ timeToSlot: tts, tiers });
+    let plan = planCell({ timeToSlot: tts, tiers, localFirst: true });
     if (task.revoice) plan = { ...plan, start: [tiers[0]!.id], reason: 'single' };
     if (!liveGated && plan.start.includes('yandex-live') && !this.model.etaKnown('yandex-live')) {
       // scouting live job (its server ETA is not known yet): race it with the best other tier so the cell is not at its mercy
@@ -1739,7 +1748,8 @@ export class TranslationEngine {
       this.yandexSkipLogAt = nowMs();
       diag.log('yandex-live-skip', { why: 'cell-late', cell: task.chunk.startSec, tts: Math.round(tts * 10) / 10, exp: Object.fromEntries(yAll.map((t) => [t.id, Math.round(t.expectedSec * 10) / 10])) });
     }
-    const start: ProviderId[] = [...d.send, 'local'];
+    // the user's voice order decides who starts first: a local tier ranked above Yandex starts before it
+    const start: ProviderId[] = [...d.send, 'local' as ProviderId].sort((a, b) => this.rankOf(a) - this.rankOf(b));
     const inTime = yAll.filter((t) => d.send.includes(t.id) && t.expectedSec + PLAN_MARGIN_SEC <= tts).map((t) => t.id);
     return { plan: { start, preferred: start[0], reason: 'live-quality', inTime: [...inTime, 'local'], late: false }, blocked: false, tts };
   }
@@ -2236,19 +2246,19 @@ export class TranslationEngine {
   // ---- Yandex full track (S24) ----
 
   /**
-   * Voice preference for track decisions (D29 quality ladder): live > standard > Gemini regardless of the user's order and of
-   * which track arrived first (a tier the user disabled is never in `usable`, so it never takes part).
+   * A full track of a lower-ranked tier waits while a higher-ranked usable tier is predicted in time for the cell (owner: the user's
+   * voice order decides; the higher tier voices the cell itself and the track may still upgrade it later).
    */
-  private prefRank(id: ProviderId): number {
-    return id === 'gemini' ? 100 : id === 'yandex-live' ? 0 : id === 'yandex' ? 1 : this.rankOf(id) + 2;
+  private higherTierInTime(tier: ProviderId, tts: number): boolean {
+    return [...this.usable].some((id) => this.rankOf(id) < this.rankOf(tier) && this.model.expectedSec(id) + PLAN_MARGIN_SEC <= tts);
   }
 
-  /** best usable tier whose full track covers the cell */
+  /** best usable tier whose full track covers the cell (the user's voice order decides) */
   private trackTierFor(c: { startSec: number; durationSec: number }): ProviderId | undefined {
     let best: ProviderId | undefined;
     for (const t of this.tracks.values()) {
       if (!this.usable.has(t.tier) || !trackCovers(t, c.startSec, c.durationSec)) continue;
-      if (best === undefined || this.prefRank(t.tier) < this.prefRank(best)) best = t.tier;
+      if (best === undefined || this.rankOf(t.tier) < this.rankOf(best)) best = t.tier;
     }
     return best;
   }
@@ -2270,7 +2280,7 @@ export class TranslationEngine {
     const old = this.cellProvider.get(cell);
     if (!old) return undefined;
     const tier = this.trackTierFor({ startSec: cell, durationSec: dur });
-    if (!tier || this.prefRank(tier) >= this.prefRank(old)) return undefined;
+    if (!tier || this.rankOf(tier) >= this.rankOf(old)) return undefined;
     const out = this.serveTrack(tier, { startSec: cell, durationSec: dur });
     if (!out || !out.ok) return undefined;
     const full = out.result.segments.map((x) => ({ ...x, providerId: tier }));
@@ -2289,7 +2299,7 @@ export class TranslationEngine {
     return { from: old, to: tier, playing };
   }
 
-  /** every done cell the playhead has not left far behind: swapped to the best full track now (live outranks standard outranks Gemini) */
+  /** every done cell the playhead has not left far behind: swapped to the best full track now (the user's voice order decides) */
   private upgradeFromTracks(): void {
     const ct = this.deps.video.currentTime;
     let n = 0;

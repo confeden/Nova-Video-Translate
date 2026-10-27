@@ -14,6 +14,7 @@ import { normHost } from '../settings';
 import { GEMINI_KEYS_URL, GROQ_KEYS_URL, openKeyPage } from './keyLinks';
 import { localAsrSection, type LocalAsrPanelHost } from './localAsrSection';
 import { localTtsSection, type LocalTtsPanelHost } from './localTtsSection';
+import { SUB_BG_TRANSP_MAX, SUB_COLORS, SUB_FONTS, SUB_SIZE_MAX, SUB_SIZE_MIN, SUB_TEXT_TRANSP_MAX, SUB_TRANSP_STEP, SUB_WEIGHTS, type SubStyle } from './subtitleStyle';
 import { isReleasePageUrl, type UpdateCheckResult, type UpdateInfo } from '../update';
 
 export interface YandexAccountInfo {
@@ -230,6 +231,72 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
     return h('section', {}, d);
   };
 
+  /** 0.3.0: the look of the subtitle line (the same controls as the hover panel on the video) */
+  const subsStyleSection = (): HTMLElement => {
+    const st = s.subStyle;
+    const put = (patch: Partial<SubStyle>): void => void save({ subStyle: { ...s.subStyle, ...patch } });
+    const select = (options: Array<[string, string]>, value: string, onPick: (v: string) => void): HTMLElement => {
+      const el = h('select', { onchange: (e: Event) => onPick((e.target as HTMLSelectElement).value) });
+      for (const [v, label] of options) el.append(h('option', { value: v }, label));
+      (el as HTMLSelectElement).value = value;
+      return el;
+    };
+    const swatches = h('div', { class: 'row' });
+    for (const c of SUB_COLORS) {
+      const b = h('button', { type: 'button', title: c.label, onclick: () => put({ color: c.hex }) });
+      b.style.background = c.hex;
+      b.style.width = '22px';
+      b.style.height = '22px';
+      b.style.borderRadius = '50%';
+      b.style.border = st.color === c.hex ? '2px solid #fff' : '2px solid transparent';
+      swatches.append(b);
+    }
+    /** the value label follows the thumb while dragging; the setting is saved shortly after the last move */
+    const transparencySlider = (label: string, key: 'textTransparency' | 'bgTransparency', max: number, value: number): HTMLElement => {
+      const out = h('span', {}, value + '%');
+      const input = h('input', {
+        type: 'range', min: '0', max: String(max), step: String(SUB_TRANSP_STEP), value: String(value),
+        oninput: (e: Event) => {
+          const v = Number((e.target as HTMLInputElement).value);
+          out.textContent = v + '%';
+          s = { ...s, subStyle: { ...s.subStyle, [key]: v } };
+          saveSoonStyle({ subStyle: s.subStyle });
+        },
+      });
+      return h('div', { class: 'row' }, h('label', {}, label), input, out);
+    };
+    const saveSoonStyle = debounce((patch: Partial<Settings>) => void host.saveSettings(patch), 200);
+    const weightName = (w: number): string => (w === 400 ? 'обычный' : w === 500 ? 'средний' : w === 700 ? 'жирный' : 'очень жирный');
+    return sec(
+      'subs-style',
+      'Субтитры: вид',
+      h('p', { class: 'hint' }, 'Меняется сразу. На самом видео: наведите на субтитры и нажмите ⚙.'),
+      (() => {
+        const sel = h('select', { onchange: () => void save({ subtitleLang: sel.value === 'translation' ? 'translation' : 'original' }) },
+          h('option', { value: 'original' }, 'Оригинал'), h('option', { value: 'translation' }, 'Перевод'));
+        sel.value = s.subtitleLang === 'translation' ? 'translation' : 'original';
+        return h('div', { class: 'row' }, h('label', {}, 'Язык субтитров'), sel);
+      })(),
+      h('div', { class: 'row' }, h('label', {}, 'Размер'),
+        h('input', { type: 'range', min: String(SUB_SIZE_MIN), max: String(SUB_SIZE_MAX), step: '10', value: String(st.size), onchange: (e: Event) => put({ size: Number((e.target as HTMLInputElement).value) }) }),
+        h('span', {}, `${st.size}%`)),
+      h('div', { class: 'row' }, h('label', {}, 'Шрифт'),
+        select(SUB_FONTS.map((f, i): [string, string] => [String(i), f.label]), String(st.font), (v) => put({ font: Number(v) }))),
+      h('div', { class: 'row' }, h('label', {}, 'Жирность'),
+        select(SUB_WEIGHTS.map((w): [string, string] => [String(w), weightName(w)]), String(st.weight), (v) => put({ weight: Number(v) as SubStyle['weight'] }))),
+      h('div', { class: 'row' }, h('label', {}, 'Цвет'), swatches),
+      h('div', { class: 'row' }, h('label', {}, 'Выравнивание'),
+        select([['left', 'слева'], ['center', 'по центру'], ['right', 'справа']], st.align, (v) => put({ align: v as SubStyle['align'] }))),
+      h('div', { class: 'row' }, h('label', {}, 'Строк'),
+        select([['1', '1'], ['2', '2'], ['3', '3']], String(st.lines), (v) => put({ lines: Number(v) as SubStyle['lines'] }))),
+      transparencySlider('Прозрачность текста', 'textTransparency', SUB_TEXT_TRANSP_MAX, st.textTransparency),
+      transparencySlider('Прозрачность фона', 'bgTransparency', SUB_BG_TRANSP_MAX, st.bgTransparency),
+      toggle('Рамка вокруг строки', st.frame, (v) => put({ frame: v })),
+      toggle('Бегущая строка', st.ticker, (v) => put({ ticker: v })),
+      toggle('Неон звучащего слова (в оригинале)', st.highlight, (v) => put({ highlight: v })),
+    );
+  };
+
   const voicesSection = (): HTMLElement => {
     const list = h('div');
     // no getLocalAsrInfo => no local tiers on this host (userscript): Groq and the on-device tier are not offered
@@ -304,12 +371,6 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
         h('select', { disabled: true }, h('option', {}, 'Русский')),
       ),
       toggle('Субтитры', s.subtitles === 'on', (v) => void save({ subtitles: v ? 'on' : 'off' })),
-      (() => {
-        const sel = h('select', { onchange: () => void save({ subtitleLang: sel.value === 'translation' ? 'translation' : 'original' }) },
-          h('option', { value: 'original' }, 'Оригинал'), h('option', { value: 'translation' }, 'Перевод'));
-        sel.value = s.subtitleLang === 'translation' ? 'translation' : 'original';
-        return h('div', { class: 'row' }, h('label', {}, 'Язык субтитров'), sel);
-      })(),
       toggle('Использовать родной русский дубляж, если есть', s.preferNativeDub !== false, (v) => void save({ preferNativeDub: v })),
       toggle('Не переводить видео на русском', s.skipRussian !== 'off', (v) => void save({ skipRussian: v ? 'on' : 'off' })),
       (() => {
@@ -850,6 +911,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
       updateBanner(),
       host.getTranslateStatus ? topBox : null,
       mixSection(),
+      subsStyleSection(),
       voicesSection(),
       geminiSection(),
       host.getLocalAsrInfo ? chromeAiSection() : null,

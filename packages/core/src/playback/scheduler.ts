@@ -1,10 +1,25 @@
-import { diag } from '../diag';
+import { devAudio, diag } from '../diag';
 import { Ducker } from '../ducking';
 import type { DubSegment } from '../providers/types';
 import { timeStretch, STRETCH_MAX } from '../audio/timeStretch';
 import { decodeDubAudio } from './decode';
 
 /** A segment may carry a TTS speed hint; DubSegment itself does not declare it. */
+/** a dub shorter than this share of its slot is reported as sped up (defect diagnostics) */
+const FAST_RATIO = 0.85;
+/** decoded dub peaks are scaled down to this level (below full scale, leaves headroom for the output stage) */
+const PEAK_CEIL = 0.95;
+/** noise gate for encoded dubs: when the quiet-part floor is above GATE_FLOOR_DB (dBFS), frames below floor + GATE_ABOVE_FLOOR_DB are cut */
+const GATE_FLOOR_DB = -48;
+/** encoded dubs whose high-frequency share exceeds this are low-passed (hiss) */
+const HISS_HF_RATIO = 0.2;
+/** devlog: how many noisy dubs were handed to the audio dump in this page */
+let devDumps = 0;
+const HISS_CUTOFF_HZ = 7000;
+const GATE_ABOVE_FLOOR_DB = 8;
+const GATE_MIN_DB = -40;
+const GATE_MAX_DB = -28;
+
 export type SchedSegment = DubSegment & { rate?: number };
 
 export interface DubSchedulerOptions {
@@ -84,6 +99,16 @@ interface Entry {
   /** decoded but (practically) silent: 'no speech', must not duck */
   silent?: boolean;
   peak?: number;
+  /** samples at or above 0.999 (full scale): a clipped decode */
+  clipped?: number;
+  /** the decoded voice was scaled down to PEAK_CEIL */
+  scaled?: boolean;
+  /** the dub went through the 7 kHz low-pass (hiss) */
+  lowPassed?: boolean;
+  /** quietest 20% of 20 ms frames, dBFS, and their high-frequency share (encoded dubs) */
+  floorDb?: number;
+  hfRatio?: number;
+  gated?: boolean;
   /** voiced ranges inside the buffer, buffer seconds (gaps shorter than the duck gap are bridged) */
   voiced?: Array<[number, number]>;
   logged?: Set<string>;
@@ -244,7 +269,18 @@ export class DubScheduler {
     this.onStarve = opts.onStarve;
     this.master = audioCtx.createGain();
     this.master.gain.value = opts.translationVolume ?? 1;
-    this.master.connect(audioCtx.destination);
+    // 0.3.2: a limiter before the speakers. Full-track Yandex audio decodes at peaks up to ~1.03 (diag 0.3.1: most segments >= 0.95),
+    // and the output stage clips those samples into audible crackle; chunk voices sit near 0.7-0.8 and are not touched.
+    if (typeof audioCtx.createDynamicsCompressor === 'function') {
+      const limiter = audioCtx.createDynamicsCompressor();
+      limiter.threshold.value = -1;
+      limiter.knee.value = 0;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.1;
+      this.master.connect(limiter);
+      limiter.connect(audioCtx.destination);
+    } else this.master.connect(audioCtx.destination);
     this.ducker = new Ducker(video);
     this.adaptive = opts.adaptiveDuck ?? true;
     this.duckLead = opts.duckLeadSec ?? 0.25;
@@ -856,14 +892,27 @@ export class DubScheduler {
         entry.buffer = buffer;
         this.analyze(entry, buffer);
         diag.log('dub-decoded', {
+          floorDb: entry.floorDb === undefined ? undefined : Math.round(entry.floorDb * 10) / 10,
+          hfRatio: entry.hfRatio === undefined ? undefined : Math.round(entry.hfRatio * 1000) / 1000,
+          gated: entry.gated ? 1 : 0,
+          lowPassed: entry.lowPassed ? 1 : 0,
           start: entry.seg.start,
           end: entry.seg.end,
           dur: buffer.duration,
           peak: entry.peak,
+          clipped: entry.clipped,
           silent: !!entry.silent,
           voiced: entry.voiced?.map(([a, b]) => [Math.round(a * 10) / 10, Math.round(b * 10) / 10]),
           ms: typeof performance !== 'undefined' ? Math.round(performance.now() - t0) : undefined,
         });
+        // defect markers for a segment (diagnostics only, the playback is unchanged): 'fast' = the voice ran shorter than its slot
+        // (sped up by the provider), 'clip' = full-scale samples (the decoded audio overshoots). Owner 0.3.4: Yandex live artefacts.
+        {
+          const slotSec = entry.seg.end - entry.seg.start;
+          const ratio = slotSec > 0 ? buffer.duration / slotSec : 1;
+          const why = [ratio < FAST_RATIO ? 'fast' : '', (entry.clipped ?? 0) > 0 ? 'clip' : ''].filter(Boolean);
+          if (why.length > 0) diag.log('dub-defect', { start: entry.seg.start, ratio: Math.round(ratio * 100) / 100, why: why.join(','), clipped: entry.clipped ?? 0, peak: entry.peak });
+        }
         if (!this.disposed) {
           this.plan();
           this.updateDuck();
@@ -901,8 +950,32 @@ export class DubScheduler {
     }
     if (!data || data.length === 0) return;
     const frame = Math.max(1, Math.round(buffer.sampleRate * VOICE_FRAME_SEC));
+    if (entry.seg.audio?.kind === 'encoded') {
+      // 0.3.6: quiet-part noise (owner: long fading hiss in Yandex live dubs). Measured first, then the gate runs on it.
+      const n = noiseFloor(data, frame);
+      entry.floorDb = n.floorDb;
+      entry.hfRatio = n.hfRatio;
+      if (devAudio.dump && devDumps < 12 && (n.hfRatio > HISS_HF_RATIO || n.floorDb > -40)) {
+        devDumps++;
+        devAudio.dump(`dub-${entry.seg.start}-${Math.round(n.floorDb)}`, data.slice(), buffer.sampleRate);
+      }
+      // 0.3.7: broadband hiss under the speech (diag 0.3.7: hfRatio 0.23-0.26 on the noisy dubs, 0.16 on clean Yandex audio):
+      // a 7 kHz low-pass removes most of it; speech stays intelligible
+      if (n.hfRatio > HISS_HF_RATIO) {
+        lowPass(data, buffer.sampleRate, HISS_CUTOFF_HZ);
+        entry.lowPassed = true;
+      }
+      if (n.floorDb > GATE_FLOOR_DB) {
+        // 0.3.6 adaptive: the gate sits GATE_ABOVE_FLOOR_DB above the measured floor, clamped to a sane range
+        // (diag 0.3.6: the 2:30 dub had floorDb -34.7 = hiss inside the Yandex audio; a fixed -55 dB gate missed it)
+        const thr = Math.min(GATE_MAX_DB, Math.max(GATE_MIN_DB, n.floorDb + GATE_ABOVE_FLOOR_DB));
+        applyGate(data, frame, 10 ** (thr / 20), buffer.sampleRate);
+        entry.gated = true;
+      }
+    }
     const rmsList: number[] = [];
     let peak = 0;
+    let clipped = 0;
     for (let i = 0; i < data.length; i += frame) {
       let sum = 0;
       const end = Math.min(data.length, i + frame);
@@ -911,10 +984,22 @@ export class DubScheduler {
         sum += v * v;
         const av = v < 0 ? -v : v;
         if (av > peak) peak = av;
+        if (av >= 0.999) clipped++;
       }
       rmsList.push(Math.sqrt(sum / (end - i)));
     }
     entry.peak = peak;
+    entry.clipped = clipped;
+    // 0.3.5: a decoded voice that overshoots full scale (Yandex full track peaks 1.00-1.02, diag 0.3.4 'clip') is scaled to
+    // PEAK_CEIL in place: the output stage would otherwise clip it into crackle. Quieter voices are not touched.
+    if (peak > PEAK_CEIL) {
+      const k = PEAK_CEIL / peak;
+      for (let c = 0; c < buffer.numberOfChannels; c++) {
+        const ch = buffer.getChannelData(c);
+        for (let i = 0; i < ch.length; i++) ch[i] = ch[i]! * k;
+      }
+      entry.scaled = true; // diagnostics keep the raw peak / clipped count
+    }
     if (peak < SILENT_PEAK) {
       entry.silent = true;
       return;
@@ -1079,5 +1164,63 @@ export class DubScheduler {
       });
     }
     diag.log('seg-play', { start: entry.seg.start, end: entry.seg.end, slot: this.ss(entry), ...(entry.shift ? { gated: entry.shift } : {}), vt, in: ctxStart - now, offset: offset0, dur, rate: source.playbackRate.value, ...(stretch > 1 ? { stretch } : {}), endV, ctx: this.ctx.state });
+  }
+}
+
+/** 20 ms RMS frames: the quietest 20% define the floor (dBFS); hfRatio = high-frequency share (first difference) of those frames */
+export function noiseFloor(data: Float32Array, frame: number): { floorDb: number; hfRatio: number } {
+  const rms: number[] = [];
+  const hf: number[] = [];
+  for (let i = 0; i + frame <= data.length; i += frame) {
+    let e = 0;
+    let d = 0;
+    for (let j = i; j < i + frame; j++) {
+      e += data[j]! * data[j]!;
+      if (j > i) d += (data[j]! - data[j - 1]!) ** 2;
+    }
+    rms.push(Math.sqrt(e / frame));
+    hf.push(Math.sqrt(d / frame));
+  }
+  if (rms.length === 0) return { floorDb: -120, hfRatio: 0 };
+  const order = rms.map((_, i) => i).sort((a, b) => rms[a]! - rms[b]!);
+  const k = Math.max(1, Math.floor(order.length * 0.2));
+  let sum = 0;
+  let hfSum = 0;
+  let rmsSum = 0;
+  for (let q = 0; q < k; q++) {
+    const i = order[q]!;
+    sum += rms[i]!;
+    hfSum += hf[i]!;
+    rmsSum += rms[i]!;
+  }
+  const floor = sum / k;
+  return { floorDb: 20 * Math.log10(floor + 1e-9), hfRatio: rmsSum > 0 ? hfSum / rmsSum : 0 };
+}
+
+/** gate: frames whose RMS is below `level` are scaled down to silence, with a 5 ms smoothed gain (no clicks) */
+export function applyGate(data: Float32Array, frame: number, level: number, sampleRate: number): void {
+  const a = Math.exp(-1 / Math.max(1, 0.005 * sampleRate));
+  let g = 1;
+  for (let i = 0; i < data.length; i += frame) {
+    const end = Math.min(data.length, i + frame);
+    let e = 0;
+    for (let j = i; j < end; j++) e += data[j]! * data[j]!;
+    const target = Math.sqrt(e / (end - i)) < level ? 0 : 1;
+    for (let j = i; j < end; j++) {
+      g = a * g + (1 - a) * target;
+      data[j] = data[j]! * g;
+    }
+  }
+}
+
+/** four-pole low-pass (four cascaded one-pole filters, about 24 dB per octave), in place */
+export function lowPass(data: Float32Array, sampleRate: number, cutoffHz: number): void {
+  const al = 1 - Math.exp((-2 * Math.PI * cutoffHz) / sampleRate);
+  for (let pass = 0; pass < 4; pass++) {
+    let z = 0;
+    for (let i = 0; i < data.length; i++) {
+      z += al * (data[i]! - z);
+      data[i] = z;
+    }
   }
 }

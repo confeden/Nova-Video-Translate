@@ -1,6 +1,6 @@
 {
   "name": "nvt",
-  "version": "0.2.47",
+  "version": "0.3.22",
   "private": true,
   "workspaces": [
     "packages/*",
@@ -9,6 +9,7 @@
   "scripts": {
     "build": "npm run build -w @nvt/core && npm run build -w @nvt/extension && npm run build -w @nvt/userscript",
     "bump": "node scripts/bump-version.mjs",
+    "diag": "node tools/diag-server.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {
