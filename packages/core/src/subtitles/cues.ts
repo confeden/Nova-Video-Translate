@@ -65,12 +65,60 @@ export function mergeCues(layers: readonly (readonly SubtitleCue[])[]): Subtitle
         else lo = mid + 1;
       }
       let covered = 0;
-      for (let i = lo; i < higher.length && higher[i]!.start < c.end; i++) covered += overlap(c.start, c.end, higher[i]!.start, higher[i]!.end);
-      if (covered <= 0.5 * (c.end - c.start)) add.push(c);
+      // a layer segments the same speech differently: a cue whose middle is already on screen is the same phrase again
+      const mid = (c.start + c.end) / 2;
+      let midCovered = false;
+      for (let i = lo; i < higher.length && higher[i]!.start < c.end; i++) {
+        covered += overlap(c.start, c.end, higher[i]!.start, higher[i]!.end);
+        if (higher[i]!.start <= mid && mid < higher[i]!.end) midCovered = true;
+      }
+      if (!midCovered && covered <= 0.5 * (c.end - c.start)) add.push(c);
     }
     kept = [...higher, ...add].sort((a, b) => a.start - b.start || a.end - b.end);
   }
   return kept;
+}
+
+/**
+ * Puts the original-language text of each translated cue into `src` (the overlay's "Оригинал" line). A translated cue
+ * takes the original cues it overlaps; without it, "Оригинал" would show the Russian text. `original` must be sorted by start.
+ */
+export function attachOriginal(translated: readonly SubtitleCue[], original: readonly SubtitleCue[]): SubtitleCue[] {
+  return translated.map((t) => {
+    let text = '';
+    let last = '';
+    for (const o of original) {
+      if (o.start >= t.end) break;
+      if (o.end <= t.start || o.text === last) continue;
+      text = appendRolling(text, o.text);
+      last = o.text;
+    }
+    return text ? { ...t, src: text } : t;
+  });
+}
+
+/**
+ * Rolling auto-captions start a line with the tail of the previous one ("A B C" then "B C D"). Returns `text` without that
+ * shared head (at least 2 words), so each cue carries only its new words and is translated once. Empty when nothing is new.
+ */
+export function dropRepeatedHead(prev: string, text: string): string {
+  const a = prev.trim().split(/\s+/).filter(Boolean);
+  const b = text.trim().split(/\s+/).filter(Boolean);
+  for (let k = Math.min(a.length, b.length); k >= 2; k--) {
+    if (a.slice(a.length - k).join(' ') === b.slice(0, k).join(' ')) return b.slice(k).join(' ');
+  }
+  return text.trim();
+}
+
+/** Appends `next` to `acc`, dropping the words of `next` that `acc` already ends with (rolling captions repeat the line). */
+function appendRolling(acc: string, next: string): string {
+  if (!acc) return next;
+  const a = acc.split(/\s+/);
+  const b = next.split(/\s+/);
+  for (let k = Math.min(a.length, b.length); k > 0; k--) {
+    if (a.slice(a.length - k).join(' ') === b.slice(0, k).join(' ')) return [...a, ...b.slice(k)].join(' ');
+  }
+  return `${acc} ${next}`;
 }
 
 /** Fraction (0..1) of [from, to) covered by the cues. */

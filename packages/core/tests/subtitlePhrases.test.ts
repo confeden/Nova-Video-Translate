@@ -12,6 +12,16 @@ describe('mergeCuesToPhrases (0.3.5)', () => {
     expect(out.map((c) => c.text)).toEqual(['Hello there my friend.', 'Next one']);
     expect(out[0]).toMatchObject({ start: 1, end: 3 });
   });
+  it('drops the repeated original text of rolling captions too (no doubled src line)', () => {
+    const out = mergeCuesToPhrases([
+      { start: 0, end: 2, text: 'Привет всем', src: 'hello everyone' },
+      { start: 2, end: 4, text: 'Привет всем друзья', src: 'hello everyone friends' },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.text).toBe('Привет всем друзья');
+    expect(out[0]!.src).toBe('hello everyone friends');
+  });
+
   it('drops the repeated part of rolling captions', () => {
     const out = mergeCuesToPhrases([
       { start: 0, end: 2, text: 'we are going' },

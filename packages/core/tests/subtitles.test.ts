@@ -173,6 +173,36 @@ describe('captions source', () => {
     expect(await new CaptionsSource({ reader: r2, translators: [] }).load(ctx())).toHaveLength(2);
   });
 
+  it('an auto-translated Russian track is not picked for a foreign-audio video', () => {
+    const info: CaptionInfo = {
+      videoId: 'v',
+      audioLang: 'en',
+      translationLangs: ['ru'],
+      tracks: [
+        { lang: 'ru', kind: 'asr', baseUrl: '/ru', translatable: true },
+        { lang: 'en', kind: 'asr', baseUrl: '/en', translatable: true },
+      ],
+    };
+    expect(pickTrack(info)?.lang).toBe('en');
+    expect(pickTrack({ ...info, tracks: [info.tracks[0]!] })).toBeUndefined();
+    expect(pickTrack({ ...info, audioLang: 'ru' })?.lang).toBe('ru');
+  });
+
+  it('a Russian caption track keeps the audio-language track as the original line', async () => {
+    const info: CaptionInfo = {
+      videoId: 'v',
+      audioLang: 'en',
+      translationLangs: [],
+      tracks: [
+        { lang: 'ru', kind: 'manual', baseUrl: '/api/timedtext?v=v&lang=ru', translatable: false },
+        { lang: 'en', kind: 'manual', baseUrl: '/api/timedtext?v=v&lang=en', translatable: true },
+      ],
+    };
+    const cues = await new CaptionsSource({ reader: reader(info, { 'lang=ru': json3(2), 'lang=en': json3(2) }), translators: [] }).load(ctx());
+    expect(cues.map((x) => x.src)).toEqual(['l0', 'l1']);
+    expect(cues.map((x) => x.text)).toEqual(['l0', 'l1']);
+  });
+
   it('no tracks / no player / empty body are SubtitleUnavailable with a Russian reason', async () => {
     await expect(new CaptionsSource({ reader: reader({ tracks: [], translationLangs: [] }), translators: [] }).load(ctx())).rejects.toThrow(/нет субтитров/);
     await expect(new CaptionsSource({ reader: reader(null), translators: [], retries: 1, sleep: async () => {} }).load(ctx())).rejects.toThrow(/доступа к плееру/);
@@ -204,12 +234,17 @@ describe('yandex subtitle source', () => {
   it('polls while waiting, takes the Russian translation, parses it', async () => {
     const replies = [{ waiting: true, subtitles: [] }, { waiting: false, subtitles: [ref({ language: 'en', url: 'https://mds/en.json', translatedLanguage: 'ru', translatedUrl: 'https://mds/ru.json' })] }];
     const api = { getSubtitles: vi.fn(async () => replies.shift()!) };
-    const fetchText = vi.fn(async () => ({ status: 200, text: JSON.stringify({ subtitles: [{ text: 'Привет', startMs: 1000, durationMs: 2000 }] }) }));
+    const bodies: Record<string, string> = {
+      'https://mds/ru.json': JSON.stringify({ subtitles: [{ text: 'Привет', startMs: 1000, durationMs: 2000 }] }),
+      'https://mds/en.json': JSON.stringify({ subtitles: [{ text: 'Hello', startMs: 1000, durationMs: 2000 }] }),
+    };
+    const fetchText = vi.fn(async (url: string) => ({ status: 200, text: bodies[url] ?? '' }));
     const src = new YandexSubtitleSource({ api, fetchText, pageUrl: () => 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', sleep: async () => {} });
     const cues = await src.load({ signal: new AbortController().signal, currentTime: () => 0, onPartial() {}, setLabel() {} });
-    expect(cues).toEqual([c(1, 3, 'Привет')]);
+    expect(cues).toEqual([{ ...c(1, 3, 'Привет'), src: 'Hello' }]);
     expect(api.getSubtitles).toHaveBeenCalledTimes(2);
     expect(fetchText).toHaveBeenCalledWith('https://mds/ru.json', expect.anything());
+    expect(fetchText).toHaveBeenCalledWith('https://mds/en.json', expect.anything());
   });
   it('gives up with a clear reason when Yandex stays waiting (measured behaviour for untranslated videos)', async () => {
     const api = { getSubtitles: async () => ({ waiting: true, subtitles: [] }) };

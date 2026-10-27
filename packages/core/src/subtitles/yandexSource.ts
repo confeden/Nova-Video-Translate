@@ -1,6 +1,7 @@
 import { diag } from '../diag';
 import type { SubtitleCue, Transport } from '../providers/types';
 import { YandexClient, type YandexSubtitleRef } from '../providers/yandex/client';
+import { attachOriginal } from './cues';
 import { parseYandexSubtitles } from './json3';
 import { SubtitleUnavailable, type WholeLoadCtx, type WholeSource } from './types';
 
@@ -83,6 +84,11 @@ export class YandexSubtitleSource implements WholeSource {
     const cues = r.status === 200 ? parseYandexSubtitles(r.text) : [];
     diag.log('subs-yandex-fetch', { status: r.status, cues: cues.length });
     if (cues.length === 0) throw new SubtitleUnavailable('не отдал текст субтитров');
+    // the translated track is the only one in Russian: its original-language twin (ru.url) gives the "Оригинал" line
+    if (pick === ru?.translatedUrl && ru.url && ru.language !== 'ru') {
+      const o = await this.o.fetchText(ru.url, ctx.signal).catch(() => undefined);
+      if (o?.status === 200) return attachOriginal(cues, parseYandexSubtitles(o.text));
+    }
     return cues;
   }
 }

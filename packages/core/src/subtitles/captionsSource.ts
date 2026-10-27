@@ -2,27 +2,32 @@ import { diag } from '../diag';
 import type { SubtitleCue } from '../providers/types';
 import type { CaptionInfo, CaptionTrack, CaptionsReader } from './captionsBridge';
 import type { SubtitleCache } from './cache';
-import { normalizeCues } from './cues';
+import { attachOriginal, normalizeCues } from './cues';
 import { parseJson3 } from './json3';
 import { BATCH_SIZE } from './geminiText';
 import { SubtitleUnavailable, type CueTranslator, type WholeLoadCtx, type WholeSource } from './types';
 
 const isRu = (lang: string): boolean => /^ru(-|$)/i.test(lang);
 
-/** Track to read: a Russian one if any, else a manual track in the audio language, else the auto-generated one, else the first. */
+/**
+ * Track to read: a manual Russian one, else (only when the audio is not Russian) the audio-language track, else a
+ * Russian auto-generated one, else the first. An auto-translated Russian track on a foreign-audio video is not the
+ * original: it would show Russian as "Оригинал" (0.3.26: diag showed `ru asr` picked for an English video).
+ */
 export function pickTrack(info: CaptionInfo): CaptionTrack | undefined {
   const t = info.tracks;
   const manual = (x: CaptionTrack): boolean => x.kind !== 'asr';
   const audio = info.audioLang?.toLowerCase();
   const sameAudio = (x: CaptionTrack): boolean => !!audio && x.lang.toLowerCase().split('-')[0] === audio;
+  const foreignAudio = !!audio && !isRu(audio);
   return (
     t.find((x) => isRu(x.lang) && manual(x)) ??
-    t.find((x) => isRu(x.lang)) ??
+    (foreignAudio ? undefined : t.find((x) => isRu(x.lang))) ??
     t.find((x) => manual(x) && sameAudio(x)) ??
     t.find((x) => sameAudio(x)) ??
-    t.find(manual) ??
-    t.find((x) => x.kind === 'asr') ??
-    t[0]
+    t.find((x) => manual(x) && !(foreignAudio && isRu(x.lang))) ??
+    t.find((x) => x.kind === 'asr' && !(foreignAudio && isRu(x.lang))) ??
+    (foreignAudio ? t.find((x) => !isRu(x.lang)) : t[0])
   );
 }
 
@@ -35,6 +40,15 @@ export function orderBatches(cues: readonly SubtitleCue[], now: number, size = B
     batches.findIndex((b) => b[b.length - 1]!.end > now),
   );
   return [...batches.slice(cur), ...batches.slice(0, cur)];
+}
+
+/** A non-Russian track in the audio language (manual first), or undefined when the audio language is unknown or Russian. */
+export function originalTrack(info: CaptionInfo): CaptionTrack | undefined {
+  const audio = info.audioLang?.toLowerCase();
+  if (!audio || isRu(audio)) return undefined;
+  const same = (x: CaptionTrack): boolean => x.lang.toLowerCase().split('-')[0] === audio.split('-')[0];
+  const others = info.tracks.filter((x) => !isRu(x.lang) && same(x));
+  return others.find((x) => x.kind !== 'asr') ?? others[0];
 }
 
 function withParam(url: string, k: string, v: string): string {
@@ -96,7 +110,13 @@ export class CaptionsSource implements WholeSource {
     diag.log('subs-captions-track', { lang: track.lang, kind: track.kind || 'manual', tracks: info.tracks.length, translatable: track.translatable });
     const src = await this.fetchCues(track.baseUrl, info.urlParams);
     if (src.length === 0) throw new SubtitleUnavailable(info.urlParams ? 'не отдал текст субтитров' : 'не отдал текст субтитров (плеер ещё не выдал токен)');
-    if (isRu(track.lang)) return src;
+    if (isRu(track.lang)) {
+      // the Russian track is the translation: its original-language track (the audio language) gives the "Оригинал" line
+      const original = originalTrack(info);
+      if (!original) return src;
+      const originalCues = await this.fetchCues(original.baseUrl, info.urlParams);
+      return attachOriginal(src, originalCues);
+    }
 
     const lang = track.lang.split('-')[0]!;
     const cacheKind = `cap:${track.lang}:${track.kind || 'm'}`;
@@ -147,7 +167,7 @@ export class CaptionsSource implements WholeSource {
       const ru = await this.fetchCues(withParam(track.baseUrl, 'tlang', 'ru'), info.urlParams);
       if (ru.length > 0) {
         ctx.setLabel('YouTube (автоперевод)');
-        return ru;
+        return attachOriginal(normalizeCues(ru), src);
       }
     }
     throw new SubtitleUnavailable(lastReason);

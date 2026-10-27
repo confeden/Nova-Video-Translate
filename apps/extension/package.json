@@ -1,6 +1,6 @@
 {
   "name": "@nvt/extension",
-  "version": "0.3.22",
+  "version": "0.3.26",
   "private": true,
   "type": "module",
   "scripts": {

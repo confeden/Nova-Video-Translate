@@ -24,7 +24,7 @@ export function mergeCuesToPhrases(cues: readonly SubtitleCue[], opt: PhraseOpti
     .filter((c) => Number.isFinite(c.start) && Number.isFinite(c.end) && c.end > c.start && c.text.trim())
     .sort((a, b) => a.start - b.start || a.end - b.end);
   const out: SubtitleCue[] = [];
-  let cur: { start: number; end: number; text: string; src?: string; last: string; words: number } | undefined;
+  let cur: { start: number; end: number; text: string; src?: string; last: string; lastSrc: string; words: number } | undefined;
   const flush = (): void => {
     if (!cur) return;
     out.push({ start: cur.start, end: cur.end, text: cur.text, ...(cur.src !== undefined ? { src: cur.src } : {}) });
@@ -44,12 +44,17 @@ export function mergeCuesToPhrases(cues: readonly SubtitleCue[], opt: PhraseOpti
         }
         cur.end = Math.max(cur.end, c.end);
         cur.last = text;
-        if (c.src) cur.src = cur.src ? `${cur.src} ${c.src.trim()}` : c.src.trim();
+        // the original line rolls the same way: only its new part is added (else it doubles)
+        const srcText = c.src?.trim() ?? '';
+        const freshSrc = cur.lastSrc && srcText.startsWith(cur.lastSrc) ? srcText.slice(cur.lastSrc.length).trim() : srcText;
+        if (freshSrc) cur.src = cur.src ? `${cur.src} ${freshSrc}` : freshSrc;
+        cur.lastSrc = srcText;
         continue;
       }
       flush();
     }
-    cur = { start: c.start, end: c.end, text, src: c.src?.trim() || undefined, last: text, words: text.split(/\s+/).length };
+    const srcText = c.src?.trim() ?? '';
+    cur = { start: c.start, end: c.end, text, src: srcText || undefined, last: text, lastSrc: srcText, words: text.split(/\s+/).length };
   }
   flush();
   return out;
