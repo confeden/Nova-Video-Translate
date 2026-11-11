@@ -254,7 +254,7 @@ export class SubtitleController {
         if (!item) break;
         const c = item.chunk;
         const end = c.startSec + c.durationSec;
-        if (this.voiceTier === 'gemini' || coverage(this.voiceCues, c.startSec, end) >= VOICE_COVER_SKIP) {
+        if (coverage(this.voiceCues, c.startSec, end) >= VOICE_COVER_SKIP) {
           this.stats.skippedByVoice++;
           this.seen.add(c.startSec);
           continue;

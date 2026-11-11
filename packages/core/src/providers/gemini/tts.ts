@@ -1,6 +1,7 @@
 import { ProviderUnavailableError } from '../types';
 import { alignSentences, type AlignResult } from '../../audio/align';
 import { trimAndFade } from '../../audio/tailTrim';
+import { diag } from '../../diag';
 import { responseInlineData, type GeminiClient } from './client';
 
 /** wall-clock cap of one TTS request (owner diag v0.2.12: runaway generations ran 140+ s) */
@@ -117,7 +118,11 @@ async function synthesizeOnce(
       const sampleRate = rateMatch?.[1] ? Number(rateMatch[1]) : TTS_SAMPLE_RATE;
       let pcm = decodeBase64Pcm(inline.data);
       if (pcm.length === 0) throw new ProviderUnavailableError(EMPTY_MSG, 'gemini', 'failed');
-      if (opts.trim !== false) pcm = trimAndFade(pcm, sampleRate);
+      if (opts.trim !== false) {
+        const before = pcm.length;
+        pcm = trimAndFade(pcm, sampleRate);
+        diag.log('gemini-audio-cleanup', { beforeSec: before / sampleRate, afterSec: pcm.length / sampleRate, removedMs: Math.round((before - pcm.length) * 1000 / sampleRate) });
+      }
       return { pcm, sampleRate, seconds: pcm.length / sampleRate };
     } catch (e) {
       lastErr = e;

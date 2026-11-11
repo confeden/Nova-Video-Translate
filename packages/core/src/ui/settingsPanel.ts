@@ -10,11 +10,11 @@ import type { VoiceReport } from './videoController';
 import { SOURCE_LANG_OPTIONS } from '../lang/names';
 import { isActiveState, stateText, voiceLine, type TranslateStatus } from './status';
 import { DEFAULT_SETTINGS, type Settings } from '../types';
-import { normHost } from '../settings';
+import { LOCAL_FILES_HOST, normHost } from '../settings';
 import { GEMINI_KEYS_URL, GROQ_KEYS_URL, openKeyPage } from './keyLinks';
-import { localAsrSection, type LocalAsrPanelHost } from './localAsrSection';
+import { localAsrSection, type LocalAsrPanelHost, type LocalAsrSectionEl } from './localAsrSection';
 import { localTtsSection, type LocalTtsPanelHost } from './localTtsSection';
-import { SUB_BG_TRANSP_MAX, SUB_COLORS, SUB_FONTS, SUB_SIZE_MAX, SUB_SIZE_MIN, SUB_TEXT_TRANSP_MAX, SUB_TRANSP_STEP, SUB_WEIGHTS, type SubStyle } from './subtitleStyle';
+import { SUB_BG_TRANSP_MAX, SUB_COLORS, SUB_FONTS, SUB_LIFT_MAX, SUB_LIFT_MIN, SUB_LIFT_STEP, SUB_SIZE_MAX, SUB_SIZE_MIN, SUB_TEXT_TRANSP_MAX, SUB_TRANSP_STEP, SUB_WEIGHTS, type SubStyle } from './subtitleStyle';
 import { isReleasePageUrl, type UpdateCheckResult, type UpdateInfo } from '../update';
 
 export interface YandexAccountInfo {
@@ -184,6 +184,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
     (styleHost instanceof ShadowRoot ? styleHost : (doc.head ?? doc.documentElement)).appendChild(st);
   }
   root.classList.add('nvt-sp');
+  root.style.overflowAnchor = 'none';
 
   let s: Settings = structuredClone(DEFAULT_SETTINGS);
   let models: ModelInfo[] = [];
@@ -231,8 +232,8 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
     return h('section', {}, d);
   };
 
-  /** 0.3.0: the look of the subtitle line (the same controls as the hover panel on the video) */
-  const subsStyleSection = (): HTMLElement => {
+  /** the subtitle category: on / off, language, look and position (the same controls as the menu on the video) */
+  const subsSection = (): HTMLElement => {
     const st = s.subStyle;
     const put = (patch: Partial<SubStyle>): void => void save({ subStyle: { ...s.subStyle, ...patch } });
     const select = (options: Array<[string, string]>, value: string, onPick: (v: string) => void): HTMLElement => {
@@ -251,11 +252,12 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
       b.style.border = st.color === c.hex ? '2px solid #fff' : '2px solid transparent';
       swatches.append(b);
     }
+    const saveSoonStyle = debounce((patch: Partial<Settings>) => void host.saveSettings(patch), 200);
     /** the value label follows the thumb while dragging; the setting is saved shortly after the last move */
-    const transparencySlider = (label: string, key: 'textTransparency' | 'bgTransparency', max: number, value: number): HTMLElement => {
+    const slider = (label: string, key: 'textTransparency' | 'bgTransparency' | 'lift', min: number, max: number, step: number, value: number): HTMLElement => {
       const out = h('span', {}, value + '%');
       const input = h('input', {
-        type: 'range', min: '0', max: String(max), step: String(SUB_TRANSP_STEP), value: String(value),
+        type: 'range', min: String(min), max: String(max), step: String(step), value: String(value),
         oninput: (e: Event) => {
           const v = Number((e.target as HTMLInputElement).value);
           out.textContent = v + '%';
@@ -265,12 +267,12 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
       });
       return h('div', { class: 'row' }, h('label', {}, label), input, out);
     };
-    const saveSoonStyle = debounce((patch: Partial<Settings>) => void host.saveSettings(patch), 200);
     const weightName = (w: number): string => (w === 400 ? 'обычный' : w === 500 ? 'средний' : w === 700 ? 'жирный' : 'очень жирный');
     return sec(
-      'subs-style',
-      'Субтитры: вид',
-      h('p', { class: 'hint' }, 'Меняется сразу. На самом видео: наведите на субтитры и нажмите ⚙.'),
+      'subs',
+      'Субтитры',
+      h('p', { class: 'hint' }, 'Меняется сразу. На самом видео: наведите на строку субтитров, появятся стрелки ▲ ▼ и кнопка ⚙.'),
+      toggle('Показывать субтитры', s.subtitles === 'on', (v) => void save({ subtitles: v ? 'on' : 'off' })),
       (() => {
         const sel = h('select', { onchange: () => void save({ subtitleLang: sel.value === 'translation' ? 'translation' : 'original' }) },
           h('option', { value: 'original' }, 'Оригинал'), h('option', { value: 'translation' }, 'Перевод'));
@@ -289,16 +291,28 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
         select([['left', 'слева'], ['center', 'по центру'], ['right', 'справа']], st.align, (v) => put({ align: v as SubStyle['align'] }))),
       h('div', { class: 'row' }, h('label', {}, 'Строк'),
         select([['1', '1'], ['2', '2'], ['3', '3']], String(st.lines), (v) => put({ lines: Number(v) as SubStyle['lines'] }))),
-      transparencySlider('Прозрачность текста', 'textTransparency', SUB_TEXT_TRANSP_MAX, st.textTransparency),
-      transparencySlider('Прозрачность фона', 'bgTransparency', SUB_BG_TRANSP_MAX, st.bgTransparency),
+      slider('Прозрачность текста', 'textTransparency', 0, SUB_TEXT_TRANSP_MAX, SUB_TRANSP_STEP, st.textTransparency),
+      slider('Прозрачность фона', 'bgTransparency', 0, SUB_BG_TRANSP_MAX, SUB_TRANSP_STEP, st.bgTransparency),
+      slider('Высота над низом видео', 'lift', SUB_LIFT_MIN, SUB_LIFT_MAX, SUB_LIFT_STEP, st.lift),
       toggle('Рамка вокруг строки', st.frame, (v) => put({ frame: v })),
       toggle('Бегущая строка', st.ticker, (v) => put({ ticker: v })),
       toggle('Неон звучащего слова (в оригинале)', st.highlight, (v) => put({ highlight: v })),
+      toggle('Скрывать, когда мышь ушла с окна (на другой экран)', st.hideOutside, (v) => put({ hideOutside: v })),
     );
   };
 
   const voicesSection = (): HTMLElement => {
     const list = h('div');
+    // YouTube's own Russian audio track is a source of its own: switched off, the video is translated by the sources below even when the track exists
+    const nativeCb = h('input', {
+      type: 'checkbox',
+      checked: s.preferNativeDub !== false,
+      onchange: () => void save({ preferNativeDub: nativeCb.checked }),
+    });
+    list.append(
+      h('div', { class: 'row' }, nativeCb, h('span', { class: 'name' }, 'Родная русская дорожка YouTube')),
+      h('p', { class: 'hint' }, 'Если у видео есть русский дубляж, включается он (громкость 100%), без перевода. Выключите, чтобы переводить всегда.'),
+    );
     // no getLocalAsrInfo => no local tiers on this host (userscript): Groq and the on-device tier are not offered
     const order = host.getLocalAsrInfo ? s.voiceOrder : s.voiceOrder.filter((id) => id !== 'groq' && id !== 'local');
     order.forEach((id, i) => {
@@ -370,8 +384,6 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
         h('label', {}, 'Язык перевода'),
         h('select', { disabled: true }, h('option', {}, 'Русский')),
       ),
-      toggle('Субтитры', s.subtitles === 'on', (v) => void save({ subtitles: v ? 'on' : 'off' })),
-      toggle('Использовать родной русский дубляж, если есть', s.preferNativeDub !== false, (v) => void save({ preferNativeDub: v })),
       toggle('Не переводить видео на русском', s.skipRussian !== 'off', (v) => void save({ skipRussian: v ? 'on' : 'off' })),
       (() => {
         const sel = h('select', { class: 'grow', onchange: () => void save({ sourceLang: sel.value }) });
@@ -382,9 +394,10 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
       })(),
       toggle('Переводить автоматически', s.autoTranslate === 'on', (v) => void save({ autoTranslate: v ? 'on' : 'off' })),
       (() => {
-        const host = normHost(status?.page || location.hostname);
+        const local = location.protocol === 'file:';
+        const host = local ? LOCAL_FILES_HOST : normHost(status?.page || location.hostname);
         if (!host) return h('div');
-        return toggle(`Не переводить автоматически на ${host}`, s.autoTranslateExcluded.includes(host), (v) =>
+        return toggle(local ? 'Не переводить автоматически локальные видео' : `Не переводить автоматически на ${host}`, s.autoTranslateExcluded.includes(host), (v) =>
           void save({ autoTranslateExcluded: v ? [...new Set([...s.autoTranslateExcluded, host])] : s.autoTranslateExcluded.filter((x) => x !== host) }));
       })(),
       (() => {
@@ -395,7 +408,7 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
         const inp = h('input', { type: 'number', min: '0', max: '6', step: '0.5', value: String(s.dubLagSec ?? 1), onchange: () => void save({ dubLagSec: Math.max(0, Math.min(6, Number(inp.value) || 0)) }) }) as HTMLInputElement;
         return h('div', { class: 'row' }, h('label', {}, 'Задержка озвучки, с'), inp);
       })(),
-      toggle('Пауза, пока не готов первый фрагмент', s.prerollPause === 'on', (v) => void save({ prerollPause: v ? 'on' : 'off' })),
+      toggle('Ждать готовности озвучки', s.prerollPause === 'on', (v) => void save({ prerollPause: v ? 'on' : 'off' })),
       (() => {
         const sel = h('select', { class: 'grow', onchange: () => void save({ clickAction: sel.value === 'toggle' ? 'toggle' : 'settings' }) },
           h('option', { value: 'settings' }, 'открывать настройки'),
@@ -560,6 +573,39 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
     input.addEventListener('change', commit);
     input.addEventListener('paste', () => setTimeout(() => { sync(); commit(); }, 0));
     return h('div', { class: 'sub-row' }, input, saved, getBtn);
+  };
+
+  /** under the translate button: a missing Groq / AI Studio key is asked for right here (more translation and voice sources) */
+  const keysPrompt = (): HTMLElement | null => {
+    const rows: Child[] = [];
+    if (host.getLocalAsrInfo && s.groqApiKey.trim() === '') {
+      const input = h('input', { type: 'password', class: 'grow', placeholder: 'Ключ Groq: вставьте сюда', autocomplete: 'off' }) as HTMLInputElement;
+      const commit = (): void => {
+        const v = input.value.trim();
+        if (v) void save({ groqApiKey: v }).then(render);
+      };
+      input.addEventListener('change', commit);
+      input.addEventListener('paste', () => setTimeout(commit, 0));
+      rows.push(h('div', { class: 'row' }, h('label', {}, 'Groq'), input, h('button', { onclick: () => void openKeyPage(host, GROQ_KEYS_URL) }, 'Получить ключ')));
+    }
+    if (s.geminiKeys.length === 0) {
+      const input = h('input', { type: 'password', class: 'grow', placeholder: 'Ключ Google AI Studio: вставьте сюда', autocomplete: 'off' }) as HTMLInputElement;
+      const add = async (): Promise<void> => {
+        const v = input.value.trim();
+        if (!v || s.geminiKeys.includes(v)) return;
+        input.value = '';
+        await save({ geminiKeys: [...s.geminiKeys, v] });
+        await loadModels();
+        render();
+      };
+      input.addEventListener('keydown', (e) => {
+        if ((e as KeyboardEvent).key === 'Enter') void add();
+      });
+      input.addEventListener('paste', () => setTimeout(() => void add(), 0));
+      rows.push(h('div', { class: 'row' }, h('label', {}, 'AI Studio'), input, h('button', { class: 'primary', onclick: () => void add() }, 'Добавить'), h('button', { onclick: () => void openKeyPage(host, GEMINI_KEYS_URL) }, 'Получить ключ')));
+    }
+    if (rows.length === 0) return null;
+    return h('div', { class: 'keys-prompt' }, h('p', { class: 'hint' }, 'Добавьте бесплатные ключи: больше источников перевода и озвучки, видео переводятся устойчивее.'), ...rows);
   };
 
   const when = (t: number): string => new Date(t).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
@@ -874,14 +920,14 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
       clearMsg = '';
       clearTimer = setTimeout(() => {
         clearStep = 'idle';
-        render();
+        renderNow();
       }, 4000);
-      render();
+      renderNow();
       return;
     }
     clearTimeout(clearTimer);
     clearStep = 'busy';
-    render();
+    renderNow();
     try {
       const r = await host.clearLocalModels();
       clearMsg = `Удалено: ${fmtBytes(r.freedBytes)}`;
@@ -889,13 +935,13 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
       clearMsg = 'Ошибка';
     }
     clearStep = 'idle';
-    render();
+    renderNow();
   };
   const footer = (): Node => {
     const kids: Child[] = [];
     if (host.clearLocalModels) {
       kids.push(
-        h('button', { class: 'clear-models', disabled: clearStep === 'busy', onclick: () => void onClear() }, clearStep === 'armed' ? 'Точно удалить?' : 'Удалить все модели'),
+        h('button', { class: clearStep === 'armed' ? 'clear-models armed' : 'clear-models', style: clearStep === 'armed' ? 'background:#d92d20;border-color:#d92d20;color:#fff' : undefined, disabled: clearStep === 'busy', onclick: () => void onClear() }, clearStep === 'armed' ? 'Точно удалить?' : 'Удалить все модели'),
         clearMsg ? h('span', {}, clearMsg) : null,
       );
     }
@@ -903,27 +949,66 @@ export function mountSettingsPanel(root: HTMLElement, host: SettingsPanelHost): 
     return h('div', { class: 'foot' }, ...kids);
   };
 
-  function render(): void {
+  function renderNow(): void {
     if (destroyed) return;
+    // Constructing the new sections moves the retained ASR/TTS nodes out of
+    // the old panel, so capture scrolling BEFORE constructing any children.
+    const saved: Array<[Element, number]> = [];
+    for (let n: Element | null = root; n; n = n.parentElement) saved.push([n, n.scrollTop]);
+    const se = document.scrollingElement;
+    if (se && !saved.some(([n]) => n === se)) saved.push([se, se.scrollTop]);
+    lastRender = Date.now();
     renderTop();
+    if (host.getLocalAsrInfo) asrEl ??= localAsrSection(host);
+    if (host.getLocalTtsInfo) ttsEl ??= localTtsSection(host);
     const kids: Child[] = [
       h('h1', {}, 'Nova Video Translate'),
       updateBanner(),
       host.getTranslateStatus ? topBox : null,
+      asrEl?.recBox ?? null,
+      keysPrompt(),
       mixSection(),
-      subsStyleSection(),
+      subsSection(),
       voicesSection(),
       geminiSection(),
-      host.getLocalAsrInfo ? chromeAiSection() : null,
-      host.getLocalTtsInfo ? localTtsSection(host) : null,
-      host.getLocalAsrInfo ? localAsrSection(host) : null,
+      host.getLocalAsrInfo || host.getLocalTtsInfo
+        ? sec('local', 'Локальный перевод и озвучка',
+            h('p', { class: 'hint' }, 'Всё, что работает на этом компьютере без ключей: распознавание речи, перевод и голос. Нужные модели скачиваются одной кнопкой под кнопкой перевода.'),
+            host.getLocalAsrInfo ? chromeAiSection() : null,
+            ttsEl ?? null,
+            asrEl ?? null)
+        : null,
       cacheSection(),
       diagSection(),
       versionLine(),
       footer(),
     ];
+    // the panel is rebuilt as a whole: the scroll position of the page / popup must survive it (it jumped to the top)
     root.replaceChildren(...(kids.filter(Boolean) as Node[]));
+    for (const [n, top] of saved) n.scrollTop = top;
   }
+
+  let asrEl: LocalAsrSectionEl | undefined;
+  let ttsEl: HTMLElement | undefined;
+
+  /** renders come in streams (download progress, polls, cache writes): at most one rebuild per 250 ms, the last one always happens */
+  let lastRender = 0;
+  let renderTimer: ReturnType<typeof setTimeout> | undefined;
+  function render(): void {
+    if (destroyed) return;
+    const wait = 250 - (Date.now() - lastRender);
+    if (wait <= 0) {
+      if (renderTimer) clearTimeout(renderTimer);
+      renderTimer = undefined;
+      renderNow();
+    } else if (!renderTimer) {
+      renderTimer = setTimeout(() => {
+        renderTimer = undefined;
+        renderNow();
+      }, wait);
+    }
+  }
+
 
   const refresh = async (): Promise<void> => {
     s = await host.getSettings();

@@ -11,7 +11,9 @@
 import type { AudioChunk } from '../providers/types';
 import { TARGET_RATE, sliceChunks } from './audio';
 import { decodeToPcm16k, yieldToMain, type Decoder } from './decode';
+import { createAacDecoder } from './hls/aac';
 import { isMp4 } from './mp4';
+import { fetchAudioFrames, loadMp4AudioIndex, sampleAt, type Mp4AudioIndex } from './mp4Progressive';
 import { isWebm } from './webm';
 
 export type DirectKind = 'mp4' | 'webm' | 'mp3';
@@ -39,6 +41,10 @@ export interface DirectOptions {
 }
 
 const DEFAULT_MAX = 150 * 1024 * 1024;
+/** audio sample tables of big progressive mp4 files found by probeDirect (keyed by url) */
+const progressiveIndex = new Map<string, Mp4AudioIndex>();
+/** audio decoded per window of a progressive mp4 */
+const PROGRESSIVE_WINDOW_SEC = 45;
 
 export function sniffKind(head: Uint8Array): DirectKind | null {
   if (isMp4(head)) return 'mp4';
@@ -72,7 +78,17 @@ export async function probeDirect(url: string, opts: DirectOptions = {}): Promis
     if (!kind) return { supported: false, size, rangeOk, reason: 'unknown container' };
     // cross-origin: Content-Range is hidden unless exposed by the server; mp4/webm are then size-checked while downloading
     if (size === undefined && kind === 'mp3') return { supported: false, kind, rangeOk, reason: 'unknown size (Content-Range not exposed)' };
-    if (kind !== 'mp3' && size !== undefined && size > (opts.maxBytes ?? DEFAULT_MAX)) return { supported: false, kind, size, rangeOk, reason: 'file too large for whole-file decode' };
+    if (kind !== 'mp3' && size !== undefined && size > (opts.maxBytes ?? DEFAULT_MAX)) {
+      // a big progressive mp4 is read through its audio sample table (a few Range requests per window), not downloaded whole
+      if (kind === 'mp4' && rangeOk) {
+        const ix = await loadMp4AudioIndex(url, size, f, opts.signal).catch(() => undefined);
+        if (ix) {
+          progressiveIndex.set(url, ix);
+          return { supported: true, kind, size, rangeOk };
+        }
+      }
+      return { supported: false, kind, size, rangeOk, reason: 'file too large for whole-file decode' };
+    }
     if (kind === 'mp3' && !rangeOk) return { supported: false, kind, size, rangeOk, reason: 'mp3 needs Range support' };
     return { supported: true, kind, size, rangeOk };
   } catch (e) {
@@ -117,6 +133,32 @@ export async function* directChunks(url: string, fromSec: number, opts: DirectOp
   const chunkSec = opts.chunkSec ?? 15;
   const probe = await probeDirect(url, opts);
   if (!probe.supported || !probe.kind) throw new Error(`direct capture unsupported: ${probe.reason ?? 'unknown'}`);
+
+  const pix = progressiveIndex.get(url);
+  if (probe.kind === 'mp4' && pix && probe.size !== undefined && probe.size > (opts.maxBytes ?? DEFAULT_MAX)) {
+    const dec = await createAacDecoder({ pts: 0, sampleRate: pix.sampleRate, channels: pix.channels, profile: pix.profile, data: new Uint8Array(0) });
+    try {
+      let i = sampleAt(pix, Math.max(0, fromSec));
+      while (i < pix.sizes.length) {
+        if (opts.signal?.aborted) return;
+        await yieldToMain();
+        const t0 = pix.startsSec[i]!;
+        let j = i;
+        while (j < pix.sizes.length && pix.startsSec[j]! < t0 + PROGRESSIVE_WINDOW_SEC) j++;
+        const frames = await fetchAudioFrames(url, pix, i, j, f, opts.signal);
+        const pcm = await dec.decode(frames);
+        for (const c of sliceChunks(pcm, t0, chunkSec)) {
+          if (opts.signal?.aborted) return;
+          yield c;
+        }
+        opts.onProgress?.(j, pix.sizes.length);
+        i = j;
+      }
+    } finally {
+      dec.close();
+    }
+    return;
+  }
 
   if (probe.kind !== 'mp3') {
     const bytes = await fetchBytes(url, f, opts.signal, undefined, opts.maxBytes ?? DEFAULT_MAX, (n) => opts.onProgress?.(n, probe.size));

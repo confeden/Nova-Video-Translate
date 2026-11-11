@@ -68,7 +68,7 @@ export function planSileroRates(naturalDurs: readonly (readonly number[])[], tar
   const natSec = sileroTotalSec(naturalDurs, 1, gapSec);
   const natural: SileroRatePlan = { speed: 1, rates: null, predictedSec: natSec };
   if (!targetSec || !(targetSec > 0) || !naturalDurs.length) return natural;
-  if (Math.abs(natSec - targetSec) / targetSec <= SILERO_FIT_TOLERANCE) return natural;
+  if (natSec <= targetSec * (1 + SILERO_FIT_TOLERANCE)) return natural;
   const uniform = (r: number): SileroRatePlan => ({
     speed: r,
     rates: naturalDurs.map((d) => new Float32Array(d.length).fill(r)),

@@ -49,8 +49,9 @@ export function voiceListsState(engineChoice: string, pi: LocalTtsPanelInfo | nu
   const engine = chosen ?? autoEngine({ voice: '' }, pi) ?? 'supertonic-webgpu';
   const info = engineInfo(engine)!;
   const st = engineState(info, '', pi).state;
-  const ready = st.phase === 'ready';
-  const note = ready ? undefined : st.phase === 'unsupported' ? (st.message ?? 'недоступно') : st.phase === 'downloading' ? 'модель скачивается…' : 'модель не скачана';
+  const gpuMissing = info.needsGpu && pi?.env.gpu === false;
+  const ready = st.phase === 'ready' && !gpuMissing;
+  const note = ready ? undefined : st.message ?? (st.phase === 'downloading' ? 'модель скачивается…' : 'модель не скачана');
   return {
     engine,
     ready,

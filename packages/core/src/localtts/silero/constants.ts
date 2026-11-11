@@ -52,8 +52,8 @@ export const SILERO_SAMPLE_RATE = 24000;
 export const SILERO_HOP_24K = 300;
 export const SILERO_MAX_CHUNK_CHARS = 220;
 export const SILERO_CHUNK_GAP_SEC = 0.25;
-export const SILERO_SPEED_MIN = 0.8;
-export const SILERO_SPEED_MAX = 1.5;
+export const SILERO_SPEED_MIN = 1.0;
+export const SILERO_SPEED_MAX = 1.2;
 /** relative duration miss tolerated before a corrective pass */
 export const SILERO_FIT_TOLERANCE = 0.01;
 

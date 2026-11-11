@@ -12,6 +12,8 @@ import type { FitOptions } from '../gemini/sync';
 import type { AudioChunk, CacheSignature, ChunkResult, DubProvider, ProviderContext, ProviderId, SubtitleCue } from '../types';
 import { ProviderUnavailableError } from '../types';
 import { alignTlang, censoredInRange, type CaptionTimeline } from './captions';
+import { guardAsrSegments } from './guard';
+import { isNonSpeech, isRussianSpeech, matchIntonation } from '../../lang/speechText';
 import { budgetFor, type SourceSegment } from './segments';
 import type { CaptionPretranslator } from './pretranslate';
 import { translateWithFailover, type TextItem, type TextTranslator } from './translate';
@@ -116,7 +118,7 @@ export class CascadeProvider implements DubProvider {
     }
     if (!translate && cap?.machineRu) translate = !!cap.peek();
     this.ready = !!this.engine && source && translate;
-    diag.log(`${this.id}-probe`, { tts: this.engine?.id, asr: asrOk, captions: !!cap?.peek(), translate, usable: this.ready });
+    diag.log(`${this.id}-probe`, { tts: this.engine?.id, ttsPreference: this.tts.preference()?.engine ?? 'auto', asr: asrOk, captions: !!cap?.peek(), translate, usable: this.ready });
   }
 
   private noTts(): void {
@@ -125,7 +127,7 @@ export class CascadeProvider implements DubProvider {
   }
 
   async cacheSignature(): Promise<CacheSignature> {
-    const engine = this.engine ?? (await this.tts.pick(this.o.ttsOrder));
+    const engine = await this.tts.pick(this.o.ttsOrder);
     // the user's pinned male / female voices change the audio, so they are part of the key (auto = unchanged key)
     const pref = this.tts.preference();
     const pinned = [pref?.voiceMale, pref?.voiceFemale].map((v) => (v && v !== 'auto' ? v : '')).join('/');
@@ -176,12 +178,15 @@ export class CascadeProvider implements DubProvider {
     const id = this.id;
     const t0 = Date.now();
     const end = chunk.startSec + chunk.durationSec;
-    const engine = this.engine ?? (await this.tts.pick(this.o.ttsOrder));
+    // Read current preference/health for every cell; keeping the probe's engine
+    // forever defeated automatic demotion and changes made in the settings.
+    const engine = await this.tts.pick(this.o.ttsOrder);
     if (!engine) {
       if (id === 'local') this.noTts();
       throw new ProviderUnavailableError('no local TTS engine available', id, 'unsupported');
     }
     if (id === 'local') localReasons.clear('tts');
+    if (this.engine?.id !== engine.id) diag.log('localtts-reselect', { tier: id, from: this.engine?.id, to: engine.id, preference: this.tts.preference()?.engine ?? 'auto' });
     this.engine = engine;
 
     // 1. source sentences: captions shortcut first, else ASR
@@ -191,7 +196,7 @@ export class CascadeProvider implements DubProvider {
     let from: 'captions' | 'asr' = 'asr';
     let nextStart: number | undefined;
     const cap = this.o.captions?.();
-    const rawTrack = cap ? await cap.get(ctx.signal, this.o.captionWaitMs ?? 2500) : undefined;
+    const rawTrack = cap && !(ctx.repairGaps && this.o.asr) ? await cap.get(ctx.signal, this.o.captionWaitMs ?? 2500) : undefined;
     // 0.3.6 censorship bypass: platform captions write a bleeped word as [ __ ] (the audio still has it). A chunk with such a
     // placeholder is transcribed from the audio instead, when an ASR is available (Groq Whisper / local Whisper).
     const censored = !!rawTrack && censoredInRange(rawTrack.sentences, chunk.startSec, end - chunk.startSec);
@@ -210,7 +215,7 @@ export class CascadeProvider implements DubProvider {
       const a0 = Date.now();
       diag.log(`${id}-asr-start`, { asr: this.o.asr.id, chunkSec: Math.round(chunk.durationSec * 10) / 10 });
       const r = await this.o.asr.transcribe(chunk, { signal: ctx.signal, sourceLang: ctx.sourceLang, live: ctx.live });
-      segs = r.segments;
+      segs = guardAsrSegments(r.segments, chunk);
       bursts = r.speechBursts;
       sourceLang = r.sourceLang || sourceLang;
       diag.log(`${id}-asr-ok`, { from, asr: this.o.asr.id, sentences: segs.length, lang: sourceLang, ms: Date.now() - a0 });
@@ -220,6 +225,13 @@ export class CascadeProvider implements DubProvider {
     // a Russian caption track over non-Russian audio is already the translation
     const ruTrackAsTranslation = from === 'captions' && sourceLang === 'ru';
     if (sourceLang === 'ru' && !ruTrackAsTranslation) return { segments: [], sourceLang: 'ru' };
+    const speech = segs.filter((s) => !isNonSpeech(s.text));
+    const foreign = ruTrackAsTranslation ? speech : speech.filter((s) => !isRussianSpeech(s.text));
+    if (speech.length > 0 && foreign.length === 0) {
+      diag.log(`${id}-speech-filter`, { cell: chunk.startSec, reason: 'russian', sentences: speech.length });
+      return { segments: [], sourceLang: 'ru' };
+    }
+    segs = foreign;
     if (segs.length === 0) return { segments: [], sourceLang: sourceLang || undefined };
 
     // 2. translation
@@ -236,14 +248,14 @@ export class CascadeProvider implements DubProvider {
         if (idx0 >= 0) {
           // holes (undefined) are allowed: they are asked again below, the translated rest of the cell is kept
           const read = (): (string | undefined)[] | undefined => {
-            const got = segs.map((_, k) => store.peek(track.sentences, idx0 + k));
+            const got = segs.map((s) => store.peek(track.sentences, track.sentences.indexOf(s)));
             return got.some((x) => x) ? got : undefined;
           };
           await store.ensure(track.sentences, sourceLang, idx0, 8000).catch(() => false);
           pre = read();
           if (!pre || pre.some((x) => !x)) {
             // the cell crosses a batch boundary: ask for the batch of its last sentence too
-            await store.ensure(track.sentences, sourceLang, idx0 + segs.length - 1, 8000).catch(() => false);
+            await store.ensure(track.sentences, sourceLang, track.sentences.indexOf(segs[segs.length - 1]!), 8000).catch(() => false);
             pre = read();
           }
           if (pre) diag.log(`${id}-translate-ok`, { by: 'pretranslated', n: segs.length, chars: pre.reduce((a, x) => a + (x?.length ?? 0), 0), ms: Date.now() - t0 });
@@ -271,8 +283,14 @@ export class CascadeProvider implements DubProvider {
       }
     }
     const genders = this.classifySpeakers(chunk, segs, bursts);
-    const items = segs.map((s, i) => ({ start: s.start, end: s.end, src: s.text, ru: (texts[i] ?? '').trim(), gender: genders[i] })).filter((x) => x.ru);
+    // technical captions ("Музыка", "[Applause]") are neither voiced nor shown; the translation keeps the question / exclamation of the original
+    const spoken = segs.map((s, i) => ({ start: s.start, end: s.end, src: s.text, ru: (texts[i] ?? '').trim(), gender: genders[i] })).filter((x) => x.ru);
+    const items = spoken.filter((x) => !isNonSpeech(x.src) && !isNonSpeech(x.ru)).map((x) => ({ ...x, ru: matchIntonation(x.src, x.ru) }));
+    if (items.length === 0 && spoken.length > 0) return { segments: [], sourceLang: sourceLang || undefined };
     if (items.length === 0) throw new ProviderUnavailableError('translation is empty', id, 'failed');
+
+    const subtitles = ctx.wantSubtitles ? items.map((x) => ({ start: x.start, end: x.end, src: x.src, text: x.ru })) : undefined;
+    if (subtitles && !ctx.signal.aborted) ctx.onSubtitles?.(subtitles);
 
     // 3. voice + fit
     void this.tts.calibrate(engine.id);
@@ -283,7 +301,7 @@ export class CascadeProvider implements DubProvider {
     }
     const result: ChunkResult = { segments: v.segments.map((s) => ({ ...s, providerId: id })), sourceLang: ruTrackAsTranslation ? (track?.audioLang ?? 'en') : sourceLang || undefined };
     if (bursts && bursts.length) result.speechBursts = bursts;
-    if (ctx.wantSubtitles) result.subtitles = items.map((x) => ({ start: x.start, end: x.end, src: x.src, text: x.ru }));
+    if (subtitles) result.subtitles = subtitles;
     if (v.failed.length > 0) {
       result.failedSegments = v.failed;
       diag.log(`${id}-partial`, { voiced: v.segments.length, failed: v.failed.length });

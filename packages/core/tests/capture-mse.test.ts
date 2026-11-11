@@ -238,6 +238,14 @@ describe('MAIN <-> isolated bridge', () => {
     for (let i = 0; i < 6; i++) await tick();
     expect(got.map((c) => c.startSec)).toEqual([0, 5]);
     expect(got[0]!.pcm).toBeInstanceOf(Int16Array);
+    win.postMessage({ 'nvt-mse': { t: 'hello', nonce: 'unrelated-client' } }, '*');
+    await tick();
+    const second = createMseBridgeClient(win);
+    expect((await second.ping(200))?.segments).toBe(2);
+    sb.appendBuffer(mp4Fragment({ trackId: 1, baseTime: 10000, durations: [5000] }));
+    for (let i = 0; i < 6; i++) await tick();
+    expect(got.map((c) => c.startSec)).toEqual([0, 5, 10]);
+    second.dispose();
     client.dispose();
     main.dispose();
   });

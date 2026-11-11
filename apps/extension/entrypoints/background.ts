@@ -1,16 +1,21 @@
 import { browser, type Browser } from 'wxt/browser';
+import { configureLocalRuntimeHost, type LocalRuntimeHost } from '../utils/localRuntimeHost';
 import { diag, isKeyPageUrl, buildAuthUrl, checkYandexToken, createCodeVerifier, createState, createYandexProviders, describeLoginError, exchangeCode, handleCacheMessage, IdbCache, isCacheMessage, startCacheMaintenance, YANDEX_OAUTH } from '@nvt/core';
 import { fromB64, logPath, swFetchTransport, toB64, type SwState, type WireReq, type WireRes } from '../utils/swTransport';
 import { YANDEX_AUTH_KEY, YANDEX_LOGIN_ERROR_KEY, type YandexAuth } from '../utils/settings';
 import { handleLocalAsrMessage } from '../utils/localasr/background';
 import { clearAllLocalModels, handleLocalTtsMessage } from '../utils/localtts/background';
 import { UPDATE_ALARM, openReleasePage, runUpdateCheck, scheduleUpdateCheck } from '../utils/updateCheck';
+import { NVT_DEVLOG } from '../utils/version';
+import { startDevLog } from '../utils/devlog';
+import { allUnits, WHISPER_MODELS, lasrStateKey, unitStateKey, LTTS_ENV_KEY, LASR_ENV_KEY } from '@nvt/core';
 
 /**
  * Yandex's balancer answers HTTP 402 to any request carrying Origin or Sec-Fetch-Mode: cors (gotcha G4).
  * A service-worker fetch always carries them, so a (session) DNR ruleset removes Origin and rewrites
  * Sec-Fetch-Mode for the Yandex hosts (API + mp3 storage).
  */
+configureLocalRuntimeHost(browser as unknown as LocalRuntimeHost);
 const RULE_ID = 1;
 const YANDEX_DOMAINS = ['api.browser.yandex.ru', 'mds.yandex.net'];
 
@@ -120,7 +125,6 @@ const loginFailed = (message: string): Promise<void> => browser.storage.local.se
 async function oauthFinish(code: string, state: string): Promise<boolean> {
   const got = await browser.storage.session.get(OAUTH_SESSION_KEY);
   const p = got[OAUTH_SESSION_KEY] as { verifier: string; state: string; at: number } | undefined;
-  await browser.storage.session.remove(OAUTH_SESSION_KEY);
   if (!p) {
     await loginFailed('Вход не был начат в этом браузере или сессия расширения сброшена — нажмите «Войти в Яндекс» в настройках ещё раз');
     return false;
@@ -129,6 +133,7 @@ async function oauthFinish(code: string, state: string): Promise<boolean> {
     await loginFailed('Не совпал контрольный код входа (state) — начните вход заново из настроек');
     return false;
   }
+  await browser.storage.session.remove(OAUTH_SESSION_KEY);
   if (Date.now() - p.at > OAUTH_TTL_MS) {
     await loginFailed('Вход не завершён за 10 минут — начните заново');
     return false;
@@ -147,11 +152,28 @@ async function oauthFinish(code: string, state: string): Promise<boolean> {
 
 /** local log sink: tools/diag-server.mjs (127.0.0.1 only) */
 const DIAG_SINK = 'http://127.0.0.1:8765/log';
+async function postDiag(page: string, entries: ReturnType<typeof diag.drainUnsent>): Promise<boolean> {
+  try {
+    const res = await fetch(DIAG_SINK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(5000), body: JSON.stringify({ version: browser.runtime.getManifest().version, page, entries }) });
+    return res.ok;
+  } catch { return false; } // the forwarder retains the batch and records the offline transition
+}
 
 /** Result cache (IndexedDB of the extension origin: shared by every site; content scripts reach it via messages). */
 const resultCache = new IdbCache();
 
 export default defineBackground(() => {
+  startDevLog('background', (entries) => postDiag('background', entries));
+  if (NVT_DEVLOG) {
+    const units = [...allUnits().map((u) => ({ id: u.id, storage: unitStateKey(u.id) })), ...WHISPER_MODELS.map((m) => ({ id: m.id, storage: lasrStateKey(m.id) }))];
+    void browser.storage.local.get([LTTS_ENV_KEY, LASR_ENV_KEY, ...units.map((u) => u.storage)]).then((got) => {
+      diag.log('local-model-env', { tts: got[LTTS_ENV_KEY], asr: got[LASR_ENV_KEY] });
+      for (const u of units) {
+        const s = got[u.storage] as { model?: string; loaded?: number; total?: number; error?: string; dtype?: string; device?: string } | undefined;
+        if (s) diag.log('local-model-state', { unit: u.id, model: s.model, loaded: s.loaded, total: s.total, error: s.error, dtype: s.dtype, device: s.device });
+      }
+    }, (e) => diag.log('local-model-state-error', { message: String((e as Error)?.message ?? e) }));
+  }
   startCacheMaintenance(resultCache);
   // update check (GitHub latest release, every 8 h; the alarm only re-evaluates the due check, retries after failures hourly)
   scheduleUpdateCheck();
@@ -178,7 +200,7 @@ export default defineBackground(() => {
       void handleHttp(msg.req as WireReq).then(sendResponse);
       return true; // async response
     }
-    if (msg?.type === 'nvt-audio-push' && typeof msg.pcm16 === 'string') {
+    if (NVT_DEVLOG && _sender.id === browser.runtime.id && msg?.type === 'nvt-audio-push' && typeof msg.pcm16 === 'string') {
       void fetch(DIAG_SINK.replace('/log', '/audio'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -186,14 +208,9 @@ export default defineBackground(() => {
       }).catch(() => {});
       return false;
     }
-    if (msg?.type === 'nvt-diag-push' && Array.isArray(msg.entries)) {
-      // the page's diagnostics go to the local sink; the sink wipes its file on a version change or after 24 h
-      void fetch(DIAG_SINK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ version: browser.runtime.getManifest().version, page: msg.page, entries: msg.entries }),
-      }).catch(() => {});
-      return false;
+    if (NVT_DEVLOG && _sender.id === browser.runtime.id && msg?.type === 'nvt-diag-push' && Array.isArray(msg.entries)) {
+      void postDiag(String(msg.page ?? 'content'), msg.entries).then((ok) => sendResponse({ ok }));
+      return true;
     }
     if (msg?.type === 'nvt-sw-diag') {
       sendResponse(diag.report());

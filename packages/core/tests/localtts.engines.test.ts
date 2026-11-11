@@ -288,7 +288,8 @@ describe('download honours per-file URLs and verifies sha256', () => {
 describe('settings panel helpers', () => {
   it('unpublished model shows an honest reason; WebGPU engines need the GPU, CPU engines do not', () => {
     expect(panelStateFrom(undefined, { needsGpu: false, published: false }).message).toBe('модель ещё не опубликована');
-    expect(panelStateFrom(undefined, { needsGpu: true, env: { gpu: false } }).phase).toBe('unsupported');
+    expect(panelStateFrom(undefined, { needsGpu: true, env: { gpu: false } }).phase).toBe('none');
+    expect(panelStateFrom(undefined, { needsGpu: true, env: { gpu: false } }).message).toContain('WebGPU недоступен');
     expect(panelStateFrom(undefined, { needsGpu: false, env: { gpu: false } }).phase).toBe('none');
     expect(panelStateFrom({ model: 'ready', loaded: 5, total: 5, rev: 'old', updatedAt: 1 }, { needsGpu: false, rev: 'new' }).phase).toBe('none');
   });

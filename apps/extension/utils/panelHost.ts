@@ -1,53 +1,10 @@
-import { LASR_ENV_KEY, LASR_MSG, LTTS_ENV_KEY, LTTS_MSG, WHISPER_MODELS, VOICE_CALIB_STORAGE_KEY, allUnits, lasrStateKey, checkYandexToken, createRemoteCache, listModels, unitStateKey, type LasrEnv, type LasrState, type LocalAsrPanelInfo, type LocalTtsEngineId, type LocalTtsPanelInfo, type LocalTtsTestResult, type LttsEnv, type LttsState, type CacheMessage, type CacheReply, type SettingsPanelHost, type TranslateStatus, type VoiceStatus } from '@nvt/core';
+import { checkYandexToken, createRemoteCache, listModels, type CacheMessage, type CacheReply, type SettingsPanelHost, type TranslateStatus, type VoiceStatus } from '@nvt/core';
 import { browser } from 'wxt/browser';
+import { createLocalModelPanelHost } from './localModelPanelHost';
 import { createSwTransport, transportFetch } from './swTransport';
 import { loadSettings, loadYandexAuth, saveSettings, VOICE_STATUS_KEY, YANDEX_LOGIN_ERROR_KEY } from './settings';
 import { NVT_VERSION } from './version';
 import { UPDATE_STATE_KEY, updateFromState, isReleasePageUrl, isKeyPageUrl, type UpdateCheckResult, type UpdateState } from '@nvt/core';
-
-let lttsProbed = false;
-const lttsSend = (op: string, extra: Record<string, unknown> = {}): Promise<unknown> => browser.runtime.sendMessage({ type: LTTS_MSG, to: 'bg', op, ...extra });
-
-let lasrProbed = false;
-const lasrSend = (op: string, extra: Record<string, unknown> = {}): Promise<unknown> => browser.runtime.sendMessage({ type: LASR_MSG, to: 'bg', op, ...extra });
-
-/** Local-ASR (Whisper) block state: storage is read directly; the worker is asked for the first WebGPU probe and for stale downloads. */
-async function getLocalAsrInfo(): Promise<LocalAsrPanelInfo | null> {
-  const keys = [LASR_ENV_KEY, ...WHISPER_MODELS.map((m) => lasrStateKey(m.id))];
-  let got = await browser.storage.local.get(keys);
-  let env = got[LASR_ENV_KEY] as LasrEnv | undefined;
-  const stale = WHISPER_MODELS.some((m) => {
-    const st = got[lasrStateKey(m.id)] as LasrState | undefined;
-    return st?.model === 'downloading' && Date.now() - st.updatedAt > 10_000;
-  });
-  if (!lasrProbed || !env || env.gpu === undefined || stale) {
-    lasrProbed = true;
-    await lasrSend('status', { probe: true }).catch(() => undefined);
-    got = await browser.storage.local.get(keys);
-    env = got[LASR_ENV_KEY] as LasrEnv | undefined;
-  }
-  return { env: env ?? {}, units: Object.fromEntries(WHISPER_MODELS.map((m) => [m.id, got[lasrStateKey(m.id)] as LasrState | undefined])) };
-}
-
-/** Local-TTS block state: storage is read directly; the worker is asked for the first probe (WebGPU) and for stale downloads. */
-async function getLocalTtsInfo(): Promise<LocalTtsPanelInfo | null> {
-  const units = allUnits();
-  const keys = [LTTS_ENV_KEY, VOICE_CALIB_STORAGE_KEY, ...units.map((u) => unitStateKey(u.id))];
-  let got = await browser.storage.local.get(keys);
-  let env = got[LTTS_ENV_KEY] as LttsEnv | undefined;
-  const stale = units.some((u) => {
-    const st = got[unitStateKey(u.id)] as LttsState | undefined;
-    return st?.model === 'downloading' && Date.now() - st.updatedAt > 10_000;
-  });
-  if (!lttsProbed || !env || env.gpu === undefined || stale) {
-    lttsProbed = true;
-    await lttsSend('status', { probe: true }).catch(() => undefined);
-    got = await browser.storage.local.get(keys);
-    env = got[LTTS_ENV_KEY] as LttsEnv | undefined;
-  }
-  const calib = got[VOICE_CALIB_STORAGE_KEY] as Record<string, { f0: Record<string, number> }> | undefined;
-  return { env: env ?? {}, units: Object.fromEntries(units.map((u) => [u.id, got[unitStateKey(u.id)] as LttsState | undefined])), ...(calib ? { calib } : {}) };
-}
 
 /** Storage + account part of the settings panel; usable from the popup, the options page and the content script. */
 export function createBaseHost(): SettingsPanelHost {
@@ -103,41 +60,15 @@ export function createBaseHost(): SettingsPanelHost {
     async yandexLogout() {
       await browser.runtime.sendMessage({ type: 'nvt-oauth-logout' });
     },
-    getLocalAsrInfo,
-    // user click only: a model is never downloaded silently
-    async localAsrDownload(model: string) {
-      await lasrSend('download', { model });
-    },
-    async localAsrUpgrade(model: string) {
-      await lasrSend('download', { model, dtype: 'gpu-mixed' });
-    },
-    async localAsrCancel(model: string) {
-      await lasrSend('download-cancel', { model });
-    },
-    async localAsrDelete(model: string) {
-      await lasrSend('delete', { model });
-    },
-    getLocalTtsInfo,
-    async clearLocalModels() {
-      const r = (await browser.runtime.sendMessage({ type: 'nvt-clear-models' })) as { freedBytes?: number } | undefined;
-      if (!r || typeof r.freedBytes !== 'number' || r.freedBytes < 0) throw new Error('clear failed');
-      return { freedBytes: r.freedBytes };
-    },
-    // user click only: a model is never downloaded silently
-    async localTtsDownload(engine: LocalTtsEngineId, voice: string) {
-      await lttsSend('download', { engine, voice });
-    },
-    async localTtsCancel(engine: LocalTtsEngineId, voice: string) {
-      await lttsSend('download-cancel', { engine, voice });
-    },
-    async localTtsDelete(engine: LocalTtsEngineId, voice: string) {
-      await lttsSend('delete', { engine, voice });
-    },
-    async localTtsTest(engine: LocalTtsEngineId, voice: string, text: string): Promise<LocalTtsTestResult> {
-      const r = (await lttsSend('synth', { id: `test${Date.now().toString(36)}`, engine, voice, text })) as ({ ok: true } & LocalTtsTestResult) | { ok: false; error: string } | undefined;
-      if (!r || !r.ok) throw new Error(r && 'error' in r ? r.error : 'нет ответа от расширения');
-      return r;
-    },
+    ...createLocalModelPanelHost({
+      storage: browser.storage.local,
+      send: (type, op, extra) => browser.runtime.sendMessage({ type, to: 'bg', op, ...extra }),
+      async clearModels() {
+        const r = (await browser.runtime.sendMessage({ type: 'nvt-clear-models' })) as { freedBytes?: number } | undefined;
+        if (!r || typeof r.freedBytes !== 'number' || r.freedBytes < 0) throw new Error('clear failed');
+        return { freedBytes: r.freedBytes };
+      },
+    }),
   };
 }
 

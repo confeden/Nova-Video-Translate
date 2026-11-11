@@ -29,6 +29,25 @@ describe('tail noise burst (Gemini 3.8 TTS artifact)', () => {
     expect(tailPeakDb(out, SR, 0.005)).toBeLessThan(-25); // faded
     expect(out.length).toBeLessThan(speech.length + Math.round(0.1 * SR));
   });
+  it('removes a final noise burst even when digital silence follows it', () => {
+    const padded = concat(clip, silence(SR, 0.2));
+    expect(findTailBurst(padded, SR)).toBeGreaterThanOrEqual(speech.length);
+    const out = trimAndFade(padded, SR);
+    expect(peakDb(out)).toBeLessThan(-8);
+    expect(out.length).toBeLessThan(speech.length + 0.1 * SR);
+  });
+  it('removes a leading isolated broadband burst, preserving the following speech', () => {
+    const dirty = concat(silence(SR, 0.05), noiseBurst(SR, 0.12), silence(SR, 0.1), speech);
+    const out = trimAndFade(dirty, SR);
+    expect(peakDb(out)).toBeLessThan(-8);
+    expect(out.length).toBeGreaterThan(speech.length * 0.98);
+    expect(out.length).toBeLessThan(speech.length + 0.15 * SR);
+  });
+  it('preserves a loud voiced opening word separated from quieter speech by a pause', () => {
+    const opening = voiced(SR, 0.15, 180).map((x) => Math.max(-32768, Math.min(32767, x * 3)));
+    const out = trimAndFade(concat(opening, silence(SR, 0.1), speech), SR);
+    expect(out.length).toBeGreaterThan(speech.length + 0.2 * SR);
+  });
 
   it('leaves speech that merely ends loudly alone', () => {
     const plain = concat(speech, silence(SR, 0.2));

@@ -50,29 +50,52 @@ export function findTailBurst(pcm: Int16Array, sampleRate: number, maxBurstSec =
   const active = max * 0.02;
   const quiet = max * 0.005;
   const maxWin = Math.round(maxBurstSec / 0.01);
-  let k = nWin;
+  // Encoders may pad the artifact with digital silence: inspect the last active
+  // run rather than requiring the noise to touch the very last sample.
+  let endWin = nWin;
+  while (endWin > 0 && rms[endWin - 1]! < active) endWin--;
+  let k = endWin;
   while (k > 0 && rms[k - 1]! >= active) k--;
-  const run = nWin - k;
+  const run = endWin - k;
   if (run < 3 || run > maxWin || k < 4) return -1;
   for (let i = k - 3; i < k; i++) if (rms[i]! >= quiet) return -1;
   // stationarity over the interior of the run (the first/last windows may be partial)
-  const inner = Array.from(rms.subarray(k + 1, nWin - 1)).sort((x, y) => x - y);
+  const inner = Array.from(rms.subarray(k + 1, endWin - 1)).sort((x, y) => x - y);
   if (inner.length < 2) return -1;
   const median = inner[inner.length >> 1]!;
   if ((inner[0] ?? 0) < 0.75 * median) return -1;
   const body = Array.from(rms.subarray(0, k)).sort((x, y) => x - y);
   const p99 = body[Math.min(body.length - 1, Math.floor(body.length * 0.99))] ?? 0;
   let clipped = 0;
-  for (let i = k * win; i < pcm.length; i++) if (Math.abs(pcm[i] ?? 0) >= 32000) clipped++;
-  const clipFrac = clipped / (pcm.length - k * win);
+  const end = Math.min(pcm.length, endWin * win);
+  for (let i = k * win; i < end; i++) if (Math.abs(pcm[i] ?? 0) >= 32000) clipped++;
+  const clipFrac = clipped / (end - k * win);
   if (median >= 1.1 * p99 || clipFrac >= 0.005) return k * win;
   return -1;
+}
+
+/** Same isolated-edge shape at the beginning, with an extra broadband check:
+ * a short voiced opening word must never be mistaken for switching noise. */
+export function findHeadBurst(pcm: Int16Array, sampleRate: number): number {
+  const at = findTailBurst(pcm.slice().reverse(), sampleRate);
+  if (at < 0) return -1;
+  const end = pcm.length - at;
+  let energy = 0;
+  let difference = 0;
+  for (let i = 1; i < end; i++) {
+    const v = pcm[i]!;
+    energy += v * v;
+    difference += (v - pcm[i - 1]!) ** 2;
+  }
+  return energy > 0 && difference / energy > 0.7 ? end : -1;
 }
 
 export function trimAndFade(input: Int16Array, sampleRate: number, opts: TrimOptions = {}): Int16Array {
   const burstAt = opts.burst === false ? -1 : findTailBurst(input, sampleRate);
   // copy: never keep a view whose .buffer is larger than the clip
-  const pcm = burstAt >= 0 ? input.slice(0, burstAt) : input;
+  const tailClean = burstAt >= 0 ? input.slice(0, burstAt) : input;
+  const headEnd = opts.burst === false ? -1 : findHeadBurst(tailClean, sampleRate);
+  const pcm = headEnd >= 0 ? tailClean.slice(headEnd) : tailClean;
   const win = Math.max(1, Math.round((opts.windowSec ?? 0.01) * sampleRate));
   if (pcm.length < 2 * win) return pcm.slice();
 

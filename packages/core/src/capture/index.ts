@@ -20,6 +20,7 @@ export * from './decode';
 export * from './mseTap';
 export * from './mseBridge';
 export * from './directUrl';
+export * from './localFile';
 export * from './realtimeTap';
 export { HlsCapture } from './hls/hlsCapture';
 export * from './hls/playlist';
@@ -49,6 +50,8 @@ export interface CaptureOptions {
   directUrl?: string;
   /** fetch for S2 (production: proxied through the service worker, which has host permissions) */
   fetchFn?: typeof fetch;
+  /** whole-file decode limit (mp4 above it is read through its audio table); local files go through extension messages, which cap near 64 MB */
+  maxDirectBytes?: number;
   /** restrict the strategies tried, in order (default all) */
   strategies?: CaptureKind[];
   /** ms to wait for the MAIN-world tap to answer a ping (default 500) */
@@ -181,7 +184,7 @@ export async function createCapture(video: HTMLMediaElement, opts: CaptureOption
       why.push(stats ? 'mse: no audio SourceBuffer' : 'mse: hook not installed');
     } else if (kind === 'direct') {
       const url = opts.directUrl ?? video.currentSrc;
-      const dopts: DirectOptions = { fetchFn: opts.fetchFn, chunkSec, durationSec: video.duration };
+      const dopts: DirectOptions = { fetchFn: opts.fetchFn, maxBytes: opts.maxDirectBytes, chunkSec, durationSec: video.duration };
       const probe = url ? await probeDirect(url, dopts) : { supported: false, reason: 'no url' };
       if (probe.supported) {
         status({ type: 'chosen', kind, why: `${probe.kind} ${probe.size} bytes` });
@@ -199,11 +202,29 @@ export async function createCapture(video: HTMLMediaElement, opts: CaptureOption
 function mseCapture(bridge: MseBridgeClient, chunkSec: number, ownsBridge: boolean): Capture {
   const cbs = new Set<(c: AudioChunk) => void>();
   const co = new Coalescer(chunkSec, (c) => cbs.forEach((f) => f(c)));
-  const off = bridge.onChunk((c) => co.push(c));
+  let running = false;
+  let quietTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearQuiet = (): void => {
+    if (quietTimer !== undefined) clearTimeout(quietTimer);
+    quietTimer = undefined;
+  };
+  const off = bridge.onChunk((c) => {
+    if (!running) return;
+    co.push(c);
+    clearQuiet();
+    // A paused player may never fetch enough audio to fill a whole window.
+    // Deliver the available tail to the engine's rechunker after the append burst ends.
+    quietTimer = setTimeout(() => {
+      quietTimer = undefined;
+      if (running) co.flush();
+    }, 500);
+  });
   return {
     kind: 'mse',
     async start(fromSec) {
+      clearQuiet();
       co.reset();
+      running = true;
       bridge.start(fromSec);
     },
     onChunk(cb) {
@@ -211,6 +232,8 @@ function mseCapture(bridge: MseBridgeClient, chunkSec: number, ownsBridge: boole
       return () => cbs.delete(cb);
     },
     stop() {
+      running = false;
+      clearQuiet();
       bridge.stop();
       co.flush();
       off();

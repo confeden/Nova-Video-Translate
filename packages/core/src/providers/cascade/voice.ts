@@ -140,7 +140,7 @@ export async function voiceSegments(items: readonly TimedText[], o: VoiceOptions
   const voiced = items.map((it, i) => ({ it, i, c: clips[i] })).filter((x) => x.c && x.c.samples.length > 0);
   const places = layoutSequential(
     voiced.map((x) => ({ start: x.it.start, end: x.it.end, sec: x.c!.samples.length / x.c!.sampleRate })),
-    o.layout,
+    { maxRate: 1.05, ...o.layout },
   );
   const placeOf = new Map<number, (typeof places)[number]>();
   voiced.forEach((x, k) => placeOf.set(x.i, places[k]!));

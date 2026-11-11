@@ -21,10 +21,10 @@ describe('voice lists visibility (never hidden)', () => {
     expect(st.note).toMatch(/не скачана/);
     expect(voiceListsState('auto', null).voices.m.length).toBe(5); // no panel info at all: still shown
   });
-  it('without WebGPU the rows are disabled with the reason and no download button', () => {
+  it('without WebGPU playback is disabled, but shared model files remain downloadable', () => {
     const st = voiceListsState('supertonic-webgpu', { env: { gpu: false, offscreen: true }, units: {} });
     expect(st.ready).toBe(false);
-    expect(st.canDownload).toBe(false);
+    expect(st.canDownload).toBe(true);
     expect(st.note).toMatch(/WebGPU/);
   });
   it('a ready engine enables the rows; the Auto voice is the calibrated / prior one', () => {

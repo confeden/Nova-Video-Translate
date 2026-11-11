@@ -146,7 +146,7 @@ export class SileroEngine {
       ac.push(await this.runAcoustic(inp.ids, speaker));
     }
     let passes = 1;
-    // exact plan from the natural durations (per-symbol rates; within one 12.5 ms frame of the target, speed clamped 0.8-1.5)
+    // Fit only when necessary, with a conservative cap to preserve articulation.
     const plan = planSileroRates(
       ac.map((a) => a.durs),
       job.targetSec,

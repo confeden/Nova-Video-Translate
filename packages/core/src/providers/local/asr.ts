@@ -5,7 +5,7 @@ import { twitchChannelFromPath } from '../../capture/hls/playlist';
 import { EMPTY_CHUNKS_BEFORE_REASON, localReasons, reasonText } from '../../localasr/localReason';
 import { anchorSentences } from '../../localasr/anchor';
 import { vadBursts, type VadResult } from '../../localasr/vad';
-import { dropLeadingWords, overlapWords, stripNonSpeech } from '../../localasr/asrText';
+import { dropLeadingWords, dropWeakSegments, overlapWords, stripNonSpeech } from '../../localasr/asrText';
 import { SourceLangResolver, getBroadcasterLang, setResolvedSourceLang } from '../../localasr/sourceLang';
 import { resampleInt16 } from '../gemini/translate';
 import { ProviderUnavailableError, type AudioChunk } from '../types';
@@ -122,8 +122,12 @@ export class LocalAsrStage implements AsrStage {
         diag.log('chunk-no-speech', { text: fullText.length, bursts: vad.bursts.length, speechSec: Math.round(vad.speechSec * 10) / 10 });
         segsOut = [];
       } else {
-        segsOut = placed;
-        diag.log('anchor', { s: placed.length, b: vad.bursts.length, first: Math.round((placed[0]!.start - leadSec) * 100) / 100, last: Math.round((placed[placed.length - 1]!.end - leadSec) * 100) / 100 });
+        const strong = dropWeakSegments(placed, vad.bursts);
+        if (strong.length < placed.length) diag.log('asr-weak-drop', { dropped: placed.length - strong.length, texts: placed.filter((p) => !strong.includes(p)).map((p) => p.text.slice(0, 40)) });
+        segsOut = strong;
+        if (strong.length === 0) {
+          diag.log('chunk-no-speech', { text: fullText.length, bursts: vad.bursts.length, speechSec: Math.round(vad.speechSec * 10) / 10, weak: true });
+        } else diag.log('anchor', { s: placed.length, b: vad.bursts.length, first: Math.round((placed[0]!.start - leadSec) * 100) / 100, last: Math.round((placed[placed.length - 1]!.end - leadSec) * 100) / 100 });
       }
     }
     if (vad) burstsOut = vad.bursts.filter((b) => b.end > leadSec).map((b) => ({ start: chunk.startSec + Math.max(0, b.start - leadSec), end: chunk.startSec + Math.min(chunk.durationSec, b.end - leadSec) }));

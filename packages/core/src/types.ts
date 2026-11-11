@@ -46,8 +46,8 @@ export interface Settings {
   /** What a click on the in-player NVT button does: open the settings panel or start/stop translation at once. */
   clickAction: 'settings' | 'toggle';
   /**
-   * Start-up UX: 'on' = pause the video at start until the first dub covering the playhead is ready (resumed only if we
-   * paused it and the user has not touched it); 'off' = the original plays at full volume until the dub joins.
+   * 'on' = pause an unprepared VOD fragment until a short nearby dub from any enabled tier is ready; resume only if we
+   * paused it and the user has not touched it. 'off' = the original plays at full volume until the dub joins.
    */
   prerollPause: 'off' | 'on';
   /**
@@ -107,7 +107,7 @@ export const DEFAULT_SETTINGS: Settings = {
   subtitleLang: 'original',
   subStyle: DEFAULT_SUB_STYLE,
   // D30: Gemini stays in the code but is OFF by default and last
-  voiceOrder: ['yandex-live', 'yandex', 'local', 'groq', 'gemini'],
+  voiceOrder: ['yandex-live', 'groq', 'local', 'gemini', 'yandex'],
   voiceEnabled: { 'yandex-live': true, yandex: true, groq: true, local: true, gemini: false },
   geminiKeys: [],
   geminiModels: { translate: '', tts: '', live: '' },

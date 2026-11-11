@@ -8,7 +8,6 @@ import type {
   DubProvider,
   DubSegment,
   ProviderContext,
-  SubtitleCue,
 } from '../types';
 import { ProviderUnavailableError } from '../types';
 import { GeminiClient } from './client';
@@ -259,6 +258,9 @@ export class GeminiProvider implements DubProvider {
     // no speech / music: a clean empty result (the engine must not duck for it)
     if (tr.segments.length === 0) return { segments: [], sourceLang: tr.sourceLang || undefined };
 
+    const subtitles = ctx.wantSubtitles ? tr.segments.map((s) => ({ start: chunk.startSec + s.start, end: chunk.startSec + s.end, src: s.src, text: s.ru })) : undefined;
+    if (subtitles && !ctx.signal.aborted) ctx.onSubtitles?.(subtitles);
+
     let choices: Array<{ voice: string }>;
     if (this.opts.fixedVoice ?? (GEMINI_FIXED_VOICE && this.opts.voices === undefined)) {
       choices = tr.segments.map(() => ({ voice: GEMINI_FIXED_VOICE_NAME }));
@@ -309,14 +311,10 @@ export class GeminiProvider implements DubProvider {
     );
 
     const segments: DubSegment[] = [];
-    const subtitles: SubtitleCue[] = [];
     const failed: { start: number; end: number }[] = [];
     tr.segments.forEach((s, i) => {
       const a = audio[i];
       const f = fits[i];
-      if (ctx.wantSubtitles) {
-        subtitles.push({ start: chunk.startSec + s.start, end: chunk.startSec + s.end, src: s.src, text: s.ru });
-      }
       if (!a || !f) {
         failed.push({ start: chunk.startSec + s.start, end: chunk.startSec + s.end });
         return;
@@ -331,7 +329,7 @@ export class GeminiProvider implements DubProvider {
       });
     });
     const result: ChunkResult = { segments, sourceLang: tr.sourceLang };
-    if (ctx.wantSubtitles) result.subtitles = subtitles;
+    if (subtitles) result.subtitles = subtitles;
     if (failed.length > 0) {
       result.failedSegments = failed;
       diag.log('gemini-partial', { voiced: segments.length, failed: failed.length });

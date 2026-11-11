@@ -123,6 +123,36 @@ describe('DubScheduler', () => {
     expect(ctx.sources).toHaveLength(2);
     expect(ctx.sources[1]!.starts[0]!.when).toBeCloseTo(4, 1);
   });
+  it('a re-requested cache result cannot restart a playing or completed sentence', async () => {
+    make().addSegments([{ ...seg(0, 2), providerId: 'groq', text: 'Та же фраза.' }]);
+    sch.start();
+    await run(0.8);
+    const first = ctx.sources[0]!;
+    const n = ctx.sources.length;
+    sch.addSegments([{ ...seg(0, 2, 1.99), providerId: 'groq', text: 'Та же фраза.' }]);
+    await flush();
+    expect(first.stops).toHaveLength(0);
+    expect(ctx.sources.length).toBe(n);
+    await run(2);
+    sch.addSegments([{ ...seg(0, 2), providerId: 'groq', text: 'Та же фраза.' }]);
+    await flush();
+    expect(ctx.sources.length).toBe(n);
+    // An explicit rewind must still replay it.
+    video.currentTime = 0.3;
+    fire('seeking'); fire('seeked');
+    await flush();
+    expect(ctx.sources.length).toBeGreaterThan(n);
+  });
+  it('still replaces a duplicate scheduled in the future', async () => {
+    make().addSegments([seg(1, 2)]);
+    sch.start();
+    await flush();
+    const first = ctx.sources[0]!;
+    sch.addSegments([seg(1, 2)]);
+    await flush();
+    expect(first.stops.length).toBeGreaterThan(0);
+    expect(ctx.sources.length).toBe(2);
+  });
 
   it('decodes pcm segments to a float buffer', async () => {
     const buf = await decodeDubAudio(ctx as unknown as AudioContext, {
@@ -384,6 +414,93 @@ describe('DubScheduler', () => {
     sch.start();
     await flush();
     expect(ctx.sources).toHaveLength(0);
+  });
+
+  it('prepares a cloud handoff while local audio keeps playing, then reuses the decoded buffer', async () => {
+    const local = { ...seg(1, 9), providerId: 'local' as const };
+    const cloud = segY(1, 5);
+    make().addSegments([local]);
+    sch.start();
+    await run(2);
+    const localSource = ctx.sources[0]!;
+    let finish!: (buffer: { duration: number }) => void;
+    const decode = vi.spyOn(ctx, 'decodeAudioData').mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const preparing = sch.prepareUpgrade([cloud]);
+    expect(localSource.stops).toHaveLength(0);
+    expect(ctx.sources).toHaveLength(1);
+    finish({ duration: 4 });
+    expect(await preparing).toBe(true);
+    expect(localSource.stops).toHaveLength(0);
+    sch.removeSegmentsWhere((s) => s.providerId === 'local', { fadeSec: 0.15 });
+    sch.addSegments([cloud]);
+    await flush();
+    expect(decode).toHaveBeenCalledTimes(1);
+    expect(ctx.sources).toHaveLength(2);
+    expect(ctx.sources[1]!.starts[0]!.offset).toBeGreaterThan(0);
+  });
+
+  it('prepares an existing paused segment against the saved playhead and reuses it when playback restores its clock', async () => {
+    video.paused = true;
+    video.currentTime = 0; // a paused player may temporarily hide its restored positive position
+    const cloud = segY(100, 104);
+    const decode = vi.spyOn(ctx, 'decodeAudioData');
+    make().addSegments([cloud]);
+    sch.start();
+    expect(decode).not.toHaveBeenCalled();
+    expect(await sch.prepareUpgrade([cloud], 103.1)).toBe(false); // the saved position is too late to join
+    expect(await sch.prepareUpgrade([cloud], 101)).toBe(true);
+    expect(decode).toHaveBeenCalledTimes(1);
+    expect(ctx.sources).toHaveLength(0);
+    video.currentTime = 101;
+    video.paused = false;
+    fire('playing');
+    await flush();
+    expect(decode).toHaveBeenCalledTimes(1);
+    expect(ctx.sources).toHaveLength(1);
+    expect(ctx.sources[0]!.starts[0]!.offset).toBeGreaterThanOrEqual(1);
+  });
+
+  it.each(['yandex', 'gemini'] as const)('keeps local audio when a prepared %s replacement is too late to join', async (providerId) => {
+    make().addSegments([{ ...seg(1, 10), providerId: 'local' }]);
+    sch.start();
+    await run(2);
+    const localSource = ctx.sources[0]!;
+    video.currentTime = providerId === 'yandex' ? 4.1 : 6;
+    const cloud = { ...seg(1, providerId === 'yandex' ? 5 : 10), providerId };
+    expect(await sch.prepareUpgrade([cloud])).toBe(false);
+    expect(localSource.stops).toHaveLength(0);
+    expect(ctx.sources).toHaveLength(1);
+  });
+
+  it('rechecks a supplied pause clock after a seek during decoding', async () => {
+    video.paused = true;
+    video.currentTime = 0;
+    let saved = 101;
+    let finish!: (buffer: { duration: number }) => void;
+    vi.spyOn(ctx, 'decodeAudioData').mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    make();
+    const preparing = sch.prepareUpgrade([segY(100, 104)], () => saved);
+    saved = 103.1;
+    finish({ duration: 4 });
+    expect(await preparing).toBe(false);
+    expect(ctx.sources).toHaveLength(0);
+  });
+
+  it('rechecks the playhead after slow cloud decoding and preserves local audio on decode failure', async () => {
+    make().addSegments([{ ...seg(1, 10), providerId: 'local' }]);
+    sch.start();
+    await run(2);
+    const localSource = ctx.sources[0]!;
+    let finish!: (buffer: { duration: number }) => void;
+    vi.spyOn(ctx, 'decodeAudioData').mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const preparing = sch.prepareUpgrade([segY(1, 5)]);
+    video.currentTime = 4.1;
+    finish({ duration: 4 });
+    expect(await preparing).toBe(false);
+    vi.spyOn(ctx, 'decodeAudioData').mockRejectedValueOnce(new Error('bad cloud audio'));
+    expect(await sch.prepareUpgrade([segY(3, 10)])).toBe(false);
+    expect(localSource.stops).toHaveLength(0);
+    expect(ctx.sources).toHaveLength(1);
   });
 
   it('a segment that has played out is retired quietly: no second seg-skip log at a vt past its end', async () => {

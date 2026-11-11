@@ -13,6 +13,8 @@ export interface RecommendCaps {
   webgpu: boolean;
   /** the adapter has shader-f16 (needed for the GPU Whisper dtype) */
   f16?: boolean;
+  /** TTS offscreen capability can differ from the ASR probe. */
+  ttsWebgpu?: boolean;
   /** Chrome Translator availability by pair key `${src}-${tgt}`; absent key = unknown (treated as usable) */
   pairs?: Record<string, PairAvailability>;
 }
@@ -36,18 +38,20 @@ const BASE_MULTI: WhisperModelId = 'onnx-community/whisper-base';
 /** `lang` = detected / chosen source language code (undefined = not known yet), `live` = the video is a live stream */
 export function recommendedLocalSetup(caps: RecommendCaps, lang: string | undefined, live: boolean): RecommendedSetup {
   const l = baseLang(lang);
-  const english = l === 'en';
+  const english = l === 'en' || !l;
   const { dtype } = planDtype({ gpu: caps.webgpu, f16: caps.f16 });
   const fastGpu = dtype === 'gpu-mixed';
   const modelId = fastGpu ? (english ? SMALL_EN : SMALL_MULTI) : english ? BASE_EN : BASE_MULTI;
-  const engine: LocalTtsEngineId = caps.webgpu ? 'supertonic-webgpu' : 'silero-cpu';
+  const ttsGpu = caps.ttsWebgpu ?? caps.webgpu;
+  const engine: LocalTtsEngineId = ttsGpu ? 'supertonic-webgpu' : 'silero-cpu';
 
   const reasons: string[] = [];
   if (fastGpu) reasons.push('Есть видеокарта с WebGPU: распознавание на ней, модель small точнее base');
   else if (caps.webgpu) reasons.push('Видеокарта без поддержки fp16: распознавание на процессоре (q8), модель base');
   else reasons.push('Нет WebGPU: распознавание на процессоре (q8), модель base');
-  if (!english) reasons.push(l ? 'Язык не английский: нужна многоязычная модель' : 'Язык ещё не определён: взята многоязычная модель (английские понимают только английский)');
-  reasons.push(caps.webgpu ? 'Голос Supertonic работает на видеокарте и очень быстро' : 'Без видеокарты голос Silero идёт в реальном времени на процессоре');
+  if (!l) reasons.push('Язык ещё не определён: взят английский (самый частый), модель меньше многоязычной');
+  else if (!english) reasons.push('Язык не английский: нужна многоязычная модель');
+  reasons.push(ttsGpu ? 'Голос Supertonic работает на видеокарте и очень быстро' : 'Без видеокарты голос Silero идёт в реальном времени на процессоре');
 
   let translator: RecommendedSetup['translator'] = null;
   if (l !== 'ru') {

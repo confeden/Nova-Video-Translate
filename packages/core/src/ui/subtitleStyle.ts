@@ -26,6 +26,10 @@ export interface SubStyle {
   ticker: boolean;
   /** in the translation, words of the original language (Latin script) get a coloured background */
   highlight: boolean;
+  /** height of the line above the video's bottom edge, % of the video height */
+  lift: number;
+  /** hide the subtitles while the mouse is outside the browser window */
+  hideOutside: boolean;
 }
 
 export type SubWeight = 400 | 500 | 700 | 900;
@@ -53,19 +57,24 @@ export const SUB_SIZE_MAX = 160;
 export const SUB_TEXT_TRANSP_MAX = 90;
 export const SUB_BG_TRANSP_MAX = 100;
 export const SUB_TRANSP_STEP = 5;
+export const SUB_LIFT_MIN = 0;
+export const SUB_LIFT_MAX = 100;
+export const SUB_LIFT_STEP = 2;
 
 export const DEFAULT_SUB_STYLE: SubStyle = {
   size: 100,
   font: 0,
   weight: 500,
-  color: '#ffffff',
-  frame: true,
+  color: '#b6ff5e',
+  frame: false,
   textTransparency: 20,
   bgTransparency: 25,
   align: 'center',
-  lines: 2,
-  ticker: false,
-  highlight: false,
+  lines: 1,
+  ticker: true,
+  highlight: true,
+  lift: 0,
+  hideOutside: true,
 };
 
 /** Repairs a stored style: unknown values fall back to the defaults, numbers are clamped. */
@@ -89,8 +98,10 @@ export function normalizeSubStyle(raw: unknown): SubStyle {
     bgTransparency: num(r.bgTransparency, d.bgTransparency, 0, SUB_BG_TRANSP_MAX),
     align,
     lines,
-    ticker: r.ticker === true,
-    highlight: r.highlight === true,
+    ticker: typeof r.ticker === 'boolean' ? r.ticker : d.ticker,
+    highlight: typeof r.highlight === 'boolean' ? r.highlight : d.highlight,
+    lift: typeof r.lift === 'number' && Number.isFinite(r.lift) ? Math.min(SUB_LIFT_MAX, Math.max(SUB_LIFT_MIN, Math.round(r.lift * 10) / 10)) : d.lift,
+    hideOutside: typeof r.hideOutside === 'boolean' ? r.hideOutside : d.hideOutside,
   };
 }
 

@@ -426,8 +426,8 @@ describe('settings panel state mapping', () => {
     const { panelStateFrom, statusText, downloadButtonLabel } = await import('../src/ui/localTtsSection');
     expect(panelStateFrom(undefined).phase).toBe('none');
     expect(panelStateFrom(readyState()).phase).toBe('ready');
-    expect(panelStateFrom(readyState({ model: 'none', gpu: false })).phase).toBe('unsupported');
-    expect(panelStateFrom(readyState({ model: 'none', gpu: false })).message).toBe('WebGPU недоступен');
+    expect(panelStateFrom(readyState({ model: 'none', gpu: false })).phase).toBe('none');
+    expect(panelStateFrom(readyState({ model: 'none', gpu: false })).message).toContain('WebGPU недоступен');
     expect(panelStateFrom(readyState({ offscreen: false })).phase).toBe('unsupported');
     expect(panelStateFrom(readyState({ model: 'error', error: 'x' })).phase).toBe('error');
     expect(statusText({ phase: 'downloading', loaded: 200e6, total: 400e6 })).toBe('Скачивание: 50% (200 из 400 МБ)');

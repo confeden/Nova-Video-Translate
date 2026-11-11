@@ -1,2 +1,13 @@
-
+.env.local
+node_modules
+dist
+.output
+.wxt
+logs/
 .output-lab
+*.log
+releases/
+research/
+VOT.txt
+CLAUDE.md
+ROADMAP.md

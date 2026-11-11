@@ -4,6 +4,7 @@ import {
   buildWordTimeline,
   layerPositionAt,
   stepTicker,
+  subtitleWindow,
   TICKER_MIN_EM_S,
   type TickerMotion,
 } from '../src/ui/subtitleOverlay';
@@ -31,6 +32,13 @@ function run(seconds = 12, dt = 1 / 60): { m: TickerMotion; t: number }[] {
 }
 
 describe('stepTicker: smooth scrolling layer', () => {
+  it('keeps a bounded word workload on a long video, and follows a distant seek', () => {
+    const all = Array.from({ length: 20000 }, (_, i) => ({ start: i * 2, end: i * 2 + 2, text: 'one two three four five six seven eight nine ten' }));
+    const local = subtitleWindow(all, 1000);
+    expect(local.length).toBeLessThan(80);
+    expect(buildWordTimeline(local, 'translation').length).toBeLessThan(800);
+    expect(subtitleWindow(all, 30000).some((c) => c.start === 30000)).toBe(true);
+  });
   const frames = run();
 
   it('never moves backwards', () => {

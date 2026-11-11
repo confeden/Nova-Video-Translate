@@ -22,6 +22,8 @@ export type DubAudio =
       kind: 'encoded';
       mime: string;
       data: Uint8Array;
+      /** Locally synthesized speech cached as Opus: do not apply remote-track hiss removal. */
+      cleanSpeech?: boolean;
       /** seconds of lead-in at the start of the DECODED audio that must be dropped (a standalone mp3 slice carries decoder priming frames) */
       skipSec?: number;
     };
@@ -55,8 +57,12 @@ export interface ProviderContext {
   sourceLang?: string;
   /** subtitles are opt-in (invariant I4): providers must NOT spend quota on them unless true */
   wantSubtitles: boolean;
+  /** Filtered translated text, available before the slower voice synthesis finishes. Opt-in only. */
+  onSubtitles?(cues: SubtitleCue[]): void;
   /** the video is a live stream (set by the engine) */
   live?: boolean;
+  /** Verify missing cloud speech from the audio instead of reusing the same caption/cache omission. */
+  repairGaps?: boolean;
   /** dynamic whole-job deadline (ms) chosen by the planner (Yandex); absent = the provider's default */
   deadlineMs?: number;
   /** the server's own estimate (s) of the remaining time: a noisy hint for the latency model, never a deadline */

@@ -240,13 +240,14 @@ describe('silero speed fitting', () => {
     const fast = planSileroRates(nat, t1 / 10);
     expect(fast.speed).toBeCloseTo(SILERO_SPEED_MAX, 6);
     expect([...new Set(fast.rates![0])]).toEqual([Math.fround(SILERO_SPEED_MAX)]);
-    expect(planSileroRates(nat, t1 * 10).speed).toBeCloseTo(SILERO_SPEED_MIN, 6);
+    expect(planSileroRates(nat, t1 * 10).rates).toBeNull();
+    expect(SILERO_SPEED_MAX).toBeLessThanOrEqual(1.2);
   });
   it('mixed adjacent rates hit the target within one frame despite the uniform-rate step function', () => {
     // 60 symbols of 3 frames: a uniform rate jumps from 180 to 120 frames at 1.2 (3/1.2 = 2.5 -> 2, half to even)
     const d = [[4, ...new Array(60).fill(3), 5, 13, 6]];
     expect(sileroFramesAt(d[0]!, 1.19)).toBeGreaterThan(sileroFramesAt(d[0]!, 1.21) + 50);
-    for (const k of [0.75, 0.8, 0.85, 0.9]) {
+    for (const k of [0.85, 0.9]) {
       const target = sileroTotalSec(d, 1) * k;
       const p = planSileroRates(d, target);
       expect(Math.abs(p.predictedSec - target)).toBeLessThanOrEqual(0.0125 + 1e-9);

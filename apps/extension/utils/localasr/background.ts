@@ -3,7 +3,7 @@
  * (LasrEnv), relays requests from content scripts / extension pages to the offscreen document (shared with local TTS).
  * Hook: handleLocalAsrMessage() in background.ts.
  */
-import { browser } from 'wxt/browser';
+import { localRuntimeHost } from '../localRuntimeHost';
 import { LASR_ENV_KEY, LASR_MSG, cachedDtypes, deviceForDtype, diag, initialState, isGpuDtype, lasrStateKey, WHISPER_MODELS, whisperBytes, whisperModelInfo, type LasrEnv, type LasrEvent, type LasrReply, type LasrRequest, type LasrState } from '@nvt/core';
 import { hasOffscreen, offscreenApi, offscreenUrl, toOffscreen as relay } from '../localtts/background';
 
@@ -18,12 +18,12 @@ const freshState = (modelId: string, env?: LasrEnv): LasrState => {
 function mutate(modelId: string, fn: (s: LasrState) => LasrState): Promise<LasrState> {
   const p = chain.then(async () => {
     const key = lasrStateKey(modelId);
-    const got = await browser.storage.local.get([key, LASR_ENV_KEY]);
+    const got = await localRuntimeHost().storage.local.get([key, LASR_ENV_KEY]);
     const info = whisperModelInfo(modelId);
     let s = got[key] as LasrState | undefined;
     if (!s || (info && s.rev !== info.revision)) s = freshState(modelId, got[LASR_ENV_KEY] as LasrEnv | undefined);
     const next = { ...fn(s), updatedAt: Date.now() };
-    await browser.storage.local.set({ [key]: next });
+    await localRuntimeHost().storage.local.set({ [key]: next });
     return next;
   });
   chain = p.catch(() => undefined);
@@ -32,16 +32,16 @@ function mutate(modelId: string, fn: (s: LasrState) => LasrState): Promise<LasrS
 /** read-only (no storage write: this runs on every transcribe request) */
 async function readState(modelId: string): Promise<LasrState> {
   const key = lasrStateKey(modelId);
-  const got = await browser.storage.local.get([key, LASR_ENV_KEY]);
+  const got = await localRuntimeHost().storage.local.get([key, LASR_ENV_KEY]);
   const info = whisperModelInfo(modelId);
   const s = got[key] as LasrState | undefined;
   return s && (!info || s.rev === info.revision) ? s : freshState(modelId, got[LASR_ENV_KEY] as LasrEnv | undefined);
 }
 function mutateEnv(fn: (e: LasrEnv) => LasrEnv): Promise<LasrEnv> {
   const p = chain.then(async () => {
-    const got = await browser.storage.local.get(LASR_ENV_KEY);
+    const got = await localRuntimeHost().storage.local.get(LASR_ENV_KEY);
     const next = fn((got[LASR_ENV_KEY] as LasrEnv | undefined) ?? {});
-    await browser.storage.local.set({ [LASR_ENV_KEY]: next });
+    await localRuntimeHost().storage.local.set({ [LASR_ENV_KEY]: next });
     return next;
   });
   chain = p.catch(() => undefined);
@@ -57,7 +57,7 @@ async function reconcile(modelId: string, s: LasrState): Promise<LasrState> {
 
 function extVersion(): string {
   try {
-    return browser.runtime.getManifest().version;
+    return localRuntimeHost().runtime.getManifest().version;
   } catch {
     return '?';
   }
@@ -77,6 +77,7 @@ function onEvent(e: LasrEvent): void {
       void mutate(e.model, (s) => ({ ...s, model: 'ready', loaded: s.total, device: e.device, dtype: e.dtype, files: { ...(s.model === 'ready' ? s.files : undefined), [e.dtype]: true }, upgrade: undefined, upgradeError: undefined, cpu: undefined, cpuAt: undefined, cpuVer: undefined, error: undefined }));
       break;
     case 'error':
+      diag.log('localasr-error', { model: e.model, message: e.message, upgrade: e.upgrade });
       if (e.upgrade) {
         void mutate(e.model, (s) => ({ ...s, upgrade: undefined, upgradeError: e.message }));
         break;
@@ -111,7 +112,7 @@ function onEvent(e: LasrEvent): void {
 export function handleLocalAsrMessage(raw: unknown, sender: { id?: string; url?: string }, sendResponse: (r: unknown) => void): boolean {
   const msg = raw as LasrRequest | undefined;
   if (!msg || msg.type !== LASR_MSG || msg.to !== 'bg') return false;
-  if (sender.id !== browser.runtime.id) return false;
+  if (sender.id !== localRuntimeHost().runtime.id) return false;
   const answer = (p: Promise<unknown>): true => {
     void p.then(sendResponse, (e) => sendResponse({ ok: false, error: String((e as Error)?.message ?? e) }));
     return true;
@@ -126,7 +127,7 @@ export function handleLocalAsrMessage(raw: unknown, sender: { id?: string; url?:
         const hasApi = !!offscreenApi();
         let env = await mutateEnv((x) => (x.offscreen === hasApi ? x : { ...x, offscreen: hasApi }));
         for (const m of WHISPER_MODELS) await reconcile(m.id, await readState(m.id));
-        if (msg.probe && hasApi && env.gpu === undefined) {
+        if (msg.probe && hasApi) {
           const r = await toOffscreen<{ gpu: boolean; f16: boolean }>({ op: 'status' });
           if (r.ok) env = await mutateEnv((x) => ({ ...x, gpu: r.gpu, f16: r.f16 }));
         }

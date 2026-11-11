@@ -1,3 +1,9 @@
+import { vi } from 'vitest';
+
+// the fake chunks here are digital silence: the ASR guard (it drops text over silence) must see speech
+vi.mock('../src/localasr/vad', () => ({
+  vadBursts: () => ({ bursts: [{ start: 0, end: 600, confidence: 1 }], speechSec: 600, noiseFloorDb: -60 }),
+}));
 import { describe, expect, it } from 'vitest';
 import { normalizeSettings, migrateVoiceOrder } from '../src/settings';
 import { DEFAULT_SETTINGS } from '../src/types';
@@ -177,25 +183,26 @@ describe('LocalAsrRegistry + Chrome Prompt API engine', () => {
 
 // ---------- settings (D30) ----------
 describe('voice source chain settings', () => {
-  it('fresh installs: yandex-live > yandex > local > groq > gemini, gemini off', () => {
+  it('fresh installs: yandex-live > groq > local > gemini > yandex, gemini off', () => {
     const s = normalizeSettings({});
-    expect(s.voiceOrder).toEqual(['yandex-live', 'yandex', 'local', 'groq', 'gemini']);
+    expect(s.voiceOrder).toEqual(['yandex-live', 'groq', 'local', 'gemini', 'yandex']);
+    expect(s.voiceOrder).toEqual(DEFAULT_SETTINGS.voiceOrder);
     expect(s.voiceEnabled.gemini).toBe(false);
     expect(s.voiceEnabled.groq).toBe(true);
     expect(s.voiceEnabled.local).toBe(true);
-    expect(DEFAULT_SETTINGS.voiceOrder.at(-1)).toBe('gemini');
+    expect(DEFAULT_SETTINGS.voiceOrder.at(-1)).toBe('yandex');
   });
-  it('old untouched defaults (yandex-live>yandex>gemini, all on) migrate to the new order with Gemini off', () => {
+  it('old untouched defaults (yandex-live>yandex>gemini, all on) migrate in one pass to the default order with Gemini off', () => {
     const s = normalizeSettings({ voiceOrder: ['yandex-live', 'yandex', 'gemini'], voiceEnabled: { 'yandex-live': true, yandex: true, gemini: true } });
-    expect(s.voiceOrder).toEqual(['yandex-live', 'yandex', 'local', 'groq', 'gemini']);
+    expect(s.voiceOrder).toEqual(DEFAULT_SETTINGS.voiceOrder);
     expect(s.voiceEnabled).toMatchObject({ gemini: false, groq: true, local: true, yandex: true });
   });
   it('a customised old profile keeps its order (new ids go before gemini) and its Gemini switch', () => {
     const s = normalizeSettings({ voiceOrder: ['gemini', 'yandex', 'yandex-live'], voiceEnabled: { 'yandex-live': false, yandex: true, gemini: true } });
-    expect(s.voiceOrder).toEqual(['local', 'groq', 'gemini', 'yandex', 'yandex-live']);
+    expect(s.voiceOrder).toEqual(['groq', 'local', 'gemini', 'yandex', 'yandex-live']);
     expect(s.voiceEnabled).toMatchObject({ gemini: true, 'yandex-live': false });
     const t = normalizeSettings({ voiceOrder: ['yandex', 'yandex-live', 'gemini'], voiceEnabled: { gemini: true } });
-    expect(t.voiceOrder).toEqual(['yandex', 'yandex-live', 'local', 'groq', 'gemini']);
+    expect(t.voiceOrder).toEqual(['yandex', 'yandex-live', 'groq', 'local', 'gemini']);
     expect(t.voiceEnabled.gemini).toBe(true);
     // untouched order but the user had switched a Yandex tier off: not the pristine default, Gemini stays on
     const u = normalizeSettings({ voiceOrder: ['yandex-live', 'yandex', 'gemini'], voiceEnabled: { 'yandex-live': false, yandex: true, gemini: true } });
@@ -204,12 +211,15 @@ describe('voice source chain settings', () => {
   it('migration is idempotent and a stored new-format profile is never touched', () => {
     const once = normalizeSettings({ voiceOrder: ['yandex-live', 'yandex', 'gemini'], voiceEnabled: { gemini: true } });
     const twice = normalizeSettings(JSON.parse(JSON.stringify(once)));
-    expect(twice.voiceOrder).toEqual(once.voiceOrder);
+    const thrice = normalizeSettings(JSON.parse(JSON.stringify(twice)));
+    expect(twice.voiceOrder).toEqual(DEFAULT_SETTINGS.voiceOrder);
+    expect(thrice.voiceOrder).toEqual(twice.voiceOrder);
     expect(twice.voiceEnabled).toEqual(once.voiceEnabled);
+    expect(thrice.voiceEnabled).toEqual(twice.voiceEnabled);
     const mine = normalizeSettings({ voiceOrder: ['local', 'gemini', 'groq', 'yandex', 'yandex-live'], voiceEnabled: { gemini: true, local: false } });
     expect(mine.voiceOrder).toEqual(['local', 'gemini', 'groq', 'yandex', 'yandex-live']);
     expect(mine.voiceEnabled).toMatchObject({ gemini: true, local: false, groq: true });
-    expect(migrateVoiceOrder(['bogus', 'yandex'])).toEqual(['yandex', 'yandex-live', 'local', 'groq', 'gemini']);
+    expect(migrateVoiceOrder(['bogus', 'yandex'])).toEqual(['yandex', 'yandex-live', 'groq', 'local', 'gemini']);
   });
   it('groq model overrides default to empty and are trimmed', () => {
     expect(normalizeSettings({}).groqModels).toEqual({ asr: '', chat: '' });
@@ -232,11 +242,12 @@ describe('voice source chain settings', () => {
 describe('tier order and planning with the new tiers', () => {
   const fakes = (): DubProvider[] => (['gemini', 'local', 'groq', 'yandex', 'yandex-live'] as const).map((id) => new FakeProvider(id));
   it('eligibleProviders follows the stored order and skips disabled Gemini', () => {
-    const s = normalizeSettings({});
+    const ord = ['yandex', 'yandex-live', 'local', 'groq', 'gemini'] as const; // customised, so it is kept as stored
+    const s = normalizeSettings({ voiceOrder: [...ord] });
     const ids = eligibleProviders(fakes(), s, createChainState(), 0).map((p) => p.id);
-    expect(ids).toEqual(['yandex-live', 'yandex', 'local', 'groq']);
-    const on = normalizeSettings({ voiceEnabled: { gemini: true } });
-    expect(eligibleProviders(fakes(), on, createChainState(), 0).map((p) => p.id)).toEqual(['yandex-live', 'yandex', 'local', 'groq', 'gemini']);
+    expect(ids).toEqual(['yandex', 'yandex-live', 'local', 'groq']);
+    const on = normalizeSettings({ voiceOrder: [...ord], voiceEnabled: { gemini: true } });
+    expect(eligibleProviders(fakes(), on, createChainState(), 0).map((p) => p.id)).toEqual(['yandex', 'yandex-live', 'local', 'groq', 'gemini']);
   });
   it('priors: groq 12 s, local 8 s; EWMA moves them', () => {
     expect(TIER_PRIOR_SEC.groq).toBe(12);
@@ -277,6 +288,24 @@ describe('tier order and planning with the new tiers', () => {
 const ev = (tStartMs: number, dDurationMs: number, words: [string, number][]) => ({ tStartMs, dDurationMs, segs: words.map(([utf8, tOffsetMs], i) => ({ utf8: i ? ` ${utf8}` : utf8, tOffsetMs })) });
 
 describe('caption sentence grouping', () => {
+  it('removes mixed soundtrack tags and music-tagged repeated filler before creating dub sentences', () => {
+    const texts = ['[music] Oh, heat, heat. >> [music]', '[dramatic music] Welcome to the show everyone. [applause]', 'Heat the pan before adding oil.'];
+    const json = { events: texts.map((text, i) => ({ tStartMs: i * 3000, dDurationMs: 2000, segs: [{ utf8: text }] })) };
+    expect(sentencesFromJson3(json).map((x) => x.text)).toEqual(['Welcome to the show everyone.', 'Heat the pan before adding oil.']);
+    const timed = { events: [ev(0, 2000, [['[music]', 0], ['Oh,', 200], ['heat,', 500], ['heat.', 900], ['[music]', 1300]])] };
+    expect(sentencesFromJson3(timed)).toEqual([]);
+  });
+  it('rejects filler between separate music events before dubbing and keeps parenthetical speech', () => {
+    const texts = ['[music]', 'Oh, heat, heat.', '>> [music]', 'Use (optional) settings before continuing.', 'Heat the pan before adding oil.'];
+    const events = texts.map((text, i) => ({ tStartMs: i * 3000, dDurationMs: 2000, segs: [{ utf8: text }] }));
+    expect(sentencesFromJson3({ events }).map((x) => x.text)).toEqual(['Use (optional) settings before continuing.', 'Heat the pan before adding oil.']);
+  });
+  it('removes sound tags split across timed parts without moving spoken-word timestamps', () => {
+    const json = { events: [ev(0, 4000, [['[dramatic', 0], ['music]', 500], ['Welcome', 1000], ['to', 1400], ['the', 1800], ['show.', 2200]])] };
+    const sentences = sentencesFromJson3(json);
+    expect(sentences.map((x) => x.text)).toEqual(['Welcome to the show.']);
+    expect(sentences[0]!.start).toBe(1);
+  });
   it('cuts unpunctuated ASR captions at pauses > 0.5 s', () => {
     const json = {
       events: [
@@ -687,8 +716,31 @@ describe('Groq tier', () => {
   it('subtitles are produced only when wanted', async () => {
     const a = build();
     await a.p.usable();
-    expect((await a.p.translateChunk(audio(0), ctxOf())).subtitles).toBeUndefined();
+    const early = vi.fn();
+    expect((await a.p.translateChunk(audio(0), ctxOf(undefined, { onSubtitles: early }))).subtitles).toBeUndefined();
+    expect(early).not.toHaveBeenCalled();
     expect((await a.p.translateChunk(audio(0), ctxOf(undefined, { wantSubtitles: true }))).subtitles).toHaveLength(2);
+  });
+
+  it('publishes translated subtitles before a stalled local voice finishes', async () => {
+    const tts = new FakeTts();
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    const synth = tts.synth.bind(tts);
+    tts.synth = async (req) => { await gate; return synth(req); };
+    const a = build({ tts: reg(tts) });
+    await a.p.usable();
+    let published!: () => void;
+    const ready = new Promise<void>((resolve) => { published = resolve; });
+    const early = vi.fn((_cues: unknown) => published());
+    let done = false;
+    const work = a.p.translateChunk(audio(30), ctxOf(undefined, { wantSubtitles: true, onSubtitles: early })).then((r) => { done = true; return r; });
+    await ready;
+    expect(done).toBe(false);
+    expect(early.mock.calls[0]![0]).toBeDefined();
+    finish();
+    const result = await work;
+    expect(result.subtitles).toEqual(early.mock.calls[0]![0]);
   });
 });
 
@@ -714,6 +766,29 @@ describe('Local tier', () => {
     if (o.asr) asrReg.register(o.asr);
     return createLocalProvider({ asrRegistry: asrReg, tts: o.tts ?? reg(new FakeTts()), translators: () => (o.tr ? [o.tr] : []), captions: o.cap ? () => o.cap : undefined });
   };
+
+  it('skips Russian and music descriptions before translation despite an English ASR label', async () => {
+    const tr = new FakeTr();
+    const tts = new FakeTts();
+    const p = mk({ asr: asrEngine([{ start: 1, end: 6, text: 'Это русская речь, её не нужно переводить ещё раз.' }]), tr, tts: reg(tts) });
+    await p.usable();
+    expect(await p.translateChunk(audio(0), ctxOf(undefined, { sourceLang: 'en' }))).toMatchObject({ segments: [], sourceLang: 'ru' });
+    expect(tr.seen).toHaveLength(0);
+    expect(tts.calls).toHaveLength(0);
+    const music = mk({ cap: timeline([{ start: 1, end: 6, text: 'Soft instrumental music plays in the background.' }]), tr, tts: reg(tts) });
+    await music.usable();
+    expect((await music.translateChunk(audio(0), ctxOf())).segments).toEqual([]);
+    expect(tr.seen).toHaveLength(0);
+  });
+
+  it('repairs a missing caption sentence by recognizing audio instead of reusing the caption gap', async () => {
+    const cap = timeline([{ start: 1, end: 3, text: 'Only the first sentence.' }]);
+    const p = mk({ cap, asr: asrEngine([{ start: 7, end: 11, text: 'Here is the missing sentence.' }]), tr: new FakeTr() });
+    await p.usable();
+    const r = await p.translateChunk(audio(0), ctxOf(undefined, { repairGaps: true }));
+    expect(r.segments.map((s) => s.src)).toEqual(['Here is the missing sentence.']);
+    expect(cap.gets).toBe(0);
+  });
 
   it('usable() is false without an ASR engine (and without captions), without TTS, without a translator - never silently empty', async () => {
     expect(await mk({ tr: new FakeTr() }).usable()).toBe(false);
@@ -760,6 +835,26 @@ describe('Local tier', () => {
     expect(await p.usable()).toBe(true);
     const r = await p.translateChunk(audio(0), ctxOf());
     expect(r.segments).toHaveLength(1);
+  });
+  it('re-picks a demoted engine and changed preferences after the initial probe', async () => {
+    const gpu = new FakeTts('supertonic-webgpu');
+    const cpu = new FakeTts('silero-cpu');
+    const tts = reg(gpu, cpu);
+    let choice: 'auto' | 'supertonic-webgpu' = 'auto';
+    tts.setPreference(() => ({ engine: choice, voice: '' }));
+    const cap = timeline([{ start: 1, end: 4, text: 'First sentence.' }, { start: 16, end: 19, text: 'Second sentence.' }]);
+    const p = createLocalProvider({ tts, asrRegistry: new LocalAsrRegistry(), translators: () => [new FakeTr()], captions: () => cap });
+    await p.probe();
+    tts.noteSynth('supertonic-webgpu', 11000, 3);
+    tts.noteSynth('supertonic-webgpu', 11000, 3);
+    expect((await p.cacheSignature()).ttsModel).toBe('silero-cpu');
+    await p.translateChunk(audio(0), ctxOf());
+    expect(cpu.calls.length).toBeGreaterThan(0);
+    expect(gpu.calls).toHaveLength(0);
+    choice = 'supertonic-webgpu';
+    await p.translateChunk(audio(15), ctxOf());
+    expect(gpu.calls.length).toBeGreaterThan(0);
+    expect((await p.cacheSignature()).ttsModel).toBe('supertonic-webgpu');
   });
 
   it('pre-translates the caption track in large batches ahead of the playhead; cells read the store (few requests, per-cell call only as fallback)', async () => {

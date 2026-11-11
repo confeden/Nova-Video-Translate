@@ -258,7 +258,7 @@ describe('preroll pause and the preparing status', () => {
     expect(e.video.paused).toBe(false);
   });
 
-  it('on: gives up after the timeout and resumes', async () => {
+  it('on: keeps waiting after a long wait rather than resuming untranslated speech', async () => {
     let fire!: () => void;
     const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
       ms >= 30_000
@@ -273,6 +273,10 @@ describe('preroll pause and the preparing status', () => {
     await e.engine.start();
     expect(e.video.paused).toBe(true);
     fire();
+    await flush();
+    expect(e.video.plays).toBe(0);
+    expect(e.video.paused).toBe(true);
+    e.caps[0]!.emit(chunk(0));
     await flush();
     expect(e.video.plays).toBe(1);
     e.engine.stop();

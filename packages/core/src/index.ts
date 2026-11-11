@@ -10,6 +10,7 @@ export * from './providers/yandex';
 export * from './providers/cascade';
 export * from './providers/groq';
 export * from './providers/local';
+export * from './providers/pageProviders';
 export * from './localtts/registry';
 export * from './localtts/voiceMap';
 export * from './audio/speakerGender';

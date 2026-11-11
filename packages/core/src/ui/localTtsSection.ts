@@ -68,11 +68,12 @@ export function panelStateFrom(s: LttsState | undefined, o: PanelStateOptions = 
   const gpu = o.env?.gpu ?? s?.gpu;
   const offscreen = o.env?.offscreen ?? s?.offscreen;
   const stale = !!s && !!o.rev && s.rev !== o.rev;
-  if (offscreen === false) return { phase: 'unsupported', loaded: 0, total, message: 'фоновые документы не поддерживаются этим браузером' };
-  if (needsGpu && gpu === false) return { phase: 'unsupported', loaded: s?.model === 'ready' ? total : 0, total, message: 'WebGPU недоступен' };
+  if (offscreen === false) return { phase: 'unsupported', loaded: 0, total, message: 'локальные модели недоступны на этой странице или в этом браузере' };
+  // Availability and downloaded bytes are separate: this pack also runs on CPU.
+  const gpuMessage = needsGpu && gpu === false ? `WebGPU недоступен: ${o.env?.gpuReason ?? 'повторная проверка выполняется автоматически'}. Эти же файлы можно использовать в Supertonic без видеокарты.` : undefined;
   if (o.published === false && (!s || s.model !== 'ready')) return { phase: 'unsupported', loaded: 0, total, message: 'модель ещё не опубликована' };
-  if (!s || stale) return { phase: 'none', loaded: 0, total };
-  return { phase: s.model === 'error' ? 'error' : s.model, loaded: s.loaded, total, message: s.error };
+  if (!s || stale) return { phase: 'none', loaded: 0, total, message: gpuMessage };
+  return { phase: s.model === 'error' ? 'error' : s.model, loaded: s.loaded, total, message: s.error ?? gpuMessage };
 }
 
 const mb = (b: number): string => `${Math.round(b / 1e6)}`; // decimal MB, like the download sizes browsers show
@@ -127,7 +128,7 @@ export function engineState(info: LocalTtsEngineInfo, voice: string, pi: LocalTt
 export function autoEngine(voices: { voice: string }, pi: LocalTtsPanelInfo | null): LocalTtsEngineId | undefined {
   for (const id of AUTO_ENGINE_ORDER) {
     const info = engineInfo(id);
-    if (info && engineState(info, voices.voice, pi).state.phase === 'ready') return id;
+    if (info && (!info.needsGpu || pi?.env.gpu !== false) && engineState(info, voices.voice, pi).state.phase === 'ready') return id;
   }
   return undefined;
 }
@@ -182,7 +183,7 @@ export function localTtsSection(host: LocalTtsPanelHost & Partial<SettingsAccess
   const testBtn = h('button', {}, 'Проверить голос');
   const stopBtn = h('button', { style: 'display:none' }, 'Стоп');
   const testOut = h('div', { class: 'hint' }, '');
-  const det = h('details', {}, h('summary', {}, h('h2', {}, 'Локальный голос')));
+  const det = h('details', {}, h('summary', {}, h('h2', {}, 'Голос для локальной озвучки')));
   det.open = localTtsOpen;
   det.addEventListener('toggle', () => (localTtsOpen = det.open));
   const sec = h('section', {}, det);
@@ -226,8 +227,9 @@ export function localTtsSection(host: LocalTtsPanelHost & Partial<SettingsAccess
     busy = true;
     try {
       await fn();
-    } catch {
-      /* the next poll shows the real state */
+    } catch (e) {
+      testOut.className = 'hint bad';
+      testOut.textContent = `Ошибка: ${String((e as Error)?.message ?? e)}`;
     } finally {
       busy = false;
       void tick();
@@ -249,6 +251,8 @@ export function localTtsSection(host: LocalTtsPanelHost & Partial<SettingsAccess
         return h('div', { style: 'margin:6px 0', 'data-engine': e.id },
           h('div', {}, h('b', {}, title), ` — ${e.speedNote}`),
           h('div', { class: st.phase === 'ready' ? 'hint ok' : st.phase === 'error' || st.phase === 'unsupported' ? 'hint bad' : 'hint' }, statusText(st)),
+          st.message && st.phase !== 'error' && st.phase !== 'unsupported' ? h('div', { class: 'hint bad' }, st.message) : null,
+          e.id === 'silero-cpu' ? h('div', { class: 'hint' }, 'В этом ONNX-пакете два голоса: Евгений и Ксения. Другие голоса Silero в пакет не включены.') : null,
           st.phase === 'downloading' ? h('progress', { max: 100, value: pct, style: 'width:100%' }) : null,
           h('div', { class: 'row' }, ...btns));
       }),

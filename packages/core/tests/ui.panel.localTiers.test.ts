@@ -43,6 +43,31 @@ async function mount(extra: Record<string, unknown>) {
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 20));
 
 describe('settings panel without local tiers (userscript)', () => {
+  it('captures scrolling before moving the retained local-model sections', async () => {
+    const { root, handle } = await mount({ getLocalAsrInfo: async () => null, getLocalTtsInfo: async () => null });
+    await new Promise((r) => setTimeout(r, 300));
+    root.scrollTop = 420;
+    const proto = Object.getPrototypeOf(root);
+    const original = proto.append;
+    let moved = false;
+    proto.append = function (...nodes: Node[]) {
+      // Simulate browser scroll clamping as retained nodes leave the live panel.
+      if (nodes.some((node) => root.contains(node))) {
+        moved = true;
+        root.scrollTop = 0;
+      }
+      return original.apply(this, nodes);
+    };
+    try {
+      await handle.refresh();
+      await new Promise((r) => setTimeout(r, 300));
+      expect(moved).toBe(true);
+      expect(root.scrollTop).toBe(420);
+    } finally {
+      proto.append = original;
+      handle.destroy();
+    }
+  });
   it('hides Groq key row, groq/local entries and the Chrome AI section without getLocalAsrInfo', async () => {
     const { root, handle } = await mount({});
     await tick();

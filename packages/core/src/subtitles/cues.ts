@@ -1,17 +1,23 @@
 import type { SubtitleCue } from '../providers/types';
+import { cleanSpeechText, musicContextAt } from '../lang/speechText';
 
 const MIN_DUR = 0.2;
 
 /** Drops junk, enforces end > start, sorts. */
 export function normalizeCues(cues: readonly SubtitleCue[]): SubtitleCue[] {
   const out: SubtitleCue[] = [];
-  for (const c of cues) {
-    const text = (c.text ?? '').replace(/\s+/g, ' ').trim();
+  const ordered = [...cues].sort((a, b) => a.start - b.start || a.end - b.end);
+  for (let i = 0; i < ordered.length; i++) {
+    const c = ordered[i]!;
+    const music = musicContextAt(ordered, i);
+    const text = cleanSpeechText(c.text ?? '', music);
     if (!text || !Number.isFinite(c.start) || !Number.isFinite(c.end)) continue;
+    const src = c.src ? cleanSpeechText(c.src, music) : undefined;
+    if (c.src && !src) continue;
     const start = Math.max(0, c.start);
     const end = c.end > start ? c.end : start + MIN_DUR;
     const cue: SubtitleCue = { start, end, text };
-    if (c.src) cue.src = c.src;
+    if (src) cue.src = src;
     out.push(cue);
   }
   return out.sort((a, b) => a.start - b.start || a.end - b.end);

@@ -8,6 +8,7 @@
  * The library is imported lazily so the local-TTS path never pays for it.
  */
 import {
+  diag,
   LASR_MSG,
   SerialQueue,
   b64ToInt16,
@@ -23,6 +24,7 @@ import {
   downloadWhisperFiles,
   verifyWhisperFiles,
   WHISPER_CACHE_NAME,
+  WHISPER_MODELS,
   whisperModelInfo,
   whisperToSegments,
   planDtype,
@@ -39,7 +41,7 @@ import {
   type WhisperDtype,
   type WhisperStage,
 } from '@nvt/core';
-import { browser } from 'wxt/browser';
+import { localRuntimeHost, withLocalModelFiles } from '../localRuntimeHost';
 import { hasWebGpu } from '../localtts/ortModel';
 import { touch } from '../localtts/offscreenRuntime';
 
@@ -51,7 +53,7 @@ const MODEL_IDLE_MS = 3 * 60_000;
 const CACHE_NAME = WHISPER_CACHE_NAME;
 /** the page's own fetch, captured before anything can patch it; downloads wrap it mirror-first (S3) with huggingface.co as fallback */
 const rawFetch: typeof fetch = globalThis.fetch.bind(globalThis);
-const downloadFetch = (): typeof fetch => createResilientFetch(rawFetch, { onRetry: (i) => console.warn(`[nvt-asr] ${i.file} ${i.source} try ${i.attempt}: ${i.error}`) });
+const downloadFetch = (): typeof fetch => createResilientFetch(localRuntimeHost().fetch ?? rawFetch, { onRetry: (i) => { diag.log('localasr-download-retry', i); console.warn(`[nvt-asr] ${i.file} ${i.source} try ${i.attempt}: ${i.error}`); } });
 /** models whose WebGPU session failed once: they run on WASM/q8 until the offscreen document is recreated (the worker persists it too) */
 const cpuModels = new Set<string>();
 /** models whose WebGPU was re-tested in this offscreen document (once per document life) */
@@ -59,7 +61,7 @@ const gpuProbed = new Set<string>();
 
 const queue = new SerialQueue();
 const aborts = new Map<string, AbortController>();
-const downloads = new Map<string, { cancelled: boolean }>();
+const downloads = new Map<string, { cancelled: boolean; abort: AbortController }>();
 
 interface Loaded {
   model: string;
@@ -73,7 +75,7 @@ let tfPromise: Promise<Transformers> | undefined;
 
 type EventBody = LasrEvent extends infer E ? (E extends LasrEvent ? Omit<E, 'type' | 'to' | 'op'> : never) : never;
 const emit = (e: EventBody): void => {
-  void browser.runtime.sendMessage({ type: LASR_MSG, to: 'bg', op: 'event', ...e }).catch(() => {});
+  void localRuntimeHost().runtime.sendMessage({ type: LASR_MSG, to: 'bg', op: 'event', ...e }).catch(() => {});
 };
 
 interface GpuAdapterLike {
@@ -135,16 +137,15 @@ const readable = (e: unknown, ctx: ErrorContext): string => {
 };
 
 function transformers(): Promise<Transformers> {
-  tfPromise ??= import('@huggingface/transformers').then((tf) => {
+  const host = localRuntimeHost();
+  tfPromise ??= (host.loadTransformers ? host.loadTransformers() : Promise.reject(new Error('Transformers loader is not configured'))).then((tf) => {
     // transcription reads ONLY the Cache API: remote is off. allowLocalModels must stay true, otherwise getModelFile throws
     // "both local and remote models are disabled" before it even looks into the cache (transformers.js 3.7.6 utils/hub.js).
     tf.env.allowLocalModels = true;
     tf.env.allowRemoteModels = false;
-    tf.env.localModelPath = browser.runtime.getURL('/nvt-no-local-models/' as never);
+    tf.env.localModelPath = host.runtime.getURL('/nvt-no-local-models/');
     tf.env.useBrowserCache = true;
-    // the ONNX runtime glue + wasm shipped with the library are copied into the extension (wxt.config.ts): no CDN code
-    const base = browser.runtime.getURL('/ort-hf/' as never);
-    (tf.env.backends.onnx as unknown as { wasm: { wasmPaths: unknown } }).wasm.wasmPaths = { mjs: `${base}ort-wasm-simd-threaded.jsep.mjs`, wasm: `${base}ort-wasm-simd-threaded.jsep.wasm` };
+    // The platform loader configures its own pinned WASM resources before returning the module.
     return tf;
   });
   tfPromise.catch(() => (tfPromise = undefined));
@@ -164,6 +165,12 @@ async function disposeLoaded(): Promise<void> {
   const cur = loaded;
   loaded = undefined;
   await cur?.pipe.dispose?.().catch(() => {});
+}
+
+/** Releases model sessions while retaining runtime listeners and downloaded files. */
+export async function releaseLocalAsrRuntime(): Promise<void> {
+  clearTimeout(idleTimer);
+  await queue.run(() => disposeLoaded());
 }
 
 /** builds a pipeline from the cached files (no network) */
@@ -210,7 +217,7 @@ async function ensurePipe(model: string, device: WhisperDevice, dtype: WhisperDt
     // pure fp16 is attempted only when its files are already cached (no download without a click)
     gpuAlternatives: plan.device === 'webgpu' ? await cachedGpuDtypes(info, cache) : [],
     ensureFiles: async (t) => {
-      await downloadWhisperFiles({ info, dtype: t, fetch: downloadFetch(), cache });
+      await withLocalModelFiles(() => downloadWhisperFiles({ info, dtype: t, fetch: downloadFetch(), cache }));
       const v = await verifyWhisperFiles(cache, info, t);
       if (!v.ok) throw new Error(`files incomplete: ${[...v.missing, ...v.bad].join(', ')}`);
     },
@@ -234,13 +241,13 @@ async function startDownload(model: string, want?: WhisperDtype): Promise<void> 
   const info = whisperModelInfo(model);
   if (!info) return emit({ model, ev: 'error', message: 'неизвестная модель' });
   if (downloads.has(model)) return;
-  const job = { cancelled: false };
+  const job = { cancelled: false, abort: new AbortController() };
   downloads.set(model, job);
   const t0 = Date.now();
   let plan: { device: WhisperDevice; dtype: WhisperDtype } | undefined;
   try {
     await navigator.storage.persist?.().catch(() => false);
-    await queue.run(async () => {
+    await queue.run(() => withLocalModelFiles(async () => {
       if (job.cancelled) throw Object.assign(new Error('cancelled'), { name: 'AbortError' });
       const caps = await webGpuCaps();
       emit({ ev: 'gpu', gpu: caps.gpu, f16: caps.f16 });
@@ -257,6 +264,7 @@ async function startDownload(model: string, want?: WhisperDtype): Promise<void> 
         fetch: downloadFetch(),
         cache,
         isCancelled: () => job.cancelled,
+        signal: job.abort.signal,
         onProgress: (l, total) => {
           touch();
           const now = Date.now();
@@ -291,7 +299,7 @@ async function startDownload(model: string, want?: WhisperDtype): Promise<void> 
       }
       cpuModels.delete(model);
       emit({ model, ev: 'downloaded', device: p.device, dtype: p.dtype, ms: Date.now() - t0 });
-    });
+    }, job.abort.signal));
   } catch (e) {
     const up = want === 'gpu-mixed' ? { upgrade: true } : {};
     if ((e as Error)?.name === 'AbortError' || job.cancelled) emit({ model, ev: 'error', message: 'скачивание отменено', ...up });
@@ -306,8 +314,8 @@ async function startDownload(model: string, want?: WhisperDtype): Promise<void> 
 async function deleteModel(model: string): Promise<LasrReply<object>> {
   if (!whisperModelInfo(model)) return { ok: false, error: 'unknown model' };
   const job = downloads.get(model);
-  if (job) job.cancelled = true;
-  await queue.run(async () => {
+  if (job) { job.cancelled = true; job.abort.abort(); }
+  await queue.run(() => withLocalModelFiles(async () => {
     if (loaded?.model === model) await disposeLoaded();
     cpuModels.delete(model);
     try {
@@ -316,29 +324,30 @@ async function deleteModel(model: string): Promise<LasrReply<object>> {
     } catch {
       /* nothing cached */
     }
-  });
+  }));
   emit({ model, ev: 'deleted' });
   return { ok: true };
 }
 
-/** "Delete all models": stops downloads, releases the model, deletes every cache of this origin (only Whisper files live there) */
+/** "Delete all models": stops downloads, releases the model, clears only NVT Whisper entries. */
 async function clearAll(): Promise<LasrReply<{ freedBytes: number }>> {
-  for (const j of downloads.values()) j.cancelled = true;
-  await queue.run(async () => {
+  for (const j of downloads.values()) { j.cancelled = true; j.abort.abort(); }
+  return queue.run(() => withLocalModelFiles(async () => {
     await disposeLoaded();
     cpuModels.clear();
-  });
-  let freed = 0;
-  for (const name of await caches.keys()) {
-    const cache = await caches.open(name);
+    let freed = 0;
+    const cache = await cacheOf();
     for (const r of await cache.keys()) {
+      const url = new URL(r.url);
+      const isNvtModel = WHISPER_MODELS.some((m) => url.origin === 'https://huggingface.co' && url.pathname.startsWith(`/${m.id}/resolve/${m.revision}/`));
+      if (!isNvtModel) continue;
       const res = await cache.match(r);
       const len = Number(res?.headers.get('content-length'));
       freed += Number.isFinite(len) && len > 0 ? len : res ? (await res.blob()).size : 0;
+      await cache.delete(r);
     }
-    await caches.delete(name);
-  }
-  return { ok: true, freedBytes: freed };
+    return { ok: true, freedBytes: freed };
+  }));
 }
 
 const toFloat32 = (pcm: Int16Array): Float32Array => {
@@ -456,7 +465,7 @@ async function transcribe(req: Extract<LasrRequest, { op: 'transcribe' }>): Prom
 }
 
 export function startLocalAsrRuntime(): void {
-  browser.runtime.onMessage.addListener((raw: unknown, _sender: unknown, sendResponse: (r: unknown) => void) => {
+  localRuntimeHost().runtime.onMessage.addListener((raw: unknown, _sender: unknown, sendResponse: (r: unknown) => void) => {
     const msg = raw as LasrRequest | undefined;
     if (!msg || msg.type !== LASR_MSG || msg.to !== 'offscreen') return false;
     touch();
@@ -476,7 +485,7 @@ export function startLocalAsrRuntime(): void {
         return false;
       case 'download-cancel': {
         const j = downloads.get(msg.model);
-        if (j) j.cancelled = true;
+        if (j) { j.cancelled = true; j.abort.abort(); }
         sendResponse({ ok: true });
         return false;
       }

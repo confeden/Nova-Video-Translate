@@ -1,8 +1,9 @@
 /** Provider fall-through chain for one audio chunk (D15). Pure of DOM; clock and sleep are injectable. */
 import { diag } from '../diag';
-import type { AudioChunk, ChunkResult, DubProvider, ProviderContext, ProviderId } from '../providers/types';
+import type { AudioChunk, ChunkResult, DubProvider, ProviderContext, ProviderId, SubtitleCue } from '../providers/types';
 import { ProviderUnavailableError } from '../providers/types';
 import type { Settings } from '../types';
+import { needsGapFill } from './gaps';
 
 export type EngineWarningKind =
   | 'quota-exhausted'
@@ -58,6 +59,7 @@ export interface ChainContext {
   sleep(ms: number, signal: AbortSignal): Promise<void>;
   warn(w: EngineWarning): void;
   sourceLang?: string;
+  repairGaps?: boolean;
   backoffMs?: number;
   cooldownMs?: number;
   /** latest settings (the user may change tiers while a chunk is in flight) */
@@ -89,8 +91,14 @@ export interface ChainContext {
   onLatency?(id: ProviderId, ms: number, censored: boolean): void;
   /** a tier attempt ended for good (success, or a failure / timeout that was not a cancellation): used for per-request evidence */
   onTierResult?(id: ProviderId, ok: boolean, ms: number): void;
+  /** translated text is ready before synthesis finishes (opt-in only). */
+  onSubtitles?(id: ProviderId, cues: SubtitleCue[]): void;
   /** a higher-priority racer finished after a lower-priority one had already been delivered */
   onLate?(win: { providerId: ProviderId; result: ChunkResult; latencyMs: number }): void;
+  /** Local speech found in a cloud result's holes; does not replace the completed cloud sentences. */
+  onGapFill?(result: ChunkResult, latencyMs: number): void;
+  /** Reserve the local tier's normal concurrency budget for a racer or background repair. */
+  scheduleRepair?(run: () => Promise<void>): void;
 }
 
 const realTimer = (ms: number, signal: AbortSignal): Promise<void> =>
@@ -129,7 +137,15 @@ function attemptWithHedge(
   cell: Record<string, unknown>,
 ): Promise<Win> {
   const mk = (prov: DubProvider, c: AbortController): Promise<Win> =>
-    prov.translateChunk(chunk, { ...pctx, signal: c.signal, deadlineMs: ctx.deadlineMs?.(prov.id), onHint: (s) => ctx.onHint?.(prov.id, s) }).then((result) => ({ providerId: prov.id, result }));
+    prov.translateChunk(chunk, {
+      ...pctx,
+      signal: c.signal,
+      deadlineMs: ctx.deadlineMs?.(prov.id),
+      onHint: (s) => ctx.onHint?.(prov.id, s),
+      onSubtitles: pctx.wantSubtitles && ctx.onSubtitles ? (cues) => {
+        if (!c.signal.aborted && !ctx.signal.aborted) ctx.onSubtitles?.(prov.id, cues);
+      } : undefined,
+    }).then((result) => ({ providerId: prov.id, result }));
   const primary = mk(p, ac);
   const after = ctx.hedgeAfterMs ?? 0;
   const later = tiers.slice(tiers.indexOf(p) + 1);
@@ -271,6 +287,26 @@ function recordFailure(id: ProviderId, state: ChainState, ctx: ChainContext): vo
 
 type TierResult = { ok: true; providerId: ProviderId; result: ChunkResult; latencyMs: number } | { ok: false };
 
+/** Waiting for local capacity must neither spend its budget nor hold an aborted race open. */
+function scheduledLocal(ctx: ChainContext, run: () => Promise<TierResult>): Promise<TierResult> {
+  if (!ctx.scheduleRepair) return run();
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => reject(new DOMException('aborted', 'AbortError'));
+    if (ctx.signal.aborted) return onAbort();
+    ctx.signal.addEventListener('abort', onAbort, { once: true });
+    ctx.scheduleRepair!(async () => {
+      if (ctx.signal.aborted) return;
+      try {
+        resolve(await run());
+      } catch (e) {
+        reject(e);
+      } finally {
+        ctx.signal.removeEventListener('abort', onAbort);
+      }
+    });
+  });
+}
+
 /** Up to two attempts of one tier with the quota / declined / auth / timeout bookkeeping. Never throws except for a cancelled `ctx.signal`. */
 async function tryTier(
   p: DubProvider,
@@ -307,7 +343,7 @@ async function tryTier(
         p,
         hedge ? tiers : [p],
         chunk,
-        { targetLang: 'ru', sourceLang: ctx.sourceLang, wantSubtitles: cur.subtitles === 'on', live: ctx.isLive?.() === true },
+        { targetLang: 'ru', sourceLang: ctx.sourceLang, wantSubtitles: cur.subtitles === 'on', live: ctx.isLive?.() === true, repairGaps: ctx.repairGaps },
         ac,
         ctx,
         state,
@@ -420,6 +456,7 @@ function raceTiers(
     let winnerRank = -1;
     let pending = racers.length;
     let resolved = false;
+    let winningResult: ChunkResult | undefined;
     const acs = racers.map(() => new AbortController());
     const links = acs.map((ac) => {
       const l = (): void => ac.abort();
@@ -430,25 +467,29 @@ function raceTiers(
     diag.log('race-start', { ...cell, tiers: racers.map((r) => r.id) });
     racers.forEach((p, i) => {
       const sub: ChainContext = { ...ctx, signal: acs[i]!.signal };
-      tryTier(p, racers, chunk, settings, sub, state, cell, false)
+      const run = (): Promise<TierResult> => tryTier(p, racers, chunk, settings, sub, state, cell, false);
+      (p.id === 'local' ? scheduledLocal(sub, run) : run())
         .catch((): TierResult => ({ ok: false }))
         .then((r) => {
           pending--;
           if (r.ok) {
             if (winnerRank < 0) {
               winnerRank = i;
-              // lower-priority racers are pointless now
-              racers.forEach((_, j) => {
-                if (j > i) acs[j]!.abort();
+              winningResult = r.result;
+              racers.forEach((tier, j) => {
+                if (r.result.segments.length > 0 && j > i && !(tier.id === 'local' && ctx.onGapFill && needsGapFill(chunk, r.result))) acs[j]!.abort();
               });
               resolved = true;
               resolve(r);
               diag.log('race-win', { ...cell, winner: p.id, ms: r.latencyMs, higherPending: racers.slice(0, i).filter((_, j) => !acs[j]!.signal.aborted).map((x) => x.id) });
-            } else if (i < winnerRank) {
+            } else if (p.id === 'local' && racers[winnerRank]?.id !== 'local' && winningResult && needsGapFill(chunk, winningResult) && ctx.onGapFill && !ctx.signal.aborted) {
+              ctx.onGapFill(r.result, r.latencyMs);
+            } else if (i < winnerRank && r.result.segments.length > 0) {
               winnerRank = i;
+              winningResult = r.result;
               ctx.onLate?.({ providerId: r.providerId, result: r.result, latencyMs: r.latencyMs });
-              racers.forEach((_, j) => {
-                if (j > i) acs[j]!.abort();
+              racers.forEach((tier, j) => {
+                if (j > i && !(tier.id === 'local' && ctx.onGapFill && needsGapFill(chunk, r.result))) acs[j]!.abort();
               });
             }
           }
@@ -480,16 +521,39 @@ export async function runChain(
   const planned = (ctx.plan ?? []).map((id) => eligible.find((t) => t.id === id)).filter((t): t is DubProvider => !!t);
   const tiers = [...planned, ...eligible.filter((t) => !planned.includes(t))];
   const tried = new Set<DubProvider>();
+  const repair = (win: Extract<TierResult, { ok: true }>): void => {
+    const local = eligible.find((p) => p.id === 'local');
+    if (!ctx.onGapFill || win.providerId === 'local' || !local || tried.has(local) || !needsGapFill(chunk, win.result)) return;
+    tried.add(local);
+    diag.log('gap-fill-start', cell);
+    const run = async (): Promise<void> => {
+      try {
+        const r = await tryTier(local, tiers, chunk, settings, { ...ctx, repairGaps: true }, state, cell, false);
+        if (r.ok && !ctx.signal.aborted) ctx.onGapFill?.(r.result, r.latencyMs);
+      } catch (e) {
+        if (!ctx.signal.aborted) diag.log('gap-fill-error', { ...cell, message: e instanceof Error ? e.message : String(e) });
+      }
+    };
+    if (ctx.scheduleRepair) ctx.scheduleRepair(run);
+    else void run();
+  };
   if (planned.length >= 2) {
     const r = await raceTiers(planned, chunk, settings, ctx, state, cell);
     if (ctx.signal.aborted) throw new DOMException('aborted', 'AbortError');
     for (const p of planned) tried.add(p);
-    if (r?.ok) return { ok: true, providerId: r.providerId, result: r.result, latencyMs: r.latencyMs };
+    if (r?.ok) {
+      repair(r);
+      return { ok: true, providerId: r.providerId, result: r.result, latencyMs: r.latencyMs };
+    }
   }
   for (const p of tiers) {
     if (tried.has(p)) continue;
     const r = await tryTier(p, tiers, chunk, settings, ctx, state, cell, true);
-    if (r.ok) return { ok: true, providerId: r.providerId, result: r.result, latencyMs: r.latencyMs };
+    if (!r.ok || r.providerId === p.id) tried.add(p);
+    if (r.ok) {
+      repair(r);
+      return { ok: true, providerId: r.providerId, result: r.result, latencyMs: r.latencyMs };
+    }
   }
   warnThrottled(state, ctx, 'no-provider', { kind: 'no-provider', message: 'no voice provider could translate this chunk' });
   diag.log('chain-failed', cell);

@@ -39,3 +39,29 @@ describe('mergeCuesToPhrases (0.3.5)', () => {
     expect(out[0]).toMatchObject({ text: 'Привет мир.', src: 'Hi there.' });
   });
 });
+
+describe('mergeCuesToPhrases: repeats', () => {
+  it('drops a cue already said and the overlapping head of the next one', () => {
+    const cues = [
+      { start: 0, end: 2, text: 'We are only one. All systems go!', src: 'We are only one. All systems go!' },
+      { start: 2.1, end: 3, text: 'All systems go! Yeah, you go!', src: 'All systems go! Yeah, you go!' },
+      { start: 3.1, end: 4, text: 'Yeah, you go!', src: 'Yeah, you go!' },
+    ];
+    const out = mergeCuesToPhrases(cues);
+    const all = out.map((c) => c.text).join(' ');
+    expect(all.match(/All systems go/g)).toHaveLength(1);
+    expect(all.match(/you go/g)).toHaveLength(1);
+  });
+});
+
+describe('mergeCuesToPhrases: a stray "So"', () => {
+  it('drops a lone So cue and a So dangling at the end of a cue', () => {
+    const out = mergeCuesToPhrases([
+      { start: 0, end: 0.4, text: 'Так', src: 'So' },
+      { start: 5, end: 7, text: 'О боже. Так', src: 'Oh, my God. So' },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.src).toBe('Oh, my God.');
+    expect(out[0]!.text).toBe('О боже.');
+  });
+});

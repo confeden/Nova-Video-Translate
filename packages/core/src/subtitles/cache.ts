@@ -4,7 +4,7 @@ import type { SubtitleCue } from '../providers/types';
 import type { Settings } from '../types';
 
 /** sub2: sub1 entries may belong to live streams (DVR-position cells) */
-const KEY_VERSION = 'sub2';
+const KEY_VERSION = 'sub3';
 
 export interface SubtitleCacheOptions {
   cache: ResultCache;

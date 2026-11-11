@@ -5,7 +5,7 @@ import { VOICE_STATUS_KEY, YANDEX_LOGIN_ERROR_KEY, loadSettings, loadYandexAuth,
 
 import { NVT_VERSION } from './version';
 import { runUpdateCheck } from './updateCheck';
-import { UPDATE_STATE_KEY, isReleasePageUrl, updateFromState, type UpdateState } from '@nvt/core';
+import { UPDATE_STATE_KEY, isKeyPageUrl, isReleasePageUrl, updateFromState, type UpdateState } from '@nvt/core';
 
 /** Storage + account part of the settings panel (GM storage); the page runtime adds the translate / diagnostics parts. */
 export function createSettingsHost(transport: Transport, cache?: ResultCache): SettingsPanelHost {
@@ -32,6 +32,9 @@ export function createSettingsHost(transport: Transport, cache?: ResultCache): S
     checkUpdateNow: () => runUpdateCheck(true),
     async openUpdatePage(url: string) {
       if (isReleasePageUrl(url)) window.open(url, '_blank', 'noopener');
+    },
+    async openKeyPage(url: string) {
+      if (isKeyPageUrl(url)) window.open(url, '_blank', 'noopener');
     },
     async getYandexLoginError() {
       return (gmGet(YANDEX_LOGIN_ERROR_KEY) as { message?: string } | null | undefined)?.message;

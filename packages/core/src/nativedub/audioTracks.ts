@@ -271,17 +271,13 @@ function originOf(win: Env): string {
 export function installAudioTracksMain(opts: { win?: Env; doc?: { getElementById(id: string): unknown } } = {}): { dispose(): void } {
   const win = opts.win ?? (globalThis as unknown as Env);
   const doc = opts.doc ?? (globalThis as unknown as { document: { getElementById(id: string): unknown } }).document;
-  let nonce: string | null = null;
   const send = (m: ToIso): void => win.postMessage({ [TAG]: m }, originOf(win));
   const onMsg = (e: MessageEvent): void => {
     if (e.source !== (win as unknown) || !e.data || typeof e.data !== 'object') return;
     const m = (e.data as Record<string, ToMain | undefined>)[TAG];
     if (!m || typeof m.t !== 'string') return;
-    if (m.t === 'hello') {
-      nonce = String(m.nonce);
-      return;
-    }
-    if (!nonce || m.nonce !== nonce) return;
+    if (typeof m.nonce !== 'string' || !m.nonce || m.nonce.length > 128 || m.t === 'hello') return;
+    const nonce = m.nonce;
     if (m.t === 'list') {
       let state: AudioTracksState | null = null;
       try {

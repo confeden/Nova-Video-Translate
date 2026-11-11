@@ -5,8 +5,8 @@
  *   MAIN world (document_start):      installMseTapMain()
  *   isolated world:                   const c = createMseBridgeClient(); await c.ping(); c.start(fromSec); c.onChunk(...)
  *
- * The nonce is chosen by the isolated side and sent in `hello`; every later message must carry it. It guards against
- * unrelated postMessage traffic and other extensions, NOT against the page itself (the page can read every message).
+ * Each client chooses a nonce to correlate replies and identify its active capture.
+ * This is NOT authentication against the page itself (the page can read every message).
  */
 import type { AudioChunk } from '../providers/types';
 import { installMseTap, type MseTapHandle, type MseTapOptions, type MseTapStats } from './mseTap';
@@ -39,6 +39,7 @@ export function installMseTapMain(
 ): { tap: MseTapHandle; dispose(): void } {
   const win = opts.win ?? (globalThis as unknown as Env);
   let nonce: string | null = null;
+  let active = false;
   const send = (m: ToIso, transfer?: Transferable[]): void => win.postMessage({ [TAG]: m }, origin(win), transfer);
   const tap = installMseTap(
     (c) => {
@@ -52,15 +53,21 @@ export function installMseTapMain(
     if (e.source !== (win as unknown) || !e.data || typeof e.data !== 'object') return;
     const m = (e.data as Record<string, ToMain | undefined>)[TAG];
     if (!m || typeof m.t !== 'string') return;
+    if (typeof m.nonce !== 'string' || !m.nonce || m.nonce.length > 128) return;
     if (m.t === 'hello') {
-      nonce = String(m.nonce);
-      tap.deactivate();
+      // A discovery message must never stop another client's active capture.
       return;
     }
-    if (!nonce || m.nonce !== nonce) return;
-    if (m.t === 'ping') send({ t: 'pong', nonce, id: m.id, stats: tap.stats() });
-    else if (m.t === 'start') tap.activate(Number(m.fromSec) || 0);
-    else if (m.t === 'stop') tap.deactivate();
+    if (m.t === 'ping') send({ t: 'pong', nonce: m.nonce, id: m.id, stats: tap.stats() });
+    else if (m.t === 'start' && (!active || m.nonce === nonce)) {
+      nonce = m.nonce;
+      active = true;
+      tap.activate(Number(m.fromSec) || 0);
+    } else if (m.t === 'stop' && m.nonce === nonce) {
+      tap.deactivate();
+      active = false;
+      nonce = null;
+    }
   };
   win.addEventListener('message', onMsg);
   return {

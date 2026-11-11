@@ -1,4 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+// the fake chunks here are digital silence: the voice-activity check (it drops short phrases over silence) must see speech
+vi.mock('../src/localasr/vad', () => ({
+  vadBursts: () => ({ bursts: [{ start: 0, end: 600, confidence: 1 }], speechSec: 600, noiseFloorDb: -60 }),
+}));
 import { KeyPool } from '../src/keypool';
 import { GeminiClient, parseRetryAfterMs, responseText } from '../src/providers/gemini/client';
 import {
@@ -253,6 +258,24 @@ describe('GeminiProvider', () => {
     const p = new GeminiProvider({ keys: ['k'], fetch: m.fetchFn });
     const res = await p.translateChunk(chunk, ctx(true));
     expect(res.subtitles).toEqual([{ start: 100, end: 105, src: 's', text: 'р' }]);
+  });
+
+  it('publishes subtitles before the TTS response, only when enabled', async () => {
+    const early = vi.fn();
+    const p = new GeminiProvider({
+      keys: ['k'],
+      models: () => ({ translate: 'my-translate', tts: 'my-tts' }),
+      fetch: async (url: string) => {
+        if (url.includes('my-tts')) {
+          expect(early).toHaveBeenCalledWith([{ start: 100, end: 105, src: 'Hello everyone', text: 'Всем привет' }]);
+          return audioResp(24000);
+        }
+        return textResp(JSON.stringify({ source_lang: 'en', segments: [{ start: 0, end: 5, src: 'Hello everyone', ru: 'Всем привет' }] }));
+      },
+    });
+    const res = await p.translateChunk(chunk, { ...ctx(true), onSubtitles: early });
+    expect(res.subtitles).toEqual(early.mock.calls[0]![0]);
+    expect(early).toHaveBeenCalledTimes(1);
   });
 
   it('russian source yields no segments and no TTS calls', async () => {

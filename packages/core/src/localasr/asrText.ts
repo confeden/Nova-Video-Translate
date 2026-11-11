@@ -1,14 +1,13 @@
+import { cleanSpeechText } from '../lang/speechText';
+
 /**
  * Text helpers of the local ASR stage (dependency-free): non-speech tag filter and the word-level de-duplication of
  * overlapping chunks. Placement of text on the timeline lives in whisperText.ts, not here.
  */
 
-/** [query], [MUSIC], (dramatic music), *laughs*, music notes: Whisper's descriptions of sound, not speech. Profanity is untouched. */
-const TAGS = /\[[^\]\n]{0,60}\]|\([^)\n]{0,60}\)|\*[^*\n]{1,40}\*|[♪♫♬\u{1F3B5}\u{1F3B6}]+/gu;
-
 /** removes non-speech tags; '' when nothing but tags was there */
 export function stripNonSpeech(text: string): string {
-  return text.replace(TAGS, ' ').replace(/\s+/g, ' ').replace(/\s+([,.!?;:])/g, '$1').replace(/^[\s,.\-–—]+(?=\S)/, '').trim().replace(/^[,.\-–—\s]+$/, '');
+  return cleanSpeechText(text);
 }
 
 const norm = (w: string): string => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, '');
@@ -55,4 +54,35 @@ export function dropLeadingWords<T extends { text: string }>(segs: T[], k: numbe
     left = 0;
   }
   return out;
+}
+
+/** least speech (s) per word that a short transcript must have under it: a word takes 0.15 s at the very least */
+const MIN_SPEECH_PER_WORD_SEC = 0.12;
+const MIN_SPEECH_BASE_SEC = 0.1;
+/** only short texts are judged: Whisper's silence fillers ("So", "I'm going to go", "Thank you") are 1-5 words */
+const WEAK_MAX_WORDS = 12;
+
+const FILLERS = new Set(['so', 'im going to go', "i'm going to go", 'thank you', 'thanks', 'thanks for watching', 'you', 'bye', 'okay', 'oh', 'yeah', 'hmm', 'uh', 'um']);
+const FILLER_MIN_SPEECH_SEC = 1;
+
+/** seconds of `bursts` that fall inside [a, b] */
+export function speechInside(bursts: readonly { start: number; end: number }[], a: number, b: number): number {
+  let s = 0;
+  for (const x of bursts) s += Math.max(0, Math.min(b, x.end) - Math.max(a, x.start));
+  return s;
+}
+
+/**
+ * Drops short segments the audio cannot hold: a transcript of up to 5 words whose span contains less speech (VAD bursts) than
+ * the words need is a Whisper hallucination over silence / a music bed. Longer text is left alone. Times are in the bursts' clock.
+ */
+export function dropWeakSegments<T extends { start: number; end: number; text: string }>(segs: T[], bursts: readonly { start: number; end: number }[]): T[] {
+  return segs.filter((s) => {
+    const n = words(s.text).length;
+    if (n > WEAK_MAX_WORDS) return true;
+    const sp = speechInside(bursts, s.start, s.end);
+    // the phrases Whisper / Gemini invent over silence need a real second of speech to be believed
+    if (FILLERS.has(words(s.text).map(norm).join(' '))) return sp >= FILLER_MIN_SPEECH_SEC;
+    return sp >= MIN_SPEECH_BASE_SEC + MIN_SPEECH_PER_WORD_SEC * n;
+  });
 }

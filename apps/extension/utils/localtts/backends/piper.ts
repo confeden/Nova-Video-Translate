@@ -1,4 +1,4 @@
-import { browser } from 'wxt/browser';
+import { localRuntimeHost } from '../../localRuntimeHost';
 import type * as OrtNs from 'onnxruntime-web';
 import { loadOrt } from '../ortModel';
 // relative on purpose: neither localtts/backend nor localtts/piper is re-exported from the @nvt/core index yet (owner wires it)
@@ -54,11 +54,19 @@ interface LoadedVoice {
 /** fresh phonemizer instance after this many callMain calls (OOM seen at ~50) */
 const PHONEMIZER_MAX_CALLS = 8;
 const abortError = (): Error => Object.assign(new Error('aborted'), { name: 'AbortError' });
-const base = (): string => browser.runtime.getURL('/piper/' as never);
+const base = (): string => localRuntimeHost().runtime.getURL('/piper/');
 
 let factoryPromise: Promise<PhonemizeFactory> | undefined;
 /** injects the vendored glue script (extension origin, allowed by script-src 'self') and returns its global factory */
 function loadPhonemizeFactory(): Promise<PhonemizeFactory> {
+  const loader = localRuntimeHost().loadPiper;
+  if (loader) return (factoryPromise ??= loader().then((factory) => {
+    if (typeof factory !== 'function') throw new Error('Piper: phonemizer factory is missing');
+    return factory as PhonemizeFactory;
+  }).catch((e) => {
+    factoryPromise = undefined;
+    throw e;
+  }));
   return (factoryPromise ??= new Promise<PhonemizeFactory>((resolve, reject) => {
     const g = globalThis as unknown as { createPiperPhonemize?: PhonemizeFactory };
     if (g.createPiperPhonemize) return resolve(g.createPiperPhonemize);

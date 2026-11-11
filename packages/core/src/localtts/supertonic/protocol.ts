@@ -16,6 +16,7 @@ export const LTTS_ENV_KEY = 'nvt.localtts.env';
 export const unitStateKey = (unitId: string): string => (unitId === 'supertonic' ? LTTS_STATE_KEY : `nvt.localtts.u.${unitId}`);
 
 export interface LttsEnv {
+  gpuReason?: string;
   /** WebGPU adapter available in the extension context; undefined = not probed yet */
   gpu?: boolean;
   /** chrome.offscreen exists */
@@ -59,10 +60,10 @@ export type LttsRequest = LttsOp & { type: typeof LTTS_MSG; to: 'bg' | 'offscree
 
 /** offscreen -> bg notifications (no reply expected) */
 export type LttsEvent =
-  | { type: typeof LTTS_MSG; to: 'bg'; op: 'event'; unit?: string; ev: 'progress'; loaded: number; total: number }
+  | { type: typeof LTTS_MSG; to: 'bg'; op: 'event'; unit?: string; ev: 'progress'; loaded: number; total: number; file?: string }
   | { type: typeof LTTS_MSG; to: 'bg'; op: 'event'; unit?: string; ev: 'downloaded'; bytes: number; fetchedBytes: number; ms: number }
   | { type: typeof LTTS_MSG; to: 'bg'; op: 'event'; unit?: string; ev: 'error'; message: string; missing?: boolean }
-  | { type: typeof LTTS_MSG; to: 'bg'; op: 'event'; ev: 'gpu'; gpu: boolean }
+  | { type: typeof LTTS_MSG; to: 'bg'; op: 'event'; ev: 'gpu'; gpu: boolean; reason?: string }
   | { type: typeof LTTS_MSG; to: 'bg'; op: 'event'; unit?: string; ev: 'deleted' }
   | { type: typeof LTTS_MSG; to: 'bg'; op: 'event'; ev: 'idle-close' };
 

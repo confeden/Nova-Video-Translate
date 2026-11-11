@@ -1,5 +1,5 @@
 import { ttsAbortError, preprocessForModel, textToIds, type TtsModel } from '@nvt/core';
-import { browser } from 'wxt/browser';
+import { localRuntimeHost } from '../localRuntimeHost';
 import type * as OrtNs from 'onnxruntime-web';
 import type { ModelReader } from '@nvt/core';
 
@@ -20,15 +20,14 @@ let ortPromise: Promise<Ort> | undefined;
 /** onnxruntime-web 1.22 (webgpu bundle) from the extension's own files (copied to ort/ at build; no remote code) */
 export function loadOrt(): Promise<Ort> {
   return (ortPromise ??= (async () => {
-    const base = browser.runtime.getURL('/ort/' as never);
-    const ort = (await import(/* @vite-ignore */ `${base}ort.webgpu.bundle.min.mjs`)) as Ort;
-    ort.env.wasm.wasmPaths = base;
+    const host = localRuntimeHost();
+    if (!host.loadOrt) throw new Error('ONNX loader is not configured');
+    const ort = await host.loadOrt();
     ort.env.wasm.proxy = false;
     // never let Chrome pick a low-power adapter for the TTS (hybrid-GPU laptops); harmless on a single-GPU desktop
     (ort.env as unknown as { webgpu: { powerPreference?: string } }).webgpu.powerPreference = 'high-performance';
     // WASM engines (Silero / Piper / Supertonic CPU) scale with threads; the WebGPU EP only runs tiny CPU ops (measured: no change)
     // capped low: the video decoder and the page need the other cores (CPU-jank report)
-    ort.env.wasm.numThreads = Math.min(2, Math.max(1, Math.floor((navigator.hardwareConcurrency || 4) / 4)));
     return ort;
   })().catch((e) => {
     ortPromise = undefined;
@@ -37,13 +36,20 @@ export function loadOrt(): Promise<Ort> {
 }
 
 /** true when a WebGPU adapter can be obtained in this context */
-export async function hasWebGpu(): Promise<boolean> {
+export async function probeWebGpu(): Promise<{ gpu: boolean; reason?: string }> {
+  const gpu = (navigator as unknown as { gpu?: { requestAdapter(o?: { powerPreference: string }): Promise<unknown> } }).gpu;
+  if (!gpu) return { gpu: false, reason: 'В браузере нет navigator.gpu (проверьте аппаратное ускорение)' };
   try {
-    const gpu = (navigator as unknown as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
-    return !!gpu && !!(await gpu.requestAdapter());
-  } catch {
-    return false;
+    if (await gpu.requestAdapter({ powerPreference: 'high-performance' })) return { gpu: true };
+    if (await gpu.requestAdapter()) return { gpu: true };
+    return { gpu: false, reason: 'Браузер не выдал WebGPU-адаптер (аппаратное ускорение или драйвер)' };
+  } catch (e) {
+    return { gpu: false, reason: `WebGPU: ${String((e as Error)?.message ?? e).slice(0, 140)}` };
   }
+}
+
+export async function hasWebGpu(): Promise<boolean> {
+  return (await probeWebGpu()).gpu;
 }
 
 /** Supertonic 3 pipeline (duration predictor -> text encoder -> N x vector estimator -> vocoder) on onnxruntime-web WebGPU. */

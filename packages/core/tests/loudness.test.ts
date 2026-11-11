@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LOUD_CEILING, normalizeLoudness, softLimit, type LevelState } from '../src/providers/cascade/loudness';
+import { LOUD_CEILING, levelDecodedSpeech, normalizeLoudness, softLimit, type LevelState } from '../src/providers/cascade/loudness';
 import { layoutSequential } from '../src/providers/cascade/segments';
 
 /** synthetic "speech": 200 Hz tone with a slow envelope, peak `peak` */
@@ -11,6 +11,28 @@ const tone = (peak: number, sec = 1, sr = 24000): Int16Array => {
 };
 
 describe('normalizeLoudness', () => {
+  it('levels quiet and loud words inside one dub, preserving silence and the peak ceiling', () => {
+    const sr = 24000;
+    const samples = Float32Array.from({ length: sr * 5 }, (_, i) => {
+      const amp = i < sr ? 0 : i < sr * 3 ? 0.04 : 0.7;
+      return amp * Math.sin(2 * Math.PI * 200 * i / sr);
+    });
+    const rms = (start: number, end: number) => Math.sqrt(samples.subarray(start * sr, end * sr).reduce((s, x) => s + x * x, 0) / ((end - start) * sr));
+    levelDecodedSpeech([samples], sr);
+    expect(rms(0, 0.8)).toBe(0);
+    expect(rms(1.5, 2.5)).toBeGreaterThan(0.14);
+    expect(rms(3.5, 4.5)).toBeCloseTo(rms(1.5, 2.5), 1);
+    expect(samples.every((x) => Math.abs(x) <= LOUD_CEILING + 1e-6)).toBe(true);
+  });
+  it('links stereo gain and does not turn digital silence into noise', () => {
+    const left = Float32Array.from({ length: 24000 }, (_, i) => 0.1 * Math.sin(i / 20));
+    const right = left.map((x) => x / 2);
+    levelDecodedSpeech([left, right], 24000);
+    expect(left[10000]).toBeCloseTo(right[10000]! * 2, 4);
+    const silence = new Float32Array(1000);
+    levelDecodedSpeech([silence], 24000);
+    expect(silence.every((x) => x === 0)).toBe(true);
+  });
   it('lifts quiet speech (peak 0.4) to Yandex-like level without clipping', () => {
     const r = normalizeLoudness(tone(0.4));
     console.log('LOUDNESS quiet', JSON.stringify(r.stats));
@@ -46,6 +68,13 @@ describe('normalizeLoudness', () => {
     function LOUD_ceil() {
       return LOUD_CEILING + 1e-9;
     }
+  });
+  it('a quiet phrase after a loud phrase is not held below its own target', () => {
+    const state: LevelState = {};
+    normalizeLoudness(tone(0.99), state);
+    const quiet = normalizeLoudness(tone(0.2), state);
+    expect(quiet.stats.rmsAfter).toBeGreaterThan(0.18);
+    expect(quiet.stats.peakAfter).toBeLessThanOrEqual(LOUD_CEILING + 1e-3);
   });
 });
 

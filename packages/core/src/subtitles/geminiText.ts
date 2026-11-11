@@ -1,4 +1,5 @@
 import { diag } from '../diag';
+import { matchIntonation } from '../lang/speechText';
 import type { KeyPool } from '../keypool';
 import { listModels, pickModels, type FetchFn } from '../models';
 import { GeminiClient, responseText } from '../providers/gemini/client';
@@ -22,6 +23,7 @@ export function buildTranslatePrompt(sourceLang: string): string {
     `Translate these video subtitle lines from "${sourceLang}" to natural Russian.`,
     'The input is a JSON array of {"i": index, "t": text}. Return {"items":[{"i": index, "ru": translation}]} with EXACTLY one item per input line,',
     'same index, same order. Keep each translation short enough to read as a subtitle, never merge or drop lines, keep names and numbers.',
+    'Keep the intonation: a question stays a question ("?"), an exclamation stays an exclamation ("!"), trailing off stays "…".',
     'Return only JSON.',
   ].join('\n');
 }
@@ -127,7 +129,7 @@ export class GeminiText implements CueTranslator, ChunkSource {
       const missing = ru.filter((x) => x === undefined).length;
       diag.log('subs-gemini-translate', { batch: batch.length, missing });
       batch.forEach((c, i) => {
-        if (ru[i]) out.push({ start: c.start, end: c.end, src: c.text, text: ru[i]! });
+        if (ru[i]) out.push({ start: c.start, end: c.end, src: c.text, text: matchIntonation(c.text, ru[i]!) });
       });
     }
     return out;

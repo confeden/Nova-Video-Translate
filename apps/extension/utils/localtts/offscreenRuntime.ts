@@ -5,6 +5,7 @@
  */
 import {
   LTTS_MSG,
+  diag,
   OFFSCREEN_IDLE_MS,
   SerialQueue,
   WARMUP_TEXT,
@@ -24,12 +25,13 @@ import {
   type SynthReplyData,
   type WarmReplyData,
 } from '@nvt/core';
-import { browser } from 'wxt/browser';
+import { createResilientFetch } from '@nvt/core';
+import { localRuntimeHost, withLocalModelFiles } from '../localRuntimeHost';
 import { createPiperBackend } from './backends/piper';
 import { createSileroBackend } from './backends/silero';
 import { SupertonicBackend } from './backends/supertonic';
 import { OpfsModelStore } from './opfsStore';
-import { hasWebGpu } from './ortModel';
+import { hasWebGpu, probeWebGpu } from './ortModel';
 
 const queue = new SerialQueue();
 const aborts = new Map<string, AbortController>();
@@ -57,7 +59,7 @@ const SELFTEST_TEXTS = [
 
 type EventBody = LttsEvent extends infer E ? (E extends LttsEvent ? Omit<E, 'type' | 'to' | 'op'> : never) : never;
 const emit = (e: EventBody): void => {
-  void browser.runtime.sendMessage({ type: LTTS_MSG, to: 'bg', op: 'event', ...e }).catch(() => {});
+  void localRuntimeHost().runtime.sendMessage({ type: LTTS_MSG, to: 'bg', op: 'event', ...e }).catch(() => {});
 };
 
 const storeFor = (u: LocalTtsUnit): OpfsModelStore => {
@@ -103,6 +105,12 @@ async function disposeLoaded(): Promise<void> {
   const cur = loaded;
   loaded = undefined;
   await cur?.backend.dispose().catch(() => {});
+}
+
+/** Releases model sessions while retaining runtime listeners and downloaded files. */
+export async function releaseLocalTtsRuntime(): Promise<void> {
+  clearTimeout(idleTimer);
+  await queue.run(() => disposeLoaded());
 }
 
 /** loads (once) the backend of an engine; must run inside the queue. A different engine replaces the loaded one. */
@@ -157,30 +165,33 @@ async function startDownload(engine: LocalTtsEngineId, voice: string | undefined
   downloads.set(unit.id, ac);
   const t0 = Date.now();
   try {
-    const baseUrl = baseUrlOverride || unit.baseUrl;
-    if (!baseUrl && !unit.files.every((f) => f.url)) throw new Error('модель ещё не опубликована (нет адреса загрузки)');
-    const store = storeFor(unit);
-    await navigator.storage.persist?.().catch(() => false);
-    await store.pruneOld().catch(() => {});
-    // primary base URL first (an override replaces the whole list), then the unit's fallbacks; the last error is surfaced
-    const bases = baseUrlOverride ? [baseUrlOverride] : [baseUrl, ...(unit.fallbackBaseUrls ?? [])];
-    let r!: Awaited<ReturnType<typeof downloadModel>>;
-    for (let i = 0; i < bases.length; i++) {
-      try {
-        r = await downloadModel({
-          files: unit.files,
-          baseUrl: bases[i]!,
-          store,
-          signal: ac.signal,
-          onProgress: (p) => emit({ ev: 'progress', unit: unit.id, loaded: p.loaded, total: p.total }),
-        });
-        break;
-      } catch (e) {
-        if ((e as Error).name === 'AbortError' || i === bases.length - 1) throw e;
-        console.warn(`[nvt-tts] ${bases[i]} failed (${String((e as Error).message ?? e).slice(0, 120)}), trying the next base URL`);
+    await withLocalModelFiles(async () => {
+      const baseUrl = baseUrlOverride || unit.baseUrl;
+      if (!baseUrl && !unit.files.every((f) => f.url)) throw new Error('модель ещё не опубликована (нет адреса загрузки)');
+      const store = storeFor(unit);
+      await navigator.storage.persist?.().catch(() => false);
+      await store.pruneOld().catch(() => {});
+      // primary base URL first (an override replaces the whole list), then the unit's fallbacks; the last error is surfaced
+      const bases = baseUrlOverride ? [baseUrlOverride] : [baseUrl, ...(unit.fallbackBaseUrls ?? [])];
+      let r!: Awaited<ReturnType<typeof downloadModel>>;
+      for (let i = 0; i < bases.length; i++) {
+        try {
+          r = await downloadModel({
+            files: unit.files,
+            baseUrl: bases[i]!,
+            store,
+            fetch: createResilientFetch(localRuntimeHost().fetch ?? globalThis.fetch.bind(globalThis), { onRetry: (i) => { diag.log('localtts-download-retry', i); console.warn(`[nvt-tts] ${i.file} ${i.source} try ${i.attempt}: ${i.error}`); } }),
+            signal: ac.signal,
+            onProgress: (p) => emit({ ev: 'progress', unit: unit.id, loaded: p.loaded, total: p.total, file: p.file }),
+          });
+          break;
+        } catch (e) {
+          if ((e as Error).name === 'AbortError' || i === bases.length - 1) throw e;
+          console.warn(`[nvt-tts] ${bases[i]} failed (${String((e as Error).message ?? e).slice(0, 120)}), trying the next base URL`);
+        }
       }
-    }
-    emit({ ev: 'downloaded', unit: unit.id, bytes: r.bytes, fetchedBytes: r.fetchedBytes, ms: Date.now() - t0 });
+      emit({ ev: 'downloaded', unit: unit.id, bytes: r.bytes, fetchedBytes: r.fetchedBytes, ms: Date.now() - t0 });
+    }, ac.signal);
   } catch (e) {
     if ((e as Error).name === 'AbortError') emit({ ev: 'error', unit: unit.id, message: 'скачивание отменено' });
     else emit({ ev: 'error', unit: unit.id, message: String((e as Error).message ?? e).slice(0, 200) });
@@ -275,7 +286,7 @@ async function dirBytes(d: FileSystemDirectoryHandle): Promise<number> {
   return n;
 }
 
-/** "Delete all models": stops downloads, releases the engine, removes every nvt-* OPFS pack */
+/** "Delete all models": stops downloads, releases the engine, removes only NVT model OPFS packs. */
 async function clearAll(): Promise<LttsReply<{ freedBytes: number }>> {
   for (const c of downloads.values()) c.abort();
   await queue.run(() => disposeLoaded());
@@ -283,7 +294,7 @@ async function clearAll(): Promise<LttsReply<{ freedBytes: number }>> {
   let freed = 0;
   const root = (await navigator.storage.getDirectory()) as FileSystemDirectoryHandle & { keys(): AsyncIterable<string> };
   const names: string[] = [];
-  for await (const k of root.keys()) if (k.startsWith('nvt-')) names.push(k);
+  for await (const k of root.keys()) if (/^nvt-(supertonic|silero|piper)-[a-zA-Z0-9_-]{12}$/.test(k)) names.push(k);
   for (const k of names) {
     freed += await dirBytes(await root.getDirectoryHandle(k)).catch(() => 0);
     await root.removeEntry(k, { recursive: true });
@@ -292,7 +303,7 @@ async function clearAll(): Promise<LttsReply<{ freedBytes: number }>> {
 }
 
 export function startOffscreenRuntime(): void {
-  browser.runtime.onMessage.addListener((raw: unknown, _sender: unknown, sendResponse: (r: unknown) => void) => {
+  localRuntimeHost().runtime.onMessage.addListener((raw: unknown, _sender: unknown, sendResponse: (r: unknown) => void) => {
     const msg = raw as LttsRequest | undefined;
     if (!msg || msg.type !== LTTS_MSG || msg.to !== 'offscreen') return false;
     touch();
@@ -302,9 +313,9 @@ export function startOffscreenRuntime(): void {
     };
     switch (msg.op) {
       case 'status':
-        return reply(hasWebGpu().then((gpu) => {
-          emit({ ev: 'gpu', gpu });
-          return { ok: true, gpu };
+        return reply(probeWebGpu().then((caps) => {
+          emit({ ev: 'gpu', ...caps });
+          return { ok: true, ...caps };
         }));
       case 'download':
         void startDownload(msg.engine ?? DEFAULT_ENGINE, msg.voice, msg.baseUrl);
@@ -316,10 +327,14 @@ export function startOffscreenRuntime(): void {
         sendResponse({ ok: true });
         return false;
       }
-      case 'delete':
-        return reply(deleteUnit(msg.engine ?? DEFAULT_ENGINE, msg.voice));
+      case 'delete': {
+        const unit = unitFor(msg.engine ?? DEFAULT_ENGINE, msg.voice);
+        if (unit) downloads.get(unit.id)?.abort();
+        return reply(withLocalModelFiles(() => deleteUnit(msg.engine ?? DEFAULT_ENGINE, msg.voice)));
+      }
       case 'clear-all':
-        return reply(clearAll());
+        for (const c of downloads.values()) c.abort();
+        return reply(withLocalModelFiles(() => clearAll()));
       case 'warm': {
         const engine = msg.engine ?? DEFAULT_ENGINE;
         return reply(queue.run(async () => {

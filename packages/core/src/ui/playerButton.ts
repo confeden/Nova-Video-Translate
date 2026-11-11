@@ -97,10 +97,18 @@ function savePos(p: SavedPos): void {
   }
 }
 
+/** the box the overlay moves in: the viewport for <body> / <html> (in a browser's media viewer the body itself collapses to a strip at the top) */
+function boxSize(parent: HTMLElement): { w: number; h: number } {
+  const d = parent.ownerDocument;
+  if (parent === d.body || parent === d.documentElement) return { w: d.documentElement.clientWidth, h: d.documentElement.clientHeight };
+  return { w: parent.clientWidth, h: parent.clientHeight };
+}
+
 /** moves the overlay to (left, top) px inside `parent`, kept fully inside the box */
 function placeOverlay(overlay: HTMLElement, parent: HTMLElement, left: number, top: number): void {
-  const x = Math.min(Math.max(0, left), Math.max(0, parent.clientWidth - OVERLAY_SIZE));
-  const y = Math.min(Math.max(0, top), Math.max(0, parent.clientHeight - OVERLAY_SIZE));
+  const box = boxSize(parent);
+  const x = Math.min(Math.max(0, left), Math.max(0, box.w - OVERLAY_SIZE));
+  const y = Math.min(Math.max(0, top), Math.max(0, box.h - OVERLAY_SIZE));
   overlay.style.left = `${x}px`;
   overlay.style.top = `${y}px`;
   overlay.style.right = 'auto';
@@ -124,7 +132,9 @@ function makeDraggable(overlay: HTMLElement, parent: HTMLElement): void {
   overlay.addEventListener('pointerdown', (e) => {
     if (e.button !== 0) return;
     const start = { x: e.clientX, y: e.clientY };
-    const frame = parent.getBoundingClientRect();
+    const d = parent.ownerDocument;
+    const icb = (parent === d.body || parent === d.documentElement) && getComputedStyle(parent).position === 'static';
+    const frame = icb ? new DOMRect(-(d.defaultView?.scrollX ?? 0), -(d.defaultView?.scrollY ?? 0), 0, 0) : parent.getBoundingClientRect();
     const box = overlay.getBoundingClientRect();
     const origin = { left: box.left - frame.left, top: box.top - frame.top };
     let moved = false;
@@ -145,8 +155,8 @@ function makeDraggable(overlay: HTMLElement, parent: HTMLElement): void {
       justDragged = true;
       setTimeout(() => (justDragged = false), 0);
       savePos({
-        x: (parseFloat(overlay.style.left) || 0) / (parent.clientWidth || 1),
-        y: (parseFloat(overlay.style.top) || 0) / (parent.clientHeight || 1),
+        x: (parseFloat(overlay.style.left) || 0) / (boxSize(parent).w || 1),
+        y: (parseFloat(overlay.style.top) || 0) / (boxSize(parent).h || 1),
       });
     };
     doc.addEventListener('pointermove', onMove);
@@ -262,7 +272,8 @@ export function mountPlayerButton(video: HTMLVideoElement, opts: PlayerButtonOpt
     if (overlay && overlay.parentElement === parent && overlayFb === fallback && btn && btn.parentElement === overlay) return;
     dropOverlay();
     dedupe(parent);
-    if (getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+    // never on <body>/<html>: in a browser's own media viewer the video is absolutely positioned against the viewport and collapses to 0x0 inside a relative <body>
+    if (parent !== doc.body && parent !== doc.documentElement && getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
     const ov = doc.createElement('div');
     ov.className = fallback ? 'nvt-overlay nvt-tw-fb' : 'nvt-overlay';
     overlay = ov;
@@ -293,7 +304,7 @@ export function mountPlayerButton(video: HTMLVideoElement, opts: PlayerButtonOpt
       return;
     }
     const saved = loadPos();
-    if (saved && parent.clientWidth > 0) placeOverlay(ov, parent, saved.x * parent.clientWidth, saved.y * parent.clientHeight);
+    if (saved && boxSize(parent).w > 0) placeOverlay(ov, parent, saved.x * boxSize(parent).w, saved.y * boxSize(parent).h);
     makeDraggable(ov, parent);
     const show = (): void => ov.classList.add('nvt-show');
     const hide = (): void => ov.classList.remove('nvt-show');

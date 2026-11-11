@@ -3,6 +3,7 @@ import { Ducker } from '../ducking';
 import type { DubSegment } from '../providers/types';
 import { timeStretch, STRETCH_MAX } from '../audio/timeStretch';
 import { decodeDubAudio } from './decode';
+import { levelDecodedSpeech } from '../providers/cascade/loudness';
 
 /** A segment may carry a TTS speed hint; DubSegment itself does not declare it. */
 /** a dub shorter than this share of its slot is reported as sped up (defect diagnostics) */
@@ -172,7 +173,16 @@ const VIDEO_EVENTS = ['play', 'playing', 'pause', 'waiting', 'seeking', 'seeked'
  * Plays dub segments on the AudioContext clock, driven by video.currentTime (invariant I3), not by
  * event order. Only reads the video (never writes currentTime/muted; D14); ducks via Ducker.
  */
+const sentenceKey = (t: string | undefined): string => (t ?? '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+/** two translated texts that are the same sentence (>= 10 characters, so "da" twice in a row stays) */
+function sameSentence(a: string | undefined, b: string | undefined): boolean {
+  const x = sentenceKey(a);
+  return x.length >= 10 && x === sentenceKey(b);
+}
+
 export class DubScheduler {
+  private readonly prepared = new WeakMap<DubSegment, Entry>();
+  private readonly decodeTasks = new WeakMap<Entry, Promise<void>>();
   onStarve?: (atVideoTime: number) => void;
 
   private readonly video: HTMLVideoElement;
@@ -320,11 +330,37 @@ export class DubScheduler {
   addSegments(segments: DubSegment[]): void {
     if (this.disposed) return;
     for (const seg of segments) {
-      const entry: Entry = { seg, rate: Math.max(0.25, (seg as SchedSegment).rate ?? 1) };
+      // Re-requested/cached cells must not restart a sentence already heard.
+      // Keep its original entry (and playback position), including after it ended.
+      const heard = this.entries.some((old) => {
+        const item = this.items.get(old);
+        const started = old.played || (!!item?.source && this.ctx.currentTime >= item.ctxStart);
+        if (!started) return false;
+        const close = Math.abs(old.seg.start - seg.start) < 0.05 && Math.abs(old.seg.end - seg.end) < 0.05;
+        return close || (sameSentence(old.seg.text, seg.text) && Math.max(old.seg.start, seg.start) - Math.min(old.seg.end, seg.end) <= 3);
+      });
+      if (heard) {
+        diag.log('sched-heard-skip', { start: seg.start, end: seg.end });
+        continue;
+      }
+      // another voice (tier) already speaks this stretch: the first one stays, the late one is not played over it (Yandex + local saying one phrase twice)
+      const spoken = this.entries.some((old) => {
+        if (!old.seg.providerId || !seg.providerId || old.seg.providerId === seg.providerId) return false;
+        const ov = Math.min(old.seg.end, seg.end) - Math.max(old.seg.start, seg.start);
+        return ov >= 0.25 * Math.max(Math.min(old.seg.end - old.seg.start, seg.end - seg.start), 1e-6) && ov > 0.2;
+      });
+      if (spoken) {
+        diag.log('sched-cross-tier-skip', { start: seg.start, end: seg.end, tier: seg.providerId });
+        continue;
+      }
+      const entry: Entry = this.prepared.get(seg) ?? { seg, rate: Math.max(0.25, (seg as SchedSegment).rate ?? 1) };
+      this.prepared.delete(seg);
       this.entries = this.entries.filter((old) => {
         const overlap = Math.min(old.seg.end, seg.end) - Math.max(old.seg.start, seg.start);
         const shorter = Math.min(old.seg.end - old.seg.start, seg.end - seg.start);
-        const dup = overlap > 0 && overlap >= 0.5 * Math.max(shorter, 1e-6);
+        // the same sentence twice (overlapping chunks, a re-asked cell with shifted times) is voiced once: equal text within 3 s
+        const sameText = sameSentence(old.seg.text, seg.text) && Math.max(old.seg.start, seg.start) - Math.min(old.seg.end, seg.end) <= 3;
+        const dup = (overlap > 0 && overlap >= 0.5 * Math.max(shorter, 1e-6)) || sameText;
         if (dup) {
           const item = this.items.get(old);
           if (item) {
@@ -339,6 +375,33 @@ export class DubScheduler {
     this.entries.sort((a, b) => a.seg.start - b.seg.start);
     diag.log('sched-add', { n: segments.length, first: segments[0]?.start, last: segments.at(-1)?.end, vt: this.video.currentTime, total: this.entries.length });
     this.plan();
+  }
+
+  /** Decode a replacement before its local bridge is removed; keep that bridge if the cloud can no longer join. */
+  async prepareUpgrade(segments: DubSegment[], atVideoTime?: number | (() => number)): Promise<boolean> {
+    if (this.disposed || segments.length === 0) return false;
+    const entries = segments.map((seg) => {
+      let entry = this.entries.find((candidate) => candidate.seg === seg) ?? this.prepared.get(seg);
+      if (!entry) {
+        entry = { seg, rate: Math.max(0.25, (seg as SchedSegment).rate ?? 1) };
+        this.prepared.set(seg, entry);
+      }
+      return entry;
+    });
+    await Promise.all(entries.map((entry) => entry.buffer ? Promise.resolve() : this.decode(entry)));
+    if (this.disposed) return false;
+    const vt = typeof atVideoTime === 'function' ? atVideoTime() : atVideoTime ?? this.video.currentTime;
+    if (!Number.isFinite(vt)) return false;
+    const ready = entries.every((entry) => {
+      if (!entry.buffer || entry.failed || entry.silent) return false;
+      if (vt >= this.se(entry)) return true; // a completed cell can still be upgraded for rewinds
+      const late = Math.max(0, vt - this.ss(entry));
+      if (this.isPerPhrase(entry)) return late <= this.maxSlip;
+      const offset = late * entry.rate;
+      return offset < MID_START_MAX * entry.buffer.duration || entry.buffer.duration - offset >= this.lateTail;
+    });
+    if (!ready) diag.log('sched-upgrade-unready', { first: segments[0]?.start, vt });
+    return ready;
   }
 
   /**
@@ -882,11 +945,12 @@ export class DubScheduler {
     return { entry, skipped: true, ctxStart: 0, anchorV: 0, offset0: 0, endV: 0 };
   }
 
-  private decode(entry: Entry): void {
-    if (entry.decoding) return;
+  private decode(entry: Entry): Promise<void> {
+    const pending = this.decodeTasks.get(entry);
+    if (pending) return pending;
     entry.decoding = true;
     const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
-    decodeDubAudio(this.ctx, entry.seg.audio).then(
+    const task = decodeDubAudio(this.ctx, entry.seg.audio).then(
       (buffer) => {
         entry.decoding = false;
         entry.buffer = buffer;
@@ -938,6 +1002,10 @@ export class DubScheduler {
         if (!this.disposed) this.plan();
       },
     );
+    this.decodeTasks.set(entry, task);
+    const clear = (): void => { this.decodeTasks.delete(entry); };
+    void task.then(clear, clear);
+    return task;
   }
 
   /** peak / silence / voiced ranges of a decoded buffer (skipped when the buffer exposes no samples) */
@@ -950,7 +1018,7 @@ export class DubScheduler {
     }
     if (!data || data.length === 0) return;
     const frame = Math.max(1, Math.round(buffer.sampleRate * VOICE_FRAME_SEC));
-    if (entry.seg.audio?.kind === 'encoded') {
+    if (entry.seg.audio?.kind === 'encoded' && !entry.seg.audio.cleanSpeech) {
       // 0.3.6: quiet-part noise (owner: long fading hiss in Yandex live dubs). Measured first, then the gate runs on it.
       const n = noiseFloor(data, frame);
       entry.floorDb = n.floorDb;
@@ -973,6 +1041,8 @@ export class DubScheduler {
         entry.gated = true;
       }
     }
+    const channels = Array.from({ length: buffer.numberOfChannels }, (_, c) => buffer.getChannelData(c));
+    levelDecodedSpeech(channels, buffer.sampleRate);
     const rmsList: number[] = [];
     let peak = 0;
     let clipped = 0;

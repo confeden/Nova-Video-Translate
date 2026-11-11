@@ -51,6 +51,8 @@ export default defineConfig({
     content_security_policy: { extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'" },
     host_permissions: [
       'https://api.browser.yandex.ru/*',
+      // local video opened from disk (needs "Allow access to file URLs"): the service worker reads it with Range requests
+      'file:///*',
       'https://*.mds.yandex.net/*',
       'https://oauth.yandex.ru/*',
       'https://login.yandex.ru/*',

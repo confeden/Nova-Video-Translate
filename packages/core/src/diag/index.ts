@@ -21,6 +21,13 @@ const entries: DiagEntry[] = [];
 const sent = new WeakSet<DiagEntry>();
 let t0 = 0;
 const SECRET = /(key|token|authorization|secret|password|cookie|code_verifier)/i;
+function redact(value: unknown, depth = 0): unknown {
+  if (typeof value === 'string') return value.replace(/([?&#][^\s]*)/g, '[query]').replace(/AIza[\w-]{20,}|gsk_[\w-]{10,}|Bearer\s+\S+/g, '[hidden]').slice(0, 200);
+  if (depth >= 4) return '[nested]';
+  if (Array.isArray(value)) return value.slice(0, 50).map((v) => redact(v, depth + 1));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, SECRET.test(k) ? '[hidden]' : redact(v, depth + 1)]));
+  return value;
+}
 
 function clean(data?: Record<string, unknown>): Record<string, unknown> | undefined {
   if (!data) return undefined;
@@ -29,12 +36,12 @@ function clean(data?: Record<string, unknown>): Record<string, unknown> | undefi
     if (SECRET.test(k)) {
       out[k] = '[hidden]';
     } else if (typeof v === 'string') {
-      out[k] = v.length > 200 ? `${v.slice(0, 200)}…` : v.replace(/([?&#][^\s]*)/g, '[query]');
+      out[k] = redact(v);
     } else if (typeof v === 'number' || typeof v === 'boolean' || v == null) {
       out[k] = typeof v === 'number' ? Math.round(v * 1000) / 1000 : v;
     } else {
       try {
-        const s = JSON.stringify(v);
+        const s = JSON.stringify(redact(v));
         out[k] = s.length > 300 ? `${s.slice(0, 300)}…` : JSON.parse(s);
       } catch {
         out[k] = String(v).slice(0, 100);

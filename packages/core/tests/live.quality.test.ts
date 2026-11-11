@@ -182,25 +182,27 @@ describe('engine: quality live mode', () => {
     engine.stop();
   });
 
-  it('the local dub is delivered at once; a Yandex dub slower than the slot is kept out of the scheduler (no replacement)', async () => {
+  it.each([99, 101])('switches the local bridge to Yandex immediately at %s s and keeps uncovered local speech', async (ct) => {
     const { engine, e, local, yandex, sched, video, cap } = await setup();
     const d = deferred();
     yandex.script = [() => d.p];
+    local.script = [async () => ({ segments: [seg(100, 101.5), seg(102, 103)], sourceLang: 'en' })];
     cap().emit(chunk(100));
     await flush(30);
     expect(local.calls).toHaveLength(1);
     expect(yandex.calls).toHaveLength(1);
     expect(e.cellProvider.get(100)).toBe('local');
     const s = sched[0]!;
-    const before = s.added.length;
-    expect(before).toBeGreaterThan(0);
-    // the slot (100 + 1 s lag) is 2 s away when Yandex finally answers
-    video.play(99);
-    d.ok({ segments: [seg(100, 108)], sourceLang: 'en' });
+    expect(s.added).toHaveLength(2);
+    // Replace the imminent or playing local sentence, while retaining the local-only sentence in the cloud's gap.
+    video.play(ct);
+    d.ok({ segments: [seg(100, 101.5)], sourceLang: 'en' });
     await flush(30);
-    expect(e.cellProvider.get(100)).toBe('local');
-    expect(s.removed).toHaveLength(0);
-    expect(s.added).toHaveLength(before);
+    expect(e.cellProvider.get(100)).toBe('yandex');
+    expect(e.pendingSwaps.size).toBe(0);
+    expect(s.removed.some((r) => r.n === 2 && r.opts?.reason === 'tier-upgrade' && r.opts.fadeSec! > 0)).toBe(true);
+    expect(s.added.map((x) => [x.start, x.end, x.providerId])).toEqual([[100, 101.5, 'yandex'], [102, 103, 'local']]);
+    expect(ev('tier-upgrade')[0]!.data).toMatchObject({ cell: 100, from: 'local', to: 'yandex', mode: 'upgrade' });
     expect(ev('yandex-live-lat')).toHaveLength(1);
     expect(ev('yandex-live-lat')[0]!.data).toMatchObject({ tier: 'yandex', cells: 1, audioSec: 4, ok: true, late: true });
     engine.stop();

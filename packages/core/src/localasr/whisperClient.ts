@@ -120,7 +120,13 @@ export function createWhisperAsr(transport: LasrTransport = chromeLasrTransport(
     async transcribe(pcm16k: Int16Array, opts: LocalAsrOptions = {}): Promise<LocalAsrResult> {
       if (opts.signal?.aborted) throw abortError();
       const set = await refresh();
-      const model: WhisperModelId | undefined = pickWhisperModel(getModel(), opts.lang, set, gpuReady);
+      let model: WhisperModelId | undefined = pickWhisperModel(getModel(), opts.lang, set, gpuReady);
+      // source language unknown (a local file, a plain page) and only English-only checkpoints downloaded: assume English instead of
+      // staying silent (the common case); a foreign source then gets a poor transcript, which `unknown-lang-en` in the diag explains
+      if (!model && !baseLang(opts.lang)) {
+        model = pickWhisperModel(getModel(), 'en', set, gpuReady);
+        if (model) diag.log('unknown-lang-en', { model });
+      }
       if (!model) {
         localReasons.set('no-model', reasonText.noModel(baseLang(opts.lang)));
         diag.log('local-reason', { why: 'no-model', lang: baseLang(opts.lang) ?? '?', ready: set.size });

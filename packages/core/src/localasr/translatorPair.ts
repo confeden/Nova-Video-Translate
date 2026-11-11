@@ -8,11 +8,19 @@ import type { ChromeAiEnv } from '../subtitles/chromeAi';
 export type PairAvailability = 'available' | 'downloadable' | 'downloading' | 'unavailable' | 'absent';
 
 const envOf = (): ChromeAiEnv => globalThis as unknown as ChromeAiEnv;
+// Keep a successfully created translator alive: some Chrome builds still report
+// "downloadable" after create() has resolved. Scope this proof to the API object.
+const readyPairs = new WeakMap<object, Map<string, { destroy?: () => void }>>();
 
 export async function pairAvailability(src: string, tgt = 'ru', e: ChromeAiEnv = envOf()): Promise<PairAvailability> {
   if (!e.Translator) return 'absent';
   try {
     const a = await e.Translator.availability({ sourceLanguage: src, targetLanguage: tgt });
+    if (a === 'downloadable' && readyPairs.get(e.Translator)?.has(`${src}>${tgt}`)) return 'available';
+    if (a === 'unavailable') {
+      readyPairs.get(e.Translator)?.get(`${src}>${tgt}`)?.destroy?.();
+      readyPairs.get(e.Translator)?.delete(`${src}>${tgt}`);
+    }
     return a === 'available' || a === 'downloadable' || a === 'downloading' ? a : 'unavailable';
   } catch {
     return 'unavailable';
@@ -30,7 +38,7 @@ export const PAIR_TEXT: Record<PairAvailability, string> = {
 
 /**
  * Creates the Translator (which downloads the pack) and reports 0..1 progress. Call from a click. Resolves when the pack is
- * usable; throws with the browser's message otherwise. The created translator is destroyed (the pack stays in the browser).
+ * usable; throws with the browser's message otherwise. Retained until this document closes or the pair becomes unavailable.
  */
 export async function downloadPair(src: string, tgt: string, onProgress?: (fraction: number) => void, e: ChromeAiEnv = envOf()): Promise<void> {
   if (!e.Translator) throw new Error('Translator API отсутствует');
@@ -42,5 +50,8 @@ export async function downloadPair(src: string, tgt: string, onProgress?: (fract
     },
   });
   onProgress?.(1);
-  t.destroy?.();
+  let pairs = readyPairs.get(e.Translator);
+  if (!pairs) readyPairs.set(e.Translator, (pairs = new Map()));
+  pairs.get(`${src}>${tgt}`)?.destroy?.();
+  pairs.set(`${src}>${tgt}`, t);
 }

@@ -19,7 +19,8 @@ export function seg(start: number, end = start + 1): DubSegment {
 }
 
 export function settings(over: Partial<Settings> = {}): Settings {
-  return { ...DEFAULT_SETTINGS, voiceEnabled: { ...DEFAULT_SETTINGS.voiceEnabled, gemini: true }, ...over };
+  // order pinned: these tests were written for yandex-live > yandex > local > groq > gemini, independent of the product default
+  return { ...DEFAULT_SETTINGS, voiceOrder: ['yandex-live', 'yandex', 'local', 'groq', 'gemini'], voiceEnabled: { ...DEFAULT_SETTINGS.voiceEnabled, gemini: true }, ...over };
 }
 
 export type Script = Array<ChunkResult | Error | 'hang' | (() => Promise<ChunkResult>)>;

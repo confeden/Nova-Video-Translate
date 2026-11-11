@@ -1,4 +1,7 @@
 import { diag } from '../../diag';
+import { cleanSpeechText, isNonSpeech, isRussianSpeech, matchIntonation } from '../../lang/speechText';
+import { dropWeakSegments } from '../../localasr/asrText';
+import { vadBursts } from '../../localasr/vad';
 import type { AudioChunk } from '../types';
 import { ProviderUnavailableError } from '../types';
 import { responseText, type GeminiClient } from './client';
@@ -120,6 +123,8 @@ export function buildPrompt(durationSec: number, sourceLangHint?: string): strin
     'You are a dubbing translator. The attached audio is a fragment of a video, ' +
       `${durationSec.toFixed(1)} seconds long.`,
     sourceLangHint ? `The source language is probably "${sourceLangHint}" (verify it).` : '',
+    'Transcribe ONLY words that are clearly audible in this audio. Never invent, complete, guess or repeat a phrase, and never add a sign-off, ' +
+      'a greeting or a remark about what comes next ("see you in the next episode"). When a stretch is music, noise, silence or unintelligible, leave it out: an empty result is correct.',
     '1. Detect the spoken language and return its ISO 639-1 code in "source_lang".',
     '2. Split the speech into sentence-level segments. "start" and "end" are seconds relative to the ' +
       'start of this audio fragment. "src" is the exact transcription.',
@@ -134,7 +139,10 @@ export function buildPrompt(durationSec: number, sourceLangHint?: string): strin
     '5. "speaker" is a short stable id of the person speaking ("S1", "S2", ...), the same id for the same voice throughout this fragment. ' +
       '"gender" is judged from the voice timbre: "male", "female", "child" or "unknown" when unsure.',
     '6. If the speech is already Russian, return source_lang "ru" and an empty string for every "ru".',
+    '6b. Keep the intonation in "ru": a question stays a question ("?"), an exclamation stays an exclamation ("!"), trailing off stays "…". ' +
+      'Never transcribe or translate non-speech sounds (music, applause, laughter, noise): leave them out.',
     '7. If there is no speech (silence, music, noise only), return an empty segments array and source_lang "und".',
+    '8. Never describe the soundtrack, instruments, tempo, mood or vocal timbre. For songs, transcribe and translate only clearly audible lyrics, never descriptions such as "instrumental music plays". Omit Russian sentences even inside otherwise foreign speech.',
     'Return only JSON matching the schema.',
   ]
     .filter(Boolean)
@@ -246,7 +254,7 @@ export async function translateChunkAudio(
     generationConfig: {
       responseMimeType: 'application/json',
       responseSchema: RESPONSE_SCHEMA,
-      temperature: 0.3,
+      temperature: 0.1,
     },
   };
   let res: Awaited<ReturnType<GeminiClient['generateContent']>> | undefined;
@@ -285,8 +293,23 @@ export async function translateChunkAudio(
     return r;
   };
   if (parsed.sourceLang.startsWith('ru')) return done({ sourceLang: 'ru', segments: [], reason: 'ru', rawSegments: parsed.segments.length });
-  const usable = parsed.segments.filter((s) => s.ru.length > 0 && s.end > s.start);
-  const merged = mergeShortSegments(usable);
+  const speech = parsed.segments.filter((s) => !isNonSpeech(s.src));
+  if (speech.length > 0 && speech.every((s) => isRussianSpeech(s.src))) return done({ sourceLang: 'ru', segments: [], reason: 'ru', rawSegments: parsed.segments.length });
+  // technical captions (music, applause) are not voiced; the translation keeps the original's question / exclamation
+  const usable = parsed.segments
+    .map((s) => ({ ...s, src: cleanSpeechText(s.src), ru: cleanSpeechText(s.ru) }))
+    .filter((s) => s.ru.length > 0 && s.end > s.start && !isNonSpeech(s.src) && !isNonSpeech(s.ru) && !isRussianSpeech(s.src))
+    .map((s) => ({ ...s, ru: matchIntonation(s.src, s.ru) }));
+  // a short phrase over silence / a music bed is the model's invention: it is checked against the voice activity of the audio itself
+  let heard = usable;
+  try {
+    const keep = new Set(dropWeakSegments(usable.map((s, i) => ({ start: s.start, end: s.end, text: s.src, i })), vadBursts(pcm, TARGET_RATE).bursts).map((x) => x.i));
+    heard = usable.filter((_, i) => keep.has(i));
+  } catch {
+    heard = usable;
+  }
+  if (heard.length < usable.length) diag.log('gemini-weak-drop', { dropped: usable.length - heard.length, texts: usable.filter((u) => !heard.includes(u)).map((u) => u.src.slice(0, 40)) });
+  const merged = mergeShortSegments(heard);
   // 'und' = the model's "no speech" marker: not a language the rest of the system should see
   const lang = parsed.sourceLang === 'und' || parsed.sourceLang === 'none' ? '' : parsed.sourceLang;
   const reason = merged.length > 0 ? undefined : parsed.segments.length === 0 ? 'no-speech' : 'empty-ru';

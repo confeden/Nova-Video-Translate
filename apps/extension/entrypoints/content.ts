@@ -1,7 +1,8 @@
-import { censoredInRange, devAudio, CaptionPretranslator, ChromePromptAudioAsr, ChromeTextTranslator, GroqAsr, GroqChatTranslator, LiveGemini, YoutubeCaptionTimeline, createCaptionsBridgeClient, createGroqProvider, createLocalProvider, createPageRuntime, createRemoteCache, createWhisperAsr, createYandexProviders, diag, localAsrRegistry, localTtsRegistry, type CacheMessage, type CacheReply, type DubProvider, type FullTrackProber, type VoiceReport } from '@nvt/core';
+import { devAudio, createCaptionsBridgeClient, createPageProviders, createPageRuntime, createRemoteCache, type CacheMessage, type CacheReply, type FullTrackProber, type VoiceReport } from '@nvt/core';
 import { browser } from 'wxt/browser';
 import { createSwTransport, transportFetch } from '../utils/swTransport';
 import { NVT_DEVLOG } from '../utils/version';
+import { startDevLog } from '../utils/devlog';
 import { VOICE_STATUS_KEY, YANDEX_AUTH_KEY, YANDEX_LOGIN_ERROR_KEY, loadSettings, onSettingsChanged } from '../utils/settings';
 import { createBaseHost } from '../utils/panelHost';
 import { registerExtensionLocalTts } from '../utils/localtts/engine';
@@ -31,17 +32,7 @@ export default defineContentScript({
     let fullTrack: FullTrackProber | undefined;
     // platform captions for the caption shortcut of the groq/local tiers (YouTube only; reset when the video changes)
     const reader = createCaptionsBridgeClient();
-    const timeline = new YoutubeCaptionTimeline({ reader });
-    let timelineVid = '';
-    const youtubeCaptions = () => {
-      if (!/(^|\.)youtube\.com$/.test(location.hostname)) return undefined;
-      const vid = new URLSearchParams(location.search).get('v') ?? location.pathname;
-      if (vid !== timelineVid) {
-        timelineVid = vid;
-        timeline.reset();
-      }
-      return timeline;
-    };
+    let censored: ((start: number, duration: number) => boolean) | undefined;
     const runtime = createPageRuntime({
       loadSettings,
       reportVoice,
@@ -53,30 +44,13 @@ export default defineContentScript({
       fullTrack: () => fullTrack,
       captions: () => reader,
       // 0.3.6: a cell whose platform captions carry a bleeped word is voiced without Yandex when another tier can (engine censor skip)
-      censored: (startSec, durSec) => {
-        const p = youtubeCaptions()?.peek();
-        return !!p && censoredInRange(p.sentences, startSec, durSec);
-      },
+      censored: (start, duration) => censored?.(start, duration) ?? false,
       createProviders(getSettings) {
         const transport = createSwTransport();
-        const y = createYandexProviders(transport, { getToken: () => getSettings().yandexToken });
-        fullTrack = y.fullTrack;
-        // D30 local tiers: engines register once per page; the Supertonic engine talks to the service worker / offscreen document
-        const tts = registerExtensionLocalTts(getSettings);
-        localAsrRegistry.register(createWhisperAsr(undefined, () => getSettings().localAsrModel)); // first in DEFAULT_LOCAL_ASR_ORDER; unavailable until the user downloads a model
-        localAsrRegistry.register(new ChromePromptAudioAsr());
-        const chrome = new ChromeTextTranslator();
-        // one batch store for both tiers: the caption track is translated 50 sentences per request, ahead of the playhead
-        let groqChat: GroqChatTranslator | undefined;
-        const translators = () => (groqChat ? [chrome, groqChat] : [chrome]); // GroqChatTranslator.isAvailable() is false without a key
-        const pretranslate = new CaptionPretranslator({ translators, tier: 'groq' });
-        const groq = createGroqProvider({ transport, getSettings, captions: youtubeCaptions, pretranslate });
-        groqChat = new GroqChatTranslator(groq.client, groq.models);
-        const local = createLocalProvider({ captions: youtubeCaptions, translators, pretranslate, getSourceLang: () => getSettings().sourceLang, liveAsr: { groq: new GroqAsr(groq.client, groq.models), hasKey: () => groq.client.hasKey(), mode: () => getSettings().liveAsr } });
-        // load the model + compile the shaders as soon as a local tier is in play and the model is already downloaded (no-op otherwise)
-        const s = getSettings();
-        if (s.voiceEnabled.groq !== false || s.voiceEnabled.local !== false) void tts.warmUp();
-        return [y.yandexLive, y.yandex, groq, local, new LiveGemini(getSettings, transportFetch(transport))] satisfies DubProvider[];
+        const chain = createPageProviders({ transport, getSettings, reader, localTts: registerExtensionLocalTts(getSettings) });
+        fullTrack = chain.fullTrack;
+        censored = chain.censored;
+        return chain.providers;
       },
     });
     // verification hook (isolated world): engine events without keys or audio
@@ -96,10 +70,10 @@ export default defineContentScript({
         for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
         void browser.runtime.sendMessage({ type: 'nvt-audio-push', name, sampleRate, pcm16: btoa(bin) }).catch(() => {});
       };
-      setInterval(() => {
-        const entries = diag.drainUnsent();
-        if (entries.length > 0) void browser.runtime.sendMessage({ type: 'nvt-diag-push', page: location.hostname, entries }).catch(() => {});
-      }, 3000);
+      startDevLog(location.hostname, async (entries) => {
+        const reply = await browser.runtime.sendMessage({ type: 'nvt-diag-push', page: location.hostname, entries });
+        return reply?.ok === true;
+      });
     }
 
     // the Yandex login finishes in another tab: redraw an open in-page panel

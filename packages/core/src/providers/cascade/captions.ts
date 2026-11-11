@@ -5,6 +5,7 @@
  * and at ~20 words; fragments < 4 words are merged into a neighbour.
  */
 import { diag } from '../../diag';
+import { cleanSpeechText, maskSoundTags, musicContextAt } from '../../lang/speechText';
 import type { SubtitleCue } from '../types';
 import type { CaptionInfo, CaptionsReader } from '../../subtitles/captionsBridge';
 import { pickTrack } from '../../subtitles/captionsSource';
@@ -19,7 +20,7 @@ interface Word {
 }
 
 const SENTENCE_END = /[.!?…。！？]["')\]»”]*$/;
-const NOISE = /^\[[^\]]*\]$|^\([^)]*\)$|^♪+$|^>>+$|^-+$/;
+const NOISE = /^>>+$|^-+$/;
 const MIN_FRAGMENT_WORDS = 4;
 
 interface Json3Event {
@@ -43,21 +44,29 @@ export function wordsFromJson3(input: string | unknown): Word[] {
   }
   const events = (o as { events?: Json3Event[] } | undefined)?.events;
   if (!Array.isArray(events)) return [];
+  const spans = events.map((e) => ({ start: (e.tStartMs ?? NaN) / 1000, end: ((e.tStartMs ?? NaN) + (e.dDurationMs ?? 0)) / 1000, text: Array.isArray(e.segs) ? e.segs.map((s) => s.utf8 ?? '').join('') : '' }));
   const words: Word[] = [];
-  for (const ev of events) {
+  for (let index = 0; index < events.length; index++) {
+    const ev = events[index]!;
     if (typeof ev.tStartMs !== 'number' || !Array.isArray(ev.segs)) continue;
+    const fullText = cleanSpeechText(spans[index]!.text, musicContextAt(spans, index));
+    if (!fullText) continue;
     const evStart = ev.tStartMs / 1000;
     const evEnd = evStart + (ev.dDurationMs ?? 0) / 1000;
     const timed = ev.segs.some((s) => typeof s.tOffsetMs === 'number' && s.tOffsetMs > 0);
     const parts: { start: number; text: string }[] = [];
     if (timed) {
+      const masked = maskSoundTags(spans[index]!.text);
+      let offset = 0;
       for (const s of ev.segs) {
-        const t = (s.utf8 ?? '').replace(/\s+/g, ' ').trim();
+        const length = (s.utf8 ?? '').length;
+        const t = cleanSpeechText(masked.slice(offset, offset + length));
+        offset += length;
         if (t) parts.push({ start: evStart + (s.tOffsetMs ?? 0) / 1000, text: t });
       }
     } else {
       // manual caption line: spread its words evenly over the event
-      const toks = ev.segs.map((s) => s.utf8 ?? '').join('').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+      const toks = fullText.split(' ').filter(Boolean);
       const dur = Math.max(0, evEnd - evStart);
       toks.forEach((t, i) => parts.push({ start: evStart + (dur * i) / toks.length, text: t }));
     }

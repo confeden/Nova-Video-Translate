@@ -13,6 +13,22 @@ describe('stripNonSpeech', () => {
     expect(stripNonSpeech('*sighs* Just a minute.')).toBe('Just a minute.');
     expect(stripNonSpeech('Just a minute.')).toBe('Just a minute.');
   });
+  it('rejects repeated filler marked as music without blacklisting heat or real lyrics', () => {
+    expect(stripNonSpeech('[music] Oh, heat, heat. >> [music]')).toBe('');
+    expect(stripNonSpeech('[Music] Heat heat heat.')).toBe('');
+    expect(stripNonSpeech('(music) Oh, oh.')).toBe('');
+    expect(stripNonSpeech('Heat the pan before adding oil.')).toBe('Heat the pan before adding oil.');
+    expect(stripNonSpeech('[music] Take me home, country roads [music]')).toBe('Take me home, country roads');
+    expect(stripNonSpeech('[Music] Wait! That is too hot.')).toBe('Wait! That is too hot.');
+    expect(stripNonSpeech('>> Welcome [music] to the show.')).toBe('Welcome to the show.');
+    expect(stripNonSpeech('What the [ __ ] is that?')).toBe('What the [ __ ] is that?');
+    expect(stripNonSpeech('Use (optional) settings and [advanced] controls.')).toBe('Use (optional) settings and [advanced] controls.');
+    expect(stripNonSpeech('Read (the next paragraph) aloud.')).toBe('Read (the next paragraph) aloud.');
+    expect(stripNonSpeech('query')).toBe('query');
+    expect(stripNonSpeech('\t Heat \n the  pan , then stir. \t')).toBe('Heat the pan, then stir.');
+    for (const text of ['(music fades out)', '(suspenseful music playing softly)', '(музыка постепенно затихает)', '(тревожная музыка нарастает)']) expect(stripNonSpeech(text), text).toBe('');
+    expect(stripNonSpeech('We talk about music (and discuss the lyrics).')).toBe('We talk about music (and discuss the lyrics).');
+  });
 });
 
 describe('overlap de-duplication', () => {

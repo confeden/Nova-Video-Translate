@@ -39,7 +39,23 @@ export const isRetriableStatus = (s: number): boolean => s === 408 || s === 425 
 
 const clip = (s: string): string => (s.length > ERROR_TEXT_MAX ? s.slice(0, ERROR_TEXT_MAX - 1) + '…' : s);
 
+/**
+ * A source that does not connect (no response headers within this time, or a network error) is skipped at once for DOWN_MS:
+ * the S3 mirror is unreachable from some networks and huggingface.co from others, and waiting out four timeouts per file
+ * made every download look dead. The last source also has a deadline, so a dead host cannot leave the UI busy forever.
+ */
+export const CONNECT_TIMEOUT_MS = 8000;
+export const SOURCE_DOWN_MS = 10 * 60 * 1000;
+/** hosts that failed to connect, until when (shared by every download in this document) */
+const hostDownUntil = new Map<string, number>();
+
 export interface ResilientFetchOptions {
+  connectTimeoutMs?: number;
+  streamTimeoutMs?: number;
+  maxResumes?: number;
+  /** clock and health memory (tests inject their own) */
+  now?: () => number;
+  health?: Map<string, number>;
   mirrorBase?: string;
   backoffMs?: readonly number[];
   sleep?: (ms: number) => Promise<void>;
@@ -59,7 +75,7 @@ class SourceError extends Error {
 /**
  * Wraps fetch for transformers.js: pinned HF model URLs go mirror-first with HF fallback, 3 attempts per source (1/3/8 s
  * backoff) and, after a stream breaks mid-file, an HTTP Range resume from the received offset (also across sources: the files
- * are byte-identical). Other URLs pass through. When every source fails the error names the file and the last status/reason.
+ * are byte-identical). Direct URLs use the same deadlines and bounded stream retries. When every source fails the error names the file and the last status/reason.
  * A 404 from every source is returned as the last 404 response (transformers.js treats optional files that way).
  */
 export function createResilientFetch(base: typeof fetch, opt: ResilientFetchOptions = {}): typeof fetch {
@@ -68,10 +84,17 @@ export function createResilientFetch(base: typeof fetch, opt: ResilientFetchOpti
 
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    const sources = modelSourceUrls(url, opt.mirrorBase);
+    const all = modelSourceUrls(url, opt.mirrorBase) ?? [url];
     const file = parseHfModelUrl(url)?.file ?? url;
-    if (!sources) return base(input, init);
     const signal = init?.signal ?? undefined;
+    const health = opt.health ?? hostDownUntil;
+    const now = opt.now ?? Date.now;
+    const connectMs = opt.connectTimeoutMs ?? CONNECT_TIMEOUT_MS;
+    // a caller that resumes by itself (the TTS downloader) asks for `bytes=N-`: N is the base offset of every request below
+    const callerStart = Number(/^bytes=(\d+)-/.exec(new Headers(init?.headers).get('range') ?? '')?.[1] ?? 0);
+    // sources that connected recently first-class, the ones that did not connect are tried only when nothing else is left
+    const live = all.filter((u) => (health.get(new URL(u).host) ?? 0) <= now());
+    const sources = live.length > 0 ? live : all;
 
     /** opens `offset` of the file from the first source that works; remembers which source index served it */
     let srcIdx = 0;
@@ -81,24 +104,43 @@ export function createResilientFetch(base: typeof fetch, opt: ResilientFetchOpti
       for (let s = srcIdx; s < sources.length; s++) {
         const source = sources[s]!;
         const host = new URL(source).host;
+        const isLast = s === sources.length - 1;
         for (let attempt = 0; attempt <= backoff.length; attempt++) {
           if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+          // A deadline on every source, including direct Silero URLs and the final fallback.
+          const ac = new AbortController();
+          const onAbort = (): void => ac.abort();
+          signal?.addEventListener('abort', onAbort, { once: true });
+          const timer = connectMs > 0 ? setTimeout(() => ac.abort(new Error('connect timeout')), connectMs) : undefined;
           try {
-            const res = await base(source, { signal, headers: offset > 0 ? { Range: `bytes=${offset}-` } : undefined });
-            if (offset > 0 ? res.status === 206 : res.ok) {
+            const abs = callerStart + offset;
+            const headers = new Headers(init?.headers);
+            headers.delete('range');
+            const res = await base(source, { ...init, signal: ac.signal, headers: abs > 0 ? { ...Object.fromEntries(headers), Range: `bytes=${abs}-` } : init?.headers });
+            if (timer) clearTimeout(timer);
+            if (abs > 0 ? res.status === 206 : res.ok) {
               srcIdx = s;
+              health.delete(host);
               return res;
             }
-            if (offset === 0 && res.status === 404) notFound = res;
-            if (offset > 0 && res.status === 200) throw new SourceError(`HTTP 200 to a Range request (${host})`);
+            if (abs === 0 && res.status === 404) notFound = res;
+            if (abs > 0 && res.status === 200) throw new SourceError(`HTTP 200 to a Range request (${host})`);
             throw new SourceError(`HTTP ${res.status} ${host}`, res.status);
           } catch (e) {
-            if ((e as Error)?.name === 'AbortError') throw e;
+            if (timer) clearTimeout(timer);
+            if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
             const err = e instanceof SourceError ? e : new SourceError(`${(e as Error)?.message ?? e} (${host})`);
             last = err;
             opt.onRetry?.({ file, source: host, attempt: attempt + 1, error: err.message });
             if (err.status !== undefined && !isRetriableStatus(err.status)) break;
+            // no answer at all (timeout / network): this host is skipped for a while, the next source is tried without any retry here
+            if (err.status === undefined && !isLast) {
+              health.set(host, now() + SOURCE_DOWN_MS);
+              break;
+            }
             if (attempt < backoff.length) await sleep(backoff[attempt]!);
+          } finally {
+            signal?.removeEventListener('abort', onAbort);
           }
         }
       }
@@ -110,12 +152,29 @@ export function createResilientFetch(base: typeof fetch, opt: ResilientFetchOpti
     if (!first.ok || !first.body) return first; // the 404 passthrough
     const total = Number(first.headers.get('content-length') ?? 0);
     let received = 0;
+    let resumes = 0;
     let reader = first.body.getReader();
+    const read = (): Promise<ReadableStreamReadResult<Uint8Array>> => new Promise((resolve, reject) => {
+      const fail = (e: Error): void => {
+        cleanup();
+        reject(e);
+        void reader.cancel(e).catch(() => {});
+      };
+      const onAbort = (): void => fail(new DOMException('aborted', 'AbortError'));
+      const timer = setTimeout(() => fail(new Error('stream timeout')), opt.streamTimeoutMs ?? 20_000);
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+      };
+      if (signal?.aborted) return onAbort();
+      signal?.addEventListener('abort', onAbort, { once: true });
+      void reader.read().then((r) => { cleanup(); resolve(r); }, (e) => { cleanup(); reject(e); });
+    });
     const body = new ReadableStream<Uint8Array>({
       async pull(ctl) {
         for (;;) {
           try {
-            const { done, value } = await reader.read();
+            const { done, value } = await read();
             if (done) {
               if (total && received < total) throw new Error(`short body ${received}/${total}`);
               return ctl.close();
@@ -124,11 +183,16 @@ export function createResilientFetch(base: typeof fetch, opt: ResilientFetchOpti
             return ctl.enqueue(value);
           } catch (e) {
             if (signal?.aborted || (e as Error)?.name === 'AbortError') return ctl.error(e);
+            if (resumes++ >= (opt.maxResumes ?? 3)) return ctl.error(new Error(clip(`${file}: stream retries exhausted: ${(e as Error)?.message ?? e}`)));
+            void reader.cancel(e).catch(() => {});
             // the stream broke: resume from the received offset (the next source after a failed one)
             try {
               opt.onRetry?.({ file, source: new URL(sources[srcIdx]!).host, attempt: 0, error: `stream: ${(e as Error)?.message ?? e}` });
+              if (srcIdx + 1 < sources.length) srcIdx++;
               await sleep(backoff[0] ?? 0);
-              reader = (await open(received)).body!.getReader();
+              const resumed = await open(received);
+              if (!resumed.ok || !resumed.body) throw new Error(`${file}: HTTP ${resumed.status} while resuming`);
+              reader = resumed.body.getReader();
             } catch (e2) {
               return ctl.error(e2);
             }

@@ -30,9 +30,9 @@ export async function oauthCallback(transport: Transport, loc: Location = locati
   const cb = parseOAuthCallback(loc.search, loc.hash);
   if (!cb) return false;
   const p = gmGet(OAUTH_PENDING_KEY) as { verifier: string; state: string; at: number } | null | undefined;
-  gmSet(OAUTH_PENDING_KEY, null);
   if (!p) return loginFailed('Вход не был начат в этом браузере — нажмите «Войти в Яндекс» в настройках ещё раз');
   if (p.state !== cb.state) return loginFailed('Не совпал контрольный код входа (state) — начните вход заново из настроек');
+  gmSet(OAUTH_PENDING_KEY, null);
   if (Date.now() - p.at > TTL_MS) return loginFailed('Вход не завершён за 10 минут — начните заново');
   try {
     const tok = await exchangeCode(cb.code, p.verifier, transport);

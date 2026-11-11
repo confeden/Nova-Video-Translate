@@ -11,7 +11,7 @@ import { OPUS_MIME, webCodecsOpus, type AudioCodec } from './opus';
 import type { CachedChunk, CachedSegment, ResultCache } from './types';
 
 /** v2: entries written by v1 may belong to live streams (DVR-position cells) and must never be read again */
-export const CACHE_KEY_VERSION = 'v2';
+export const CACHE_KEY_VERSION = 'v8';
 
 let liveSkipLogged = false;
 /** tests: re-arm the once-per-session 'cache-skip' diag line */
@@ -22,6 +22,8 @@ export function resetCacheSkipLog(): void {
 export interface CacheInfo {
   /** stable video identity (videoCacheKey); undefined = do not cache (live stream, unknown duration) */
   videoKey(): string | undefined;
+  /** undefined from a supplied reader means the track is unknown: skip caching. */
+  audioTrackId?(): string | undefined | Promise<string | undefined>;
   settings(): Settings;
   /** the video is a live stream RIGHT NOW (re-checked on every get and put: the live flag may arrive after the start) => no read, no write */
   isLive?(): boolean;
@@ -48,6 +50,8 @@ export async function cacheKey(parts: {
   targetLang: string;
   sig: CacheSignature;
   wantSubtitles: boolean;
+  sourceLang?: string;
+  audioTrackId?: string;
 }): Promise<string> {
   const s = parts.sig;
   const raw = [
@@ -57,6 +61,8 @@ export async function cacheKey(parts: {
     parts.chunkSec,
     parts.providerId,
     parts.targetLang,
+    parts.sourceLang || 'auto',
+    parts.audioTrackId || 'default',
     s.translateModel || 'auto',
     s.ttsModel || 'auto',
     s.voice || 'auto',
@@ -93,7 +99,7 @@ export function withCache(inner: DubProvider, cache: ResultCache, info: CacheInf
         (s): DubSegment => ({
           start: s.start,
           end: s.end,
-          audio: { kind: 'encoded', mime: OPUS_MIME, data: s.opus! },
+          audio: { kind: 'encoded', mime: OPUS_MIME, data: s.opus!, cleanSpeech: inner.id === 'local' || inner.id === 'groq' },
           src: s.src,
           text: s.text,
           rate: s.rate,
@@ -164,6 +170,7 @@ export function withCache(inner: DubProvider, cache: ResultCache, info: CacheInf
       while (pending.size > 0) await Promise.all([...pending]);
     },
     async translateChunk(chunk, ctx) {
+      if (ctx.repairGaps) return inner.translateChunk(chunk, ctx);
       let key: string | undefined;
       let el: ReturnType<typeof eligible>;
       try {
@@ -175,7 +182,8 @@ export function withCache(inner: DubProvider, cache: ResultCache, info: CacheInf
           }
           el = undefined;
         }
-        const vk = el ? info.videoKey() : undefined;
+        const audioTrack = el && info.audioTrackId ? await info.audioTrackId() : 'default';
+        const vk = el && audioTrack !== undefined ? info.videoKey() : undefined;
         if (el && vk) {
           let sig: CacheSignature = {};
           try {
@@ -189,6 +197,8 @@ export function withCache(inner: DubProvider, cache: ResultCache, info: CacheInf
             chunkSec: el.chunkSec,
             providerId: inner.id,
             targetLang: ctx.targetLang,
+            sourceLang: el.s.sourceLang && el.s.sourceLang !== 'auto' ? el.s.sourceLang : ctx.sourceLang,
+            audioTrackId: audioTrack,
             sig,
             wantSubtitles: ctx.wantSubtitles,
           });

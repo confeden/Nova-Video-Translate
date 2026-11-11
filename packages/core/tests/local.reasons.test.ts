@@ -152,6 +152,7 @@ describe('Chrome Translator route', () => {
     const progress: number[] = [];
     await downloadPair('da', 'ru', (f) => progress.push(f), env);
     expect(progress).toEqual([0.25, 1, 1]);
+    expect(await pairAvailability('da', 'ru', env)).toBe('available');
     await expect(downloadPair('da', 'ru', undefined, {})).rejects.toThrow();
   });
 });

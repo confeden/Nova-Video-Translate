@@ -1,6 +1,6 @@
 import { isLiveCacheTarget, videoCacheKey, videoKey, withCache, type ResultCache } from '../cache';
 import { createLangStore, detectVideoLanguage } from '../lang';
-import { createCapture, fetchBroadcasterLanguage, isHlsHost, twitchChannelFromPath } from '../capture';
+import { createCapture, fetchBroadcasterLanguage, isHlsHost, localFileUrl, swFileFetch, twitchChannelFromPath } from '../capture';
 import { getBroadcasterLang, hasBroadcasterLookup, localReasons, setBroadcasterLang, twitchLangToIso } from '../localasr';
 import { TranslationEngine, type EngineState, type EngineWarning, type LanguageInfo } from '../pipeline';
 import { GeminiProvider } from '../providers/gemini';
@@ -29,6 +29,7 @@ import { isAutoExcluded, siteVoiceOverride, withSiteOverride } from '../settings
 import { mountPlayerButton, watchVideos, type ButtonState, type PlayerButton } from './playerButton';
 import { openPagePanel, type PagePanelHandle } from './pagePanel';
 import type { SettingsPanelHost } from './settingsPanel';
+import { installLocalFullscreen } from './localFullscreen';
 import { createSubtitleOverlay, SUBS_CSS, type SubtitleOverlay } from './subtitleOverlay';
 import { buildDiagReport, isActiveState, languageStatusText, laterName, providerName, sourceName, type TranslateStatus } from './status';
 
@@ -47,6 +48,21 @@ const TITLES: Record<string, { text: string; toggle?: string }> = {
 };
 
 /** First tooltip line: the state text plus the hint for what a left click REALLY does. */
+/** a Range read of the first bytes of a file:// URL succeeds (access to file URLs is on) */
+async function canReadFile(f: ReturnType<typeof transportFetch>, url: string): Promise<boolean> {
+  // the first read after the service worker wakes can fail once
+  for (let i = 0; i < 2; i++) {
+    try {
+      const res = await f(url, { headers: { Range: 'bytes=0-15' }, signal: AbortSignal.timeout(8000) });
+      diag.log('file-access-probe', { status: res.status, ok: res.ok, try: i });
+      if (res.ok) return true;
+    } catch (e) {
+      diag.log('file-access-probe', { err: String((e as Error)?.message ?? e).slice(0, 120), try: i });
+    }
+  }
+  return false;
+}
+
 export function buttonTitle(key: string, clickAction: 'settings' | 'toggle'): string {
   const t = TITLES[key] ?? TITLES.idle!;
   if (clickAction === 'settings') return `${t.text} ${SETTINGS_HINT}`;
@@ -138,6 +154,9 @@ export interface PageRuntimeHost {
   subtitleTransport?: () => Transport;
   /** HTTP for the Twitch audio_only HLS capture (extension: service worker; userscript: GM_xmlhttpRequest); absent = 'hls' is skipped */
   hlsTransport?: () => Transport;
+  /** Userscripts read a user-selected local file; extensions use their service-worker transport by default. */
+  localFileFetch?(): Promise<typeof fetch | undefined>;
+  fileAccessHint?: string;
   /** reader of the page player's caption tracks; default: the postMessage bridge to the MAIN-world half */
   captions?: () => CaptionsReader;
   /** page-world reader / switcher of the YouTube audio tracks (native Russian dub); default: the postMessage bridge */
@@ -237,6 +256,11 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
     return base.map((p) =>
       withCache(p, cache, {
         videoKey: () => videoCacheKey(video, location.href, { live: isLive }),
+        audioTrackId: async () => {
+          const tracks = await getAudioTracks().list(400);
+          if (tracks) return tracks.currentId ?? (tracks.tracks.length <= 1 ? tracks.tracks[0]?.id ?? 'default' : undefined);
+          return /(^|\.)youtube(-nocookie)?\.com$/.test(location.hostname) ? undefined : 'default';
+        },
         isLive: () => isLive() || isLiveCacheTarget(video, location.href),
         settings: () => settings!,
         onHit: (h) => note({ type: 'cache-hit', providerId: h.providerId, startSec: h.startSec }),
@@ -462,14 +486,18 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
       if (!this.video.paused) this.onPlay();
     }
 
+    private unFs?: () => void;
+
     constructor(readonly video: HTMLVideoElement) {
       this.subs = createSubtitleOverlay(
         video,
         () => this.host(),
         (st) => void host.settingsHost?.saveSettings({ subStyle: st }),
         (l) => void host.settingsHost?.saveSettings({ subtitleLang: l }),
+        { get: () => settings?.subtitles === 'on', set: (on) => void host.settingsHost?.saveSettings({ subtitles: on ? 'on' : 'off' }) },
       );
       this.btn = mountPlayerButton(video, { onClick: () => this.onButton(), title: IDLE_TITLE });
+      this.unFs = installLocalFullscreen(video);
       this.refreshButton();
       video.addEventListener('play', this.onPlay);
       video.addEventListener('playing', this.onMediaReady);
@@ -568,9 +596,22 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
       this.refreshButton();
     }
 
+    /** fetch for a file:// video (through the service worker), set once file access was verified */
+    private localFile?: typeof fetch;
+
     async start(force = false): Promise<void> {
       await ready;
       if (!settings) return;
+      // a video opened from disk: the content script cannot read file://, the service worker can once "Allow access to file URLs" is on
+      this.localFile = undefined;
+      if (location.protocol === 'file:') {
+        const t = host.hlsTransport?.();
+        this.localFile = host.localFileFetch ? await host.localFileFetch() : t && (await canReadFile(transportFetch(t), location.href)) ? swFileFetch(transportFetch(t), location.href) : undefined;
+        if (!this.localFile) {
+          this.addWarning(host.fileAccessHint ?? 'Видео открыто с диска: разрешите расширению доступ к файлам (chrome://extensions → NVT → «Разрешить доступ к URL-адресам файлов»), затем обновите страницу', 'local-file');
+          return;
+        }
+      }
       this.userStopped = false;
       this.pendingAuto = false;
       this.sessionKey = videoKey(this.video, location.href);
@@ -601,7 +642,11 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
         settings,
         detectLanguage: () => detectVideoLanguage(this.video, document, { captions: getReader(), broadcasterLang: hlsFetch ? () => this.twitchLanguage(hlsFetch) : undefined }),
         langStore: host.cache ? createLangStore(host.cache, () => videoKey(this.video, location.href)) : undefined,
-        createCapture: (v, o) => (host.createCapture ?? createCapture)(v, hlsFetch && !o?.hlsFetch ? { ...o, hlsFetch } : o),
+        createCapture: (v, o) => {
+          const withHls = hlsFetch && !o?.hlsFetch ? { ...o, hlsFetch } : o;
+          const lf = this.localFile;
+          return (host.createCapture ?? createCapture)(v, lf ? { ...withHls, directUrl: localFileUrl(decodeURIComponent(location.pathname.split('/').pop() ?? 'video')), fetchFn: lf, maxDirectBytes: 24 * 1024 * 1024, strategies: ['direct', 'realtime'] } : withHls);
+        },
         events: {
           onState: (s, d) => {
             this.slow = d?.slow;
@@ -719,7 +764,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
           // not an error: the status line says the language is checked on the first result
           return;
         case 'no-provider':
-          text = !getProviders().some((p) => p.id === 'local') ? 'В userscript нет локальных моделей; для live/Twitch нужно расширение' : siteVoiceOverride(location.hostname) ? (localReasons.first()?.text ?? 'Для Twitch нужны локальные модели: скачайте Whisper в настройках') : 'Нет доступного источника озвучки — проверьте настройки';
+          text = siteVoiceOverride(location.hostname) ? (localReasons.first()?.text ?? 'Для Twitch нужны локальные модели: скачайте Whisper в настройках') : 'Нет доступного источника озвучки — проверьте настройки';
           fixable = 'no-source';
           break;
         case 'capture-tainted':
@@ -755,7 +800,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
 
     private host(): HTMLElement | null {
       const h = this.video.closest<HTMLElement>('.html5-video-player') ?? this.video.parentElement;
-      if (h && getComputedStyle(h).position === 'static') h.style.position = 'relative';
+      if (h && h !== document.body && h !== document.documentElement && getComputedStyle(h).position === 'static') h.style.position = 'relative';
       return h;
     }
 
@@ -777,6 +822,7 @@ export function createPageRuntime(host: PageRuntimeHost): PageRuntime {
 
     destroy(): void {
       this.unsubReasons?.();
+      this.unFs?.();
       this.subs.destroy();
     }
   }

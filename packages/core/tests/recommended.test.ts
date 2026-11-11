@@ -8,13 +8,18 @@ const GPU = { webgpu: true, f16: true };
 const CPU = { webgpu: false };
 
 describe('recommendedLocalSetup', () => {
+  it('does not require an unusable GPU voice when the ASR and TTS probes disagree', () => {
+    const r = recommendedLocalSetup({ ...GPU, ttsWebgpu: false }, 'en', false);
+    expect(r.asr.dtype).toBe('gpu-mixed');
+    expect(r.tts.engine).toBe('silero-cpu');
+  });
   it.each([
     ['gpu', GPU, 'en', 'onnx-community/whisper-small.en', 'gpu-mixed', 'supertonic-webgpu'],
     ['gpu', GPU, 'de', 'onnx-community/whisper-small', 'gpu-mixed', 'supertonic-webgpu'],
-    ['gpu', GPU, undefined, 'onnx-community/whisper-small', 'gpu-mixed', 'supertonic-webgpu'],
+    ['gpu', GPU, undefined, 'onnx-community/whisper-small.en', 'gpu-mixed', 'supertonic-webgpu'],
     ['cpu', CPU, 'en', 'onnx-community/whisper-base.en', 'q8', 'silero-cpu'],
     ['cpu', CPU, 'de', 'onnx-community/whisper-base', 'q8', 'silero-cpu'],
-    ['cpu', CPU, undefined, 'onnx-community/whisper-base', 'q8', 'silero-cpu'],
+    ['cpu', CPU, undefined, 'onnx-community/whisper-base.en', 'q8', 'silero-cpu'],
     ['webgpu without f16', { webgpu: true, f16: false }, 'en', 'onnx-community/whisper-base.en', 'q8', 'supertonic-webgpu'],
   ])('%s / %s', (_n, caps, lang, model, dtype, tts) => {
     for (const live of [false, true]) {
@@ -65,11 +70,11 @@ describe('missingPieces', () => {
 });
 
 describe('voiceOrder default and migration', () => {
-  it('on-demand default: local before groq, gemini last', () => {
-    expect(DEFAULT_SETTINGS.voiceOrder).toEqual(['yandex-live', 'yandex', 'local', 'groq', 'gemini']);
+  it('default: groq before local, gemini before yandex', () => {
+    expect(DEFAULT_SETTINGS.voiceOrder).toEqual(['yandex-live', 'groq', 'local', 'gemini', 'yandex']);
   });
   it('an untouched groq-first profile moves to the default; a customised one is kept', () => {
-    expect(normalizeSettings({ voiceOrder: ['yandex-live', 'yandex', 'groq', 'local', 'gemini'] }).voiceOrder).toEqual(['yandex-live', 'yandex', 'local', 'groq', 'gemini']);
+    expect(normalizeSettings({ voiceOrder: ['yandex-live', 'yandex', 'groq', 'local', 'gemini'] }).voiceOrder).toEqual(['yandex-live', 'groq', 'local', 'gemini', 'yandex']);
     expect(normalizeSettings({ voiceOrder: ['yandex', 'yandex-live', 'groq', 'local', 'gemini'] }).voiceOrder).toEqual(['yandex', 'yandex-live', 'groq', 'local', 'gemini']);
   });
 });

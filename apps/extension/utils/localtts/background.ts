@@ -3,7 +3,7 @@
  * creates / closes the offscreen document on demand and relays requests from content scripts and extension pages to it.
  * Hook: handleLocalTtsMessage() in background.ts.
  */
-import { browser } from 'wxt/browser';
+import { localRuntimeHost } from '../localRuntimeHost';
 import { LASR_MSG, LTTS_ENV_KEY, LTTS_MSG, VOICE_CALIB_STORAGE_KEY, WHISPER_MODELS, lasrStateKey, allUnits, diag, engineInfo, initialState, unitById, unitFor, unitStateKey, type LocalTtsEngineId, type LttsEnv, type LttsEvent, type LttsReply, type LttsRequest, type LttsState } from '@nvt/core';
 
 /** chrome.storage.local key of dev/mirror base-URL overrides: { [unitId]: baseUrl } (e.g. a self-hosted copy of the Silero files) */
@@ -13,9 +13,9 @@ interface OffscreenApi {
   createDocument(o: { url: string; reasons: string[]; justification: string }): Promise<void>;
   closeDocument(): Promise<void>;
 }
-export const offscreenApi = (): OffscreenApi | undefined => (browser as unknown as { offscreen?: OffscreenApi }).offscreen;
+export const offscreenApi = (): OffscreenApi | undefined => localRuntimeHost().offscreen;
 const OFFSCREEN_PATH = 'offscreen.html';
-export const offscreenUrl = (): string => browser.runtime.getURL(`/${OFFSCREEN_PATH}` as never);
+export const offscreenUrl = (): string => localRuntimeHost().runtime.getURL(`/${OFFSCREEN_PATH}`);
 
 // ---- persisted state (one record per download unit; serialised read-modify-write) ----
 let chain: Promise<unknown> = Promise.resolve();
@@ -23,11 +23,11 @@ function mutate(unitId: string, fn: (s: LttsState) => LttsState): Promise<LttsSt
   const p = chain.then(async () => {
     const unit = unitById(unitId);
     const key = unitStateKey(unitId);
-    const got = await browser.storage.local.get(key);
+    const got = await localRuntimeHost().storage.local.get(key);
     let s = got[key] as LttsState | undefined;
     if (!s || (unit && s.rev !== unit.rev)) s = initialState(unit?.total ?? 0, unit?.rev ?? '');
     const next = { ...fn(s), updatedAt: Date.now() };
-    await browser.storage.local.set({ [key]: next });
+    await localRuntimeHost().storage.local.set({ [key]: next });
     return next;
   });
   chain = p.catch(() => undefined);
@@ -36,16 +36,16 @@ function mutate(unitId: string, fn: (s: LttsState) => LttsState): Promise<LttsSt
 /** read-only (no storage write: this runs on every synth request) */
 async function readState(unitId: string): Promise<LttsState> {
   const unit = unitById(unitId);
-  const got = await browser.storage.local.get(unitStateKey(unitId));
+  const got = await localRuntimeHost().storage.local.get(unitStateKey(unitId));
   const s = got[unitStateKey(unitId)] as LttsState | undefined;
   return s && (!unit || s.rev === unit.rev) ? s : initialState(unit?.total ?? 0, unit?.rev ?? '');
 }
 
 function mutateEnv(fn: (e: LttsEnv) => LttsEnv): Promise<LttsEnv> {
   const p = chain.then(async () => {
-    const got = await browser.storage.local.get(LTTS_ENV_KEY);
+    const got = await localRuntimeHost().storage.local.get(LTTS_ENV_KEY);
     const next = fn((got[LTTS_ENV_KEY] as LttsEnv | undefined) ?? {});
-    await browser.storage.local.set({ [LTTS_ENV_KEY]: next });
+    await localRuntimeHost().storage.local.set({ [LTTS_ENV_KEY]: next });
     return next;
   });
   chain = p.catch(() => undefined);
@@ -53,7 +53,7 @@ function mutateEnv(fn: (e: LttsEnv) => LttsEnv): Promise<LttsEnv> {
 }
 
 async function baseUrlOverride(unitId: string): Promise<string | undefined> {
-  const got = await browser.storage.local.get(LTTS_BASEURLS_KEY);
+  const got = await localRuntimeHost().storage.local.get(LTTS_BASEURLS_KEY);
   const v = (got[LTTS_BASEURLS_KEY] as Record<string, unknown> | undefined)?.[unitId];
   return typeof v === 'string' && /^https?:\/\//.test(v) ? v : undefined;
 }
@@ -62,7 +62,7 @@ async function baseUrlOverride(unitId: string): Promise<string | undefined> {
 let creating: Promise<void> | undefined;
 
 export async function hasOffscreen(): Promise<boolean> {
-  const rt = browser.runtime as unknown as { getContexts?: (f: { contextTypes: string[] }) => Promise<unknown[]> };
+  const rt = localRuntimeHost().runtime;
   if (!rt.getContexts) return false;
   try {
     return (await rt.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] })).length > 0;
@@ -100,7 +100,7 @@ export async function toOffscreen<T>(msg: object, type: string = LTTS_MSG): Prom
   let last = 'no answer';
   for (let i = 0; i < 8; i++) {
     try {
-      const r = (await browser.runtime.sendMessage({ ...msg, type, to: 'offscreen' })) as LttsReply<T> | undefined;
+      const r = (await localRuntimeHost().runtime.sendMessage({ ...msg, type, to: 'offscreen' })) as LttsReply<T> | undefined;
       if (r) return r;
     } catch (e) {
       last = String((e as Error)?.message ?? e);
@@ -117,10 +117,18 @@ async function reconcile(unitId: string, s: LttsState): Promise<LttsState> {
   return s;
 }
 
+const progressMarks = new Map<string, string>();
 function onEvent(e: LttsEvent): void {
   const unit = 'unit' in e && e.unit ? e.unit : 'supertonic';
   switch (e.ev) {
     case 'progress':
+      {
+        const mark = `${e.file}:${Math.floor(e.loaded / (5 * 1048576))}`;
+        if (progressMarks.get(unit) !== mark) {
+          progressMarks.set(unit, mark);
+          diag.log('localtts-download-progress', { unit, file: e.file, loaded: e.loaded, total: e.total });
+        }
+      }
       void mutate(unit, (s) => ({ ...s, model: 'downloading', loaded: e.loaded, total: e.total, error: undefined }));
       break;
     case 'downloaded':
@@ -128,10 +136,12 @@ function onEvent(e: LttsEvent): void {
       void mutate(unit, (s) => ({ ...s, model: 'ready', loaded: s.total, error: undefined }));
       break;
     case 'error':
+      diag.log('localtts-error', { unit, message: e.message, missing: e.missing });
       void mutate(unit, (s) => ({ ...s, model: e.missing ? 'none' : s.model === 'ready' ? 'ready' : 'error', loaded: e.missing ? 0 : s.loaded, error: e.message }));
       break;
     case 'gpu':
-      void mutateEnv((x) => (x.gpu === e.gpu ? x : { ...x, gpu: e.gpu }));
+      diag.log('localtts-gpu', { gpu: e.gpu, reason: e.reason });
+      void mutateEnv((x) => ({ ...x, gpu: e.gpu, gpuReason: e.reason }));
       break;
     case 'deleted':
       void mutate(unit, (s) => initialState(s.total, s.rev));
@@ -148,9 +158,17 @@ const DEFAULT_ENGINE: LocalTtsEngineId = 'supertonic-webgpu';
 export function handleLocalTtsMessage(raw: unknown, sender: { id?: string; url?: string }, sendResponse: (r: unknown) => void): boolean {
   const msg = raw as LttsRequest | undefined;
   if (!msg || msg.type !== LTTS_MSG || msg.to !== 'bg') return false;
-  if (sender.id !== browser.runtime.id) return false;
+  if (sender.id !== localRuntimeHost().runtime.id) return false;
   const answer = (p: Promise<unknown>): true => {
-    void p.then(sendResponse, (e) => sendResponse({ ok: false, error: String((e as Error)?.message ?? e) }));
+    void p.then((r) => {
+      const status = r as { ok?: boolean; error?: string } | undefined;
+      if (status?.ok === false) diag.log('localtts-request-error', { op: msg.op, message: status.error });
+      sendResponse(r);
+    }, (e) => {
+      const error = String((e as Error)?.message ?? e);
+      diag.log('localtts-request-error', { op: msg.op, message: error });
+      sendResponse({ ok: false, error });
+    });
     return true;
   };
   if ((msg.op as string) === 'event') {
@@ -164,9 +182,9 @@ export function handleLocalTtsMessage(raw: unknown, sender: { id?: string; url?:
         const hasApi = !!offscreenApi();
         let env = await mutateEnv((x) => (x.offscreen === hasApi ? x : { ...x, offscreen: hasApi }));
         for (const u of allUnits()) await reconcile(u.id, await readState(u.id));
-        if (msg.probe && hasApi && env.gpu === undefined) {
-          const r = await toOffscreen<{ gpu: boolean }>({ op: 'status' });
-          if (r.ok) env = await mutateEnv((x) => ({ ...x, gpu: r.gpu }));
+        if (msg.probe && hasApi) {
+          const r = await toOffscreen<{ gpu: boolean; reason?: string }>({ op: 'status' });
+          if (r.ok) env = await mutateEnv((x) => ({ ...x, gpu: r.gpu, gpuReason: r.reason }));
         }
         return { ok: true, env, state: await readState('supertonic') };
       })());
@@ -177,12 +195,13 @@ export function handleLocalTtsMessage(raw: unknown, sender: { id?: string; url?:
         const info = engineInfo(engine);
         if (!unit || !info) return { ok: false, error: 'неизвестный движок' };
         if (!offscreenApi()) return { ok: false, error: 'chrome.offscreen недоступен в этом браузере' };
-        const env = await mutateEnv((x) => x);
-        if (info.needsGpu && env.gpu === false) return { ok: false, error: 'WebGPU недоступен' };
+        // Downloaded files are shared with the CPU engine; GPU readiness only
+        // matters at synthesis time, never at download time.
         const override = msg.baseUrl || (await baseUrlOverride(unit.id));
         if (!unit.published && !override) return { ok: false, error: 'модель ещё не опубликована' };
         const s = await reconcile(unit.id, await readState(unit.id));
         if (s.model === 'downloading') return { ok: true };
+        diag.log('localtts-download-start', { engine, unit: unit.id, voice: msg.voice });
         await mutate(unit.id, (x) => ({ ...x, model: 'downloading', error: undefined }));
         const r = await toOffscreen({ op: 'download', engine, voice: msg.voice, baseUrl: override });
         if (!r.ok) await mutate(unit.id, (x) => ({ ...x, model: 'error', error: r.error }));
@@ -227,9 +246,9 @@ export async function clearAllLocalModels(): Promise<{ freedBytes: number }> {
   }
   const keys = [VOICE_CALIB_STORAGE_KEY, ...allUnits().map((u) => unitStateKey(u.id)), ...WHISPER_MODELS.map((m) => lasrStateKey(m.id))];
   await chain.catch(() => undefined);
-  await browser.storage.local.remove(keys);
+  await localRuntimeHost().storage.local.remove(keys);
   await closeOffscreen();
   await new Promise((r) => setTimeout(r, 300)); // late events of the cancelled downloads
-  await browser.storage.local.remove(keys);
+  await localRuntimeHost().storage.local.remove(keys);
   return { freedBytes: freed };
 }

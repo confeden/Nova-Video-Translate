@@ -9,6 +9,8 @@ const IDS: ProviderId[] = ['yandex-live', 'yandex', 'groq', 'local', 'gemini'];
 const LEGACY_ORDER: ProviderId[] = ['yandex-live', 'yandex', 'gemini'];
 /** the D30 default (Groq before the on-device tier): an untouched profile moves to the Chrome-AI-first default, Groq stays the fallback */
 const GROQ_FIRST_ORDER: ProviderId[] = ['yandex-live', 'yandex', 'groq', 'local', 'gemini'];
+/** the default of 0.4.11 and before: an untouched profile with it moves to the current default */
+const PREVIOUS_DEFAULT_ORDER: ProviderId[] = ['yandex-live', 'yandex', 'local', 'groq', 'gemini'];
 
 /**
  * Stored order -> current order. Unknown ids are dropped; ids missing from the stored list are inserted before 'gemini'
@@ -35,16 +37,22 @@ export function normHost(h: unknown): string {
   return typeof h === 'string' ? h.trim().toLowerCase().replace(/^www\./, '') : '';
 }
 
-/** True when auto-translate is switched off for the current page's domain (other sites are unaffected). */
+/** the exclusion key of videos opened from disk (file://), which have no domain */
+export const LOCAL_FILES_HOST = 'file://';
+
+/** True when auto-translate is switched off for the current page's domain (other sites are unaffected); local files have their own key. */
 export function isAutoExcluded(s: Pick<Settings, 'autoTranslateExcluded'> | undefined, host?: string): boolean {
-  const h = normHost(host ?? (typeof location !== 'undefined' ? location.hostname : ''));
+  const h = normHost(host ?? (typeof location !== 'undefined' ? (location.protocol === 'file:' ? LOCAL_FILES_HOST : location.hostname) : ''));
   return !!h && !!s?.autoTranslateExcluded?.includes(h);
 }
 
 export function normalizeSettings(raw: unknown): Settings {
   const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   const storedOrder = Array.isArray(r.voiceOrder) ? (r.voiceOrder as unknown[]).filter((x): x is ProviderId => IDS.includes(x as ProviderId)) : [];
-  const voiceOrder = GROQ_FIRST_ORDER.length === storedOrder.length && GROQ_FIRST_ORDER.every((id, i) => storedOrder[i] === id) ? [...DEFAULT_SETTINGS.voiceOrder] : migrateVoiceOrder(r.voiceOrder);
+  const same = (a: readonly ProviderId[], b: readonly ProviderId[]): boolean => a.length === b.length && a.every((id, i) => b[i] === id);
+  const migrated = migrateVoiceOrder(r.voiceOrder);
+  // no stored order (a fresh install) or an untouched one of an earlier default: the current default, in one pass
+  const voiceOrder = storedOrder.length === 0 || [GROQ_FIRST_ORDER, PREVIOUS_DEFAULT_ORDER].some((o) => same(storedOrder, o) || same(migrated, o)) ? [...DEFAULT_SETTINGS.voiceOrder] : migrated;
   const en = (r.voiceEnabled && typeof r.voiceEnabled === 'object' ? r.voiceEnabled : {}) as Record<string, unknown>;
   const voiceEnabled: Partial<Record<ProviderId, boolean>> = { ...DEFAULT_SETTINGS.voiceEnabled };
   // a pre-D30 profile (neither new id stored): Gemini used to be on by default

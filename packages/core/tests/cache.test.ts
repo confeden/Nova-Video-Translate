@@ -156,6 +156,35 @@ function setup(over: Partial<Settings> = {}, infoOver: Partial<CacheInfo> = {}, 
 }
 
 describe('withCache', () => {
+  it('bypasses cached caption-based results during audio gap repair without replacing the normal cache', async () => {
+    const { w, provider, hits } = setup();
+    await w.translateChunk(chunk(15), ctx()); await w.idle();
+    await w.translateChunk(chunk(15), ctx({ repairGaps: true })); await w.idle();
+    expect(provider.calls).toBe(2);
+    expect(hits).toEqual([]);
+    await w.translateChunk(chunk(15), ctx());
+    expect(provider.calls).toBe(2);
+    expect(hits).toEqual([15]);
+  });
+  it('partitions actual cache reads by source language and selected audio track', async () => {
+    let track = 'en.4';
+    const { w, provider } = setup({}, { audioTrackId: () => track });
+    await w.translateChunk(chunk(15), ctx({ sourceLang: 'en' })); await w.idle();
+    await w.translateChunk(chunk(15), ctx({ sourceLang: 'en' }));
+    expect(provider.calls).toBe(1);
+    await w.translateChunk(chunk(15), ctx({ sourceLang: 'de' })); await w.idle();
+    expect(provider.calls).toBe(2);
+    track = 'de.4';
+    await w.translateChunk(chunk(15), ctx({ sourceLang: 'de' })); await w.idle();
+    expect(provider.calls).toBe(3);
+  });
+  it('does not reuse or write cache entries when the selected track is unknown', async () => {
+    const { w, provider, cache } = setup({}, { audioTrackId: () => undefined });
+    await w.translateChunk(chunk(15), ctx()); await w.idle();
+    await w.translateChunk(chunk(15), ctx()); await w.idle();
+    expect(provider.calls).toBe(2);
+    expect((await cache.stats()).entries).toBe(0);
+  });
   it('forwards the async probe() of the inner provider (groq/local readiness would stay false otherwise)', async () => {
     let probed = 0;
     const inner = Object.assign(new FakeGemini(), { probe: async () => void probed++ });
@@ -361,6 +390,8 @@ describe('cacheKey', () => {
     expect(await cacheKey({ ...base, sig: { translateModel: 'other', ttsModel: 't', voice: 'v' } })).not.toBe(k1);
     expect(await cacheKey({ ...base, chunkSec: 10 })).not.toBe(k1);
     expect(await cacheKey({ ...base, targetLang: 'en' })).not.toBe(k1);
+    expect(await cacheKey({ ...base, sourceLang: 'de' })).not.toBe(await cacheKey({ ...base, sourceLang: 'en' }));
+    expect(await cacheKey({ ...base, audioTrackId: 'en.4' })).not.toBe(await cacheKey({ ...base, audioTrackId: 'de.4' }));
   });
   it('sha256Hex matches node crypto (subtle and the pure fallback)', async () => {
     const txt = 'v1|yt:abc|30.000|15|gemini|ru|a|b|c|s0 — юникод';

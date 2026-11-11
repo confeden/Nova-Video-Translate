@@ -3,8 +3,9 @@ import { Rechunker } from '../capture/rechunk';
 import { diag } from '../diag';
 import { createCapture as defaultCreateCapture, isHlsHost, strategiesForHost, type Capture, type CaptureKind, type CaptureStatus } from '../capture';
 import { DubScheduler, type BufferedRange, type DubSchedulerOptions } from '../playback/scheduler';
-import type { AudioChunk, DubProvider, DubSegment, ProviderId, SubtitleCue } from '../providers/types';
+import type { AudioChunk, ChunkResult, DubProvider, DubSegment, ProviderId, SubtitleCue } from '../providers/types';
 import type { Settings } from '../types';
+import { dedupeCues, mergeCues } from '../subtitles/cues';
 import { siteVoiceOverride, withSiteOverride } from '../settings';
 import { LIVE_CHUNK_SEC, LiveDelayController, availableBackSec, SkipLog, isDefinitelyLive, isLiveVideo, resolveLiveDelaySec } from '../live/liveDelay';
 import {
@@ -22,6 +23,7 @@ import type { LangVerdictStore } from '../lang/store';
 import { findRussianDub, type AudioTracksController } from '../nativedub';
 import { FALLBACK_DURATION_SEC, WATCH_WAIT_REPEAT_MS, indexMp3, nextWatchDelayMs, serveFromTrack, sliceMp3, trackCovers, type FullTrack, type FullTrackProber, type ProbeReplyInfo } from '../providers/yandex/fullTrack';
 import { createChainState, eligibleProviders, runChain, type ChainOutcome, type ChainState, type EngineWarning } from './chain';
+import { uncoveredSpeech } from './gaps';
 import {
   FULL_TRACK_LATENCY_SEC,
   GEMINI_MAX_PARALLEL,
@@ -115,6 +117,8 @@ export interface EngineEvents {
 export interface SchedulerLike {
   onStarve?: (atVideoTime: number) => void;
   addSegments(segments: DubSegment[]): void;
+  /** Decode and validate a replacement before the local bridge is removed. */
+  prepareUpgrade?(segments: DubSegment[], atVideoTime?: number | (() => number)): Promise<boolean>;
   start(): void;
   dispose(): void;
   setVolume(v: number): void;
@@ -244,7 +248,7 @@ const LATE_TAIL_SEC = 3;
 const MAX_QUEUED = 10;
 /** after a rate-limit-like answer the parallelism is halved for this long */
 const RATE_BACKOFF_MS = 60_000;
-/** prerollPause: give up waiting and resume the video after this long */
+/** Surface a prolonged VOD wait without resuming untranslated speech. */
 const PREROLL_MAX_MS = 60_000;
 /** a live HLS stream (Twitch) cannot be waited for as long: the preroll pause is capped here, counted from its start */
 export const PREROLL_LIVE_MAX_MS = 15_000;
@@ -252,6 +256,8 @@ export const PREROLL_LIVE_MAX_MS = 15_000;
 export const PREROLL_EMPTY_RELEASE = 2;
 /** short wait between "dub ready" and resuming, so the scheduler has decoded the first segment */
 const PREROLL_RESUME_DELAY_MS = 250;
+/** Resume from a short nearby dub; the remaining video and cloud racers may still be pending. */
+const PREROLL_BUFFER_AHEAD_SEC = 2;
 const MAX_CHUNK_RETRIES = 3;
 /** a chunk nobody could voice because every tier was cooling down is re-queued this many times (waits are not "attempts") */
 const MAX_NOTIER_WAITS = 20;
@@ -281,6 +287,7 @@ interface CellResult {
 
 interface Task {
   chunk: AudioChunk;
+  gapFill?: { result: ChunkResult; ms: number };
   status: 'queued' | 'running' | 'waiting';
   attempts: number;
   noTierWaits: number;
@@ -362,12 +369,15 @@ export class TranslationEngine {
   private readonly model: LatencyModel;
   /** every tier attempt in flight (also racers that outlive their task), key `cell:tier` */
   private readonly liveAttempts = new Map<string, { id: ProviderId; abort: () => void }>();
+  private readonly repairQueue: Array<{ task: Task; session: number; run: () => Promise<void> }> = [];
+  private readonly localPending = new Set<Task>();
   /** better-tier results that arrived too late for playback: swapped in after their slot has passed (rewinds) */
   private readonly pendingSwaps = new Map<number, { from: ProviderId; to: ProviderId; dur: number; segments: DubSegment[]; voice?: 'lively' | 'standard' }>();
   /** the tier expected to deliver the first audible dub, and when/what it was expected */
   private prep?: { id: ProviderId; at: number; expectedSec: number; cell: number };
   private lastWarnAt = new Map<string, number>();
   private cues: SubtitleCue[] = [];
+  private readonly cueLayers = new Map<ProviderId, SubtitleCue[]>();
   private sourceLang?: string;
   private forced = false;
   /** language not confirmed yet: the first provider result re-checks it */
@@ -402,6 +412,12 @@ export class TranslationEngine {
   private selfPlay = false;
   private prerollCtrl?: AbortController;
   private prerollAt = 0;
+  private prerollPosition?: number;
+  private prerollPreparing = false;
+  private prerollPrepareId = 0;
+  private readonly prerollPrepared = new Set<DubSegment>();
+  private readonly prerollRejected = new Set<DubSegment>();
+  private waitBypassUntil = -Infinity;
   /** consecutive cells that came back without any speech (reset by a voiced cell and by every capture start) */
   private emptyRun = 0;
   private liveDelay?: LiveDelayController;
@@ -459,6 +475,7 @@ export class TranslationEngine {
     this.scheduler?.removeSegmentsWhere?.(() => true, { fadeSec: 0.1, reason: 'timeline-reset' });
     this.segments = [];
     this.cues = [];
+    this.cueLayers.clear();
     this.dubReady = false;
     this.provCells.clear();
     this.provShift = undefined;
@@ -476,6 +493,11 @@ export class TranslationEngine {
   private readonly onSeeked = (): void => {
     if (this._state !== 'starting' && this._state !== 'translating' && this._state !== 'buffering') return;
     const ct = this.deps.video.currentTime;
+    if (this.prerollActive) {
+      this.prerollPosition = ct;
+      this.resetPrerollPreparation();
+      this.dubReady = false;
+    }
     if (this.liveDelay?.takeOwnSeek()) {
       this.lastCt = ct;
       // our own live-delay seek: the capture window restarts at the new position, the session and its queued cells stay
@@ -487,6 +509,7 @@ export class TranslationEngine {
       return;
     }
     if (this.checkTimelineReset(ct)) return;
+    this.waitBypassUntil = -Infinity;
     const cs = this.cellSec();
     let near = false;
     for (const [s, e] of this.doneRanges) if (ct >= s - cs && ct <= e + cs) near = true;
@@ -501,6 +524,7 @@ export class TranslationEngine {
     }
     this.abortTasks();
     this.cues = [];
+    this.cueLayers.clear();
     this.dubReady = false;
     const cap = this.capture;
     this.rechunker?.reset(ct);
@@ -512,20 +536,21 @@ export class TranslationEngine {
 
   private readonly onTimeUpdate = (): void => {
     if (this._state === 'starting' || this._state === 'translating' || this._state === 'buffering') {
-      if (this.checkTimelineReset(this.deps.video.currentTime)) return;
-    } else this.lastCt = this.deps.video.currentTime;
+      if (this.checkTimelineReset(this.playhead())) return;
+    } else this.lastCt = this.playhead();
     if (this.tracks.size > 0) {
       this.feedFromTrack();
       this.pump();
     }
-    if (!this.dubReady) this.updateReady();
+    this.updateReady();
     if (this.pendingSwaps.size > 0) this.flushSwaps();
   };
 
   /** the user pressed play while we hold the video paused for the preroll: they are in charge now */
   private readonly onPlayEvent = (): void => {
     if (this.selfPlay || !this.prerollActive) return;
-    diag.log('preroll-cancel', { reason: 'user-play', ct: this.deps.video.currentTime });
+    diag.log('preroll-cancel', { reason: 'user-play', ct: this.playhead() });
+    this.bypassWaitCell();
     this.endPreroll();
     this.pausedByUs = false;
     this.emitPreparing();
@@ -611,7 +636,7 @@ export class TranslationEngine {
       if (!this.yandexUsable()) localReasons.set('quality-slow', reasonText.qualitySlow());
     }
     diag.log('engine-start', {
-      t: this.deps.video.currentTime,
+      t: this.playhead(),
       chunkSec: this.cellSec(),
       order: this.settings.voiceOrder.join('>'),
       usable: [...this.usable],
@@ -632,6 +657,7 @@ export class TranslationEngine {
     this.deps.video.addEventListener('seeked', this.onSeeked);
     this.deps.video.addEventListener('timeupdate', this.onTimeUpdate);
     this.deps.video.addEventListener('playing', this.onTimeUpdate);
+    this.deps.video.addEventListener('loadeddata', this.onTimeUpdate);
     this.deps.video.addEventListener('play', this.onPlayEvent);
     this.listening = true;
     this.startWatchdog();
@@ -656,8 +682,8 @@ export class TranslationEngine {
         return;
       }
       if (!cap) return;
-      this.rechunker?.reset(this.deps.video.currentTime);
-      await cap.start(this.deps.video.currentTime);
+      this.rechunker?.reset(this.playhead());
+      await cap.start(this.playhead());
       this.ensureLiveDelay();
     } catch (e) {
       if (gen === this.gen) this.fail(e);
@@ -719,7 +745,7 @@ export class TranslationEngine {
     if (applied > 0) return applied + this.extraRewindSec;
     if (this.rewindSlot === undefined) return 0;
     if (this.qualityLive() && this.settings.liveDelaySec < 0) return eff; // quality: straight to the largest safe delay, not only what this dub needs
-    return Math.min(60, Math.max(0, this.deps.video.currentTime - this.rewindSlot + REWIND_MARGIN_SEC));
+    return Math.min(60, Math.max(0, this.playhead() - this.rewindSlot + REWIND_MARGIN_SEC));
   }
 
   /**
@@ -731,7 +757,7 @@ export class TranslationEngine {
     if (!ld || !this.rewindWhenReady() || segments.length === 0) return;
     if (ld.appliedSec() > 0) return this.maybeExtraRewind(ld);
     const slot = Math.min(...segments.map((x) => x.start)) + this.lagSec();
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     const needed = ct - slot + REWIND_MARGIN_SEC;
     // quality mode: the first dub (local) is the cue to move to the largest safe delay even when its slot is still ahead (Yandex needs the time)
     if (needed < 3 && !this.qualityLive()) return; // the slot is still ahead: nothing to catch up
@@ -849,6 +875,8 @@ export class TranslationEngine {
       diag.log('native-dub-switch', { ok, from: st.currentId ?? '?', to: ru.id });
       if (!ok) return miss('set-failed');
     }
+    // Native audio follows the player's own volume. The previous scheduler's
+    // stop() restores any ducking; selecting a track must not override the user.
     this.setState('native-dub');
     this.watchNative(gen, ru.id, confirmed);
     return true;
@@ -917,7 +945,10 @@ export class TranslationEngine {
     this.settings = s;
     const keysChanged = prev.geminiKeys.join('\n') !== s.geminiKeys.join('\n');
     if (prev.yandexToken !== s.yandexToken || prev.groqApiKey !== s.groqApiKey || keysChanged) this.chain.authSkip.clear();
-    if (s.subtitles === 'off') this.cues = [];
+    if (s.subtitles === 'off') {
+      this.cues = [];
+      this.cueLayers.clear();
+    }
     this.applyTierChange(prev, s);
     if (!this.scheduler) return;
     if (prev.originalVolume !== s.originalVolume) {
@@ -926,6 +957,11 @@ export class TranslationEngine {
       this.scheduler.setVolume(s.translationVolume);
     }
     if (prev.dubLagSec !== s.dubLagSec) this.scheduler.setDubLagSec?.(this.lagSec());
+    if (prev.prerollPause !== s.prerollPause) {
+      if (s.prerollPause === 'off') this.releasePreroll('disabled');
+      else this.waitBypassUntil = -Infinity;
+      this.updateReady();
+    }
   }
 
   // ---- tier switching (owner feedback #3) ----
@@ -997,7 +1033,7 @@ export class TranslationEngine {
   }
 
   private dropTiers(ids: Set<ProviderId>): void {
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     for (const [key, a] of [...this.liveAttempts]) {
       if (ids.has(a.id)) {
         diag.log('tier-abort-inflight', { attempt: key, tier: a.id });
@@ -1025,7 +1061,7 @@ export class TranslationEngine {
 
   /** a better tier is now first: re-voice the next few cells that a worse tier already voiced */
   private revoiceUpcoming(top: ProviderId): void {
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     const rank = this.rankOf(top);
     const cands = [...this.cellProvider]
       .filter(([key, id]) => key > ct + 2 && this.rankOf(id) > rank && this.kept.has(key) && !this.tasks.has(key))
@@ -1066,6 +1102,7 @@ export class TranslationEngine {
       this.armHlsProbe(gen);
     }
     if (cap.kind === 'hls') this.capPrerollForLive(gen);
+    else if (cap.kind === 'realtime') this.releasePreroll('realtime-capture');
     // fixed [k*chunkSec, (k+1)*chunkSec) cells: a second viewing produces identical chunk boundaries (result cache)
     const rc = new Rechunker({
       chunkSec: this.cellSec(),
@@ -1076,8 +1113,8 @@ export class TranslationEngine {
       // Meaningless with the 'hls' capture (it has lookahead: cells arrive complete), where it is forced off and has no UI toggle.
       hold: (start) =>
         this.settings.holdCellsToEnd && cap.kind !== 'hls'
-          ? start + this.cellSec() + this.lagSec() > this.deps.video.currentTime
-          : start + this.lagSec() > this.deps.video.currentTime + this.latencySec() + START_MARGIN_SEC,
+          ? start + this.cellSec() + this.lagSec() > this.playhead()
+          : start + this.lagSec() > this.playhead() + this.latencySec() + START_MARGIN_SEC,
     });
     this.rechunker = rc;
     // diagnostics: how far the player has buffered ahead of playback (the lead the capture can deliver in time)
@@ -1107,7 +1144,7 @@ export class TranslationEngine {
   private onRetime(shift: number): void {
     this.provShift = shift;
     const large = Math.abs(shift) > RETIME_MIN_SEC;
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     let moved = 0;
     if (large) {
       moved = this.scheduler?.shiftSegmentsWhere?.((seg) => this.provSegs.has(seg), shift, { reason: 'provisional-offset', maxPlayingMoveSec: RETIME_PLAYING_MAX_MOVE_SEC }) ?? 0;
@@ -1307,7 +1344,7 @@ export class TranslationEngine {
   }
 
   private restartForStall(what: string): void {
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     localReasons.set('restart', reasonText.restart());
     this.setAds(false);
     this.lateRun = 0;
@@ -1441,7 +1478,7 @@ export class TranslationEngine {
         return;
       }
       this.hlsProbe = cap;
-      await cap.start(this.deps.video.currentTime);
+      await cap.start(this.playhead());
     } catch {
       finish(false);
     }
@@ -1466,7 +1503,7 @@ export class TranslationEngine {
         return;
       }
       if (!cap) return;
-      await cap.start(this.deps.video.currentTime);
+      await cap.start(this.playhead());
       this.ensureLiveDelay();
     } catch (e) {
       if (gen === this.gen) this.fail(e);
@@ -1510,11 +1547,11 @@ export class TranslationEngine {
     }
     if (this.doneRanges.has(c.startSec) || this.tasks.has(c.startSec)) return;
     if (this.isStale(c)) {
-      diag.log('chunk-stale', { cell: c.startSec, dur: c.durationSec, ct: this.deps.video.currentTime });
+      diag.log('chunk-stale', { cell: c.startSec, dur: c.durationSec, ct: this.playhead() });
       return;
     }
     if (c.provisional) this.provCells.set(c.startSec, c.durationSec);
-    diag.log('chunk-queued', { cell: c.startSec, dur: c.durationSec, partial: !!c.partial, ct: this.deps.video.currentTime, kind: this.capture?.kind, ...(c.provisional ? { provisional: true } : {}) });
+    diag.log('chunk-queued', { cell: c.startSec, dur: c.durationSec, partial: !!c.partial, ct: this.playhead(), kind: this.capture?.kind, ...(c.provisional ? { provisional: true } : {}) });
     this.tasks.set(c.startSec, { chunk: c, status: 'queued', attempts: 0, noTierWaits: 0, ctrl: new AbortController() });
     if (!this.dubReady && this._state === 'starting') this.emitPreparing();
     this.pumpSoon();
@@ -1537,12 +1574,12 @@ export class TranslationEngine {
     // a realtime tap can only deliver a cell after it was played, so its dub is always late: keep such cells for rewinds
     let lim = this.capture?.kind === 'realtime' ? 120 : STALE_SEC;
     // rewind-when-ready: a cell the playhead has passed is still worth dubbing while the first rewind can reach its slot (ad-aware back-buffer)
-    if (this.rewindWhenReady() && (this.liveDelay?.appliedSec() ?? 0) === 0) lim = Math.max(lim, availableBackSec(this.deps.video, this.deps.video.currentTime, this.capture?.adEndSec?.()).sec - 1);
-    return c.startSec + c.durationSec < this.deps.video.currentTime - lim;
+    if (this.rewindWhenReady() && (this.liveDelay?.appliedSec() ?? 0) === 0) lim = Math.max(lim, availableBackSec(this.deps.video, this.playhead(), this.capture?.adEndSec?.()).sec - 1);
+    return c.startSec + c.durationSec < this.playhead() - lim;
   }
 
   private distance(c: AudioChunk): number {
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     if (c.startSec > ct) return c.startSec - ct;
     return Math.max(0, ct - (c.startSec + c.durationSec));
   }
@@ -1550,6 +1587,15 @@ export class TranslationEngine {
   private pump(): void {
     if (this._state !== 'starting' && this._state !== 'translating' && this._state !== 'buffering') return;
     if (this.probePending) return;
+    while (this.repairQueue.length && this.tierActive('local') < this.tierCap('local')) {
+      this.repairQueue.sort((a, b) => this.distance(a.task.chunk) - this.distance(b.task.chunk));
+      const repair = this.repairQueue.shift()!;
+      if (repair.session !== this.session || repair.task.ctrl.signal.aborted) {
+        this.localPending.delete(repair.task);
+        continue;
+      }
+      void repair.run();
+    }
     while (this.inflight.size < this.concurrency()) {
       const best = this.pickNext();
       if (!best) return;
@@ -1571,7 +1617,7 @@ export class TranslationEngine {
    * Nothing is dropped just for being late: only a cell the playhead has passed (isStale) goes.
    */
   private pickNext(): Task | undefined {
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     const realtime = this.capture?.kind === 'realtime';
     const lat = this.deps.video.paused || realtime ? 0 : this.latencySec();
     const arrive = ct + lat;
@@ -1687,7 +1733,7 @@ export class TranslationEngine {
   private planTask(task: Task): { plan: CellPlan; blocked: boolean; tts: number } {
     const now = (this.deps.now ?? Date.now)();
     const c = task.chunk;
-    const tts = c.startSec + this.lagSec() - this.deps.video.currentTime;
+    const tts = c.startSec + this.lagSec() - this.playhead();
     const ft = this.trackTierFor(c);
     if (ft && !this.higherTierInTime(ft, tts)) return { plan: { start: [ft], preferred: ft, reason: 'full-track', inTime: [ft], late: false }, blocked: false, tts };
     const all = eligibleProviders(this.deps.providers, this.settings, this.chain, now);
@@ -1714,6 +1760,11 @@ export class TranslationEngine {
       free.splice(0, free.length, ...rest);
     }
     const tiers = free.map((p) => ({ id: p.id, expectedSec: this.tracks.get(p.id)?.complete ? Math.max(this.model.expectedSec(p.id), this.model.prior(p.id) * 0.5) : this.model.expectedSec(p.id) }));
+    // Queue the local safety net now even when its single execution slot is busy.
+    // runChain reserves that slot through scheduleRepair before invoking the provider.
+    if (!task.revoice && !tiers.some((t) => t.id === 'local') && all.some((p) => p.id === 'local')) {
+      tiers.push({ id: 'local', expectedSec: this.model.expectedSec('local') });
+    }
     let plan = planCell({ timeToSlot: tts, tiers, localFirst: true });
     if (task.revoice) plan = { ...plan, start: [tiers[0]!.id], reason: 'single' };
     if (!liveGated && plan.start.includes('yandex-live') && !this.model.etaKnown('yandex-live')) {
@@ -1759,7 +1810,7 @@ export class TranslationEngine {
     if (id === 'gemini' || id === 'groq' || id === 'local') return undefined;
     if (this.qualityLive()) return LIVE_YANDEX_JOB_DEADLINE_MS;
     const c = task.chunk;
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     return jobTimeoutMs(c.startSec + this.lagSec() - ct, ct >= c.startSec + c.durationSec + this.lagSec(), this.model.expectedSec(id, c.durationSec));
   }
 
@@ -1777,7 +1828,7 @@ export class TranslationEngine {
     const now = this.deps.now ?? Date.now;
     const t0 = now();
     if (!this.firstRequestAt) this.firstRequestAt = t0;
-    const ct0 = this.deps.video.currentTime;
+    const ct0 = this.playhead();
     const tierIds = this.deps.providers.map((p) => p.id);
     diag.log('cell-plan', {
       cell: key,
@@ -1795,7 +1846,7 @@ export class TranslationEngine {
       cell: key,
       dur: task.chunk.durationSec,
       partial: !!task.chunk.partial,
-      ct: this.deps.video.currentTime,
+      ct: this.playhead(),
       inflight: this.inflight.size,
       cap: this.concurrency(),
       lat: Math.round(this.latencySec()),
@@ -1827,7 +1878,8 @@ export class TranslationEngine {
           isLive: () => this.isLive(),
           hedgeAfterMs,
           hedgeTimer: this.deps.hedgeTimer,
-          plan: plan.start,
+          // Local-first means concurrent startup, not higher replacement priority than the user's preferred cloud voice.
+          plan: [...plan.start].sort((a, b) => this.rankOf(a) - this.rankOf(b)),
           skip: plan.skip,
           deadlineMs: (id) => this.deadlineFor(id, task),
           onHint: (id, sec) => {
@@ -1843,6 +1895,27 @@ export class TranslationEngine {
               return;
             }
             this.onLateWin(task, win);
+          },
+          onGapFill: (result, ms) => {
+            if (session !== this.session || signal.aborted || this.settings.voiceEnabled.local === false) return;
+            task.gapFill = { result, ms };
+            if (this.doneRanges.has(key)) this.fillCellGaps(task);
+          },
+          onSubtitles: (id, cues) => {
+            if (session !== this.session || signal.aborted || this.staleVideoData('subtitles', key)) return;
+            this.publishSubtitles(cues, id);
+          },
+          scheduleRepair: (run) => {
+            this.localPending.add(task);
+            this.repairQueue.push({ task, session, run: async () => {
+              try {
+                await run();
+              } finally {
+                this.localPending.delete(task);
+                if (session === this.session) this.updateReady();
+              }
+            } });
+            this.pumpSoon();
           },
           onRateSignal: (id, status) => this.onRateSignal(id, status),
           onAttempt: (id, abort) => {
@@ -1894,11 +1967,23 @@ export class TranslationEngine {
     this.cellProvider.set(key, providerId);
     this.keep(task.chunk);
     this.onResult(task, providerId, result.segments, result.sourceLang, result.subtitles, result.voice, ms);
+    this.fillCellGaps(task);
     if (this.tracks.size > 0) {
       // a track tier arrived while a worse tier was working on this cell
       const r = this.upgradeCell(key, task.chunk.durationSec);
-      if (r) diag.log('tier-switch-now', { from: r.from, to: r.to, vt: this.deps.video.currentTime, cells: 1 });
+      if (r) diag.log('tier-switch-now', { from: r.from, to: r.to, vt: this.playhead(), cells: 1 });
     }
+  }
+
+  private fillCellGaps(task: Task): void {
+    const fill = task.gapFill;
+    task.gapFill = undefined;
+    if (!fill || task.ctrl.signal.aborted || !['starting', 'translating', 'buffering'].includes(this._state)) return;
+    const segments = uncoveredSpeech(this.segments, fill.result.segments).map((s) => ({ ...s, providerId: 'local' as const }));
+    diag.log('gap-fill-result', { cell: task.chunk.startSec, candidates: fill.result.segments.length, added: segments.length, ms: fill.ms });
+    if (!segments.length) return;
+    const subs = fill.result.subtitles?.filter((s) => segments.some((x) => s.start < x.end && s.end > x.start));
+    this.onResult(task, 'local', segments, undefined, subs, fill.result.voice, fill.ms);
   }
 
   // ---- S26: Yandex super-chunk jobs ----
@@ -1928,7 +2013,7 @@ export class TranslationEngine {
     const max = this.superCells();
     if (max < 2 || lead.revoice || lead.noBatch || this.tracks.size > 0) return undefined;
     if (plan.reason === 'full-track' || plan.start.length === 0 || !plan.start.every((id) => TranslationEngine.isYandexId(id))) return undefined;
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     const c0 = lead.chunk;
     if (c0.startSec + c0.durationSec <= ct || !TranslationEngine.pcmMatches(c0)) return undefined;
     const limit = this.superOk ? max : Math.min(max, YANDEX_FIRST_BATCH_CELLS);
@@ -1968,7 +2053,7 @@ export class TranslationEngine {
     const ids = plan.start;
     const providers = this.deps.providers.filter((p) => TranslationEngine.isYandexId(p.id));
     const expS = Math.max(...ids.map((id) => this.model.expectedSec(id, total)));
-    const ct0 = this.deps.video.currentTime;
+    const ct0 = this.playhead();
     diag.log('cell-plan', {
       cell: key,
       tts: Math.round((key + this.lagSec() - ct0) * 10) / 10,
@@ -2007,7 +2092,7 @@ export class TranslationEngine {
       return ac;
     };
     const deadline = (id: ProviderId): number => {
-      const ct = this.deps.video.currentTime;
+      const ct = this.playhead();
       return jobTimeoutMs(key + this.lagSec() - ct, ct >= key + total + this.lagSec(), this.model.expectedSec(id, total));
     };
     const attempt = (dup: boolean, ac: AbortController): Promise<ChainOutcome> => {
@@ -2170,7 +2255,7 @@ export class TranslationEngine {
     if (!TranslationEngine.isYandexId(id) || !this.qualityLive()) return;
     this.yandexGate.record();
     const c = task.chunk;
-    const tts = c.startSec + this.lagSec() - this.deps.video.currentTime;
+    const tts = c.startSec + this.lagSec() - this.playhead();
     diag.log('yandex-live-lat', { tier: id, cells: 1, audioSec: Math.round(c.durationSec * 10) / 10, ms: Math.round(ms), ok, late: tts < UPGRADE_LEAD_SEC, tts: Math.round(tts * 10) / 10 });
   }
 
@@ -2209,7 +2294,7 @@ export class TranslationEngine {
   private notePrep(task: Task, plan: CellPlan): void {
     if (this.dubReady || plan.start.length === 0) return;
     const c = task.chunk;
-    if (c.startSec + c.durationSec <= this.deps.video.currentTime) return;
+    if (c.startSec + c.durationSec <= this.playhead()) return;
     if (this.prep && this.prep.cell <= c.startSec) return;
     let id = plan.start[0]!;
     for (const t of plan.start) if (this.model.expectedSec(t) < this.model.expectedSec(id)) id = t;
@@ -2233,8 +2318,31 @@ export class TranslationEngine {
 
   /** D26: a better tier's dub of a cell that a worse tier already voices (race winner arriving late, or a full track appearing) */
   private applyUpgrade(cell: number, dur: number, old: ProviderId, to: ProviderId, segs: DubSegment[], voice: 'lively' | 'standard' | undefined): void {
-    const ct = this.deps.video.currentTime;
-    const d = upgradeDecision(cell, cell + dur, ct);
+    const scheduler = this.scheduler;
+    if (old === 'local' && scheduler?.prepareUpgrade) {
+      const ct = this.playhead();
+      if (ct < cell + dur && segs.every((s) => s.end + this.lagSec() <= ct)) {
+        this.pendingSwaps.set(cell, { from: old, to, dur, segments: segs, voice });
+        return;
+      }
+      const session = this.session;
+      void scheduler.prepareUpgrade(segs, this.prerollActive && this.pausedByUs ? () => this.playhead() : undefined).then((ready) => {
+        if (session !== this.session || scheduler !== this.scheduler || this.videoChanged() || !this.usable.has(to) || this.settings.voiceEnabled[to] === false) return;
+        const from = this.cellProvider.get(cell);
+        if (!from || this.rankOf(to) >= this.rankOf(from)) return;
+        if (!ready) {
+          diag.log('tier-upgrade-kept-local', { cell, tier: to, reason: 'not-playable' });
+          return;
+        }
+        this.swapCell(cell, dur, from, to, segs, voice, 'now');
+      }, (e: unknown) => {
+        if (session === this.session) diag.log('tier-upgrade-failed', { cell, tier: to, message: e instanceof Error ? e.message : String(e) });
+      });
+      return;
+    }
+    const ct = this.playhead();
+    // Local audio is a bridge: as soon as the preferred cloud voice is ready, use it.
+    const d = old === 'local' ? 'upgrade' : upgradeDecision(cell, cell + dur, ct);
     if (d === 'defer') {
       this.pendingSwaps.set(cell, { from: old, to, dur, segments: segs, voice });
       diag.log('tier-late-discard', { cell, tier: to, old, lead: Math.round((cell - ct) * 10) / 10, why: 'slot-playing', kept: 'for-rewind' });
@@ -2284,7 +2392,7 @@ export class TranslationEngine {
     const out = this.serveTrack(tier, { startSec: cell, durationSec: dur });
     if (!out || !out.ok) return undefined;
     const full = out.result.segments.map((x) => ({ ...x, providerId: tier }));
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     const playing = ct > cell && ct < cell + dur;
     const past = ct >= cell + dur;
     let sched: DubSegment[] | undefined;
@@ -2301,7 +2409,7 @@ export class TranslationEngine {
 
   /** every done cell the playhead has not left far behind: swapped to the best full track now (the user's voice order decides) */
   private upgradeFromTracks(): void {
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     let n = 0;
     let from: ProviderId | undefined;
     let first: { from: ProviderId; to: ProviderId } | undefined;
@@ -2673,7 +2781,7 @@ export class TranslationEngine {
     if (this.tracks.size === 0 || (this._state !== 'starting' && this._state !== 'translating' && this._state !== 'buffering')) return;
     if (this.videoChanged()) return;
     const cs = this.settings.chunkSec;
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     const dur = this.deps.video.duration;
     let added = 0;
     for (let k = Math.floor(ct / cs + 1e-9); k * cs < ct + TRACK_AHEAD_SEC; k++) {
@@ -2693,14 +2801,23 @@ export class TranslationEngine {
 
   /** `schedSegs`: what the scheduler plays when it differs from the engine's record `segs` (the tail of the playing cell) */
   private swapCell(cell: number, dur: number, from: ProviderId, to: ProviderId, segs: DubSegment[], voice: 'lively' | 'standard' | undefined, mode: string, schedSegs?: DubSegment[]): void {
-    const inCell = (x: DubSegment): boolean => x.providerId === from && x.start >= cell - 0.01 && x.end <= cell + dur + 0.01;
+    // the old tier's sentences that belong to the cell: starting in it, or mostly inside it (a sentence that runs over the cell border is still the cell's)
+    const inCell = (x: DubSegment): boolean => {
+      if (x.providerId !== from && x.providerId !== 'local') return false;
+      if (x.start >= cell - 0.01 && x.start < cell + dur) return true;
+      const inside = Math.min(x.end, cell + dur) - Math.max(x.start, cell);
+      return inside > 0.5 * Math.max(x.end - x.start, 1e-6);
+    };
+    // A partial cloud upgrade must not erase the local sentences that fill its holes.
+    const retained = to === 'local' ? [] : uncoveredSpeech(segs, this.segments.filter((s) => s.providerId === 'local' && inCell(s)));
+    segs = [...segs, ...retained];
     const removed = this.scheduler?.removeSegmentsWhere?.(inCell, { fadeSec: mode === 'now' ? 0.15 : 0.3, reason: 'tier-upgrade' }) ?? 0;
     this.segments = this.segments.filter((x) => !inCell(x));
     this.segments.push(...segs);
-    this.scheduler?.addSegments(schedSegs ?? segs);
+    this.scheduler?.addSegments(schedSegs ? [...schedSegs, ...retained] : segs);
     this.cellProvider.set(cell, to);
     this.pendingSwaps.delete(cell);
-    diag.log('tier-upgrade', { cell, from, to, mode, removed, lead: Math.round((cell - this.deps.video.currentTime) * 10) / 10 });
+    diag.log('tier-upgrade', { cell, from, to, mode, removed, lead: Math.round((cell - this.playhead()) * 10) / 10 });
     if (mode === 'upgrade' || mode === 'now') {
       this.deps.events?.onVoice?.({ providerId: to, voice });
       // the status line ("Озвучка: X -> Y позже") follows the tier that voices now: a takeover must refresh it
@@ -2711,7 +2828,7 @@ export class TranslationEngine {
 
   /** deferred swaps whose slot has passed: the better voice is used from now on (rewinds) */
   private flushSwaps(): void {
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     for (const [cell, w] of [...this.pendingSwaps]) {
       if (ct >= cell + w.dur + 0.3 && this.cellProvider.get(cell) === w.from) this.swapCell(cell, w.dur, w.from, w.to, w.segments, w.voice, 'rewind');
     }
@@ -2725,7 +2842,7 @@ export class TranslationEngine {
     if (task.attempts > MAX_CHUNK_RETRIES || task.noTierWaits > MAX_NOTIER_WAITS || task.revoice) {
       this.tasks.delete(cell);
       diag.log('chunk-gave-up', { cell, attempts: task.attempts, noTierWaits: task.noTierWaits, revoice: !!task.revoice });
-      const ctNow = this.deps.video.currentTime;
+      const ctNow = this.playhead();
       if (!task.revoice && ctNow >= cell - 0.5 && ctNow < cell + task.chunk.durationSec) this.releasePreroll('gave-up');
       if (!task.revoice) {
         // the original keeps playing for this cell (adaptive ducking never lowered it), but say so
@@ -2755,7 +2872,7 @@ export class TranslationEngine {
     if (c.pcm.length === 0) return; // a cell created from a full track has no captured audio to re-voice
     this.kept.set(c.startSec, c);
     if (this.kept.size <= KEEP_CHUNKS) return;
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     const keys = [...this.kept.keys()].sort((a, b) => a - b);
     // drop what lies furthest behind the playhead first
     for (const k of keys) {
@@ -2819,7 +2936,7 @@ export class TranslationEngine {
     }
     const cell = task.chunk.startSec;
     const dur = task.chunk.durationSec;
-    const ct = this.deps.video.currentTime;
+    const ct = this.playhead();
     const dubSec = segments.reduce((n, x) => n + Math.max(0, x.end - x.start), 0);
     // how far the playhead already is into the cell this dub belongs to (> 0.7 of it = the scheduler will skip it)
     const intoCell = ct - cell - this.lagSec();
@@ -2867,14 +2984,17 @@ export class TranslationEngine {
       if (!task.revoice) this.maybeRewindForDub(segments);
     }
     if (this.ttfd.asrMs === undefined && ms > 0 && segments.length > 0) this.ttfd.asrMs = ms;
-    if (this.settings.subtitles === 'on' && subs && subs.length > 0) {
-      const seen = new Set(this.cues.map((c) => `${c.start}|${c.text}`));
-      for (const c of subs) if (!seen.has(`${c.start}|${c.text}`)) this.cues.push(c);
-      this.cues.sort((a, b) => a.start - b.start);
-      this.deps.events?.onSubtitles?.([...this.cues]);
-    }
+    if (subs) this.publishSubtitles(subs, providerId);
     this._active = providerId;
     this.updateReady();
+  }
+
+  private publishSubtitles(subs: SubtitleCue[], providerId: ProviderId): void {
+    if (this.settings.subtitles === 'on' && this.settings.voiceEnabled[providerId] !== false && subs.length > 0) {
+      this.cueLayers.set(providerId, dedupeCues([...(this.cueLayers.get(providerId) ?? []), ...subs]));
+      this.cues = mergeCues([...this.cueLayers].sort(([a], [b]) => this.rankOf(a) - this.rankOf(b)).map(([, cues]) => cues));
+      this.deps.events?.onSubtitles?.([...this.cues]);
+    }
   }
 
   // ---- start-up: "preparing" status and the optional preroll pause ----
@@ -2924,29 +3044,97 @@ export class TranslationEngine {
     return this.chain.hedges > 0 || [...this.chain.cooldownUntil.values()].some((u) => u > now) ? 'switch' : 'wait';
   }
 
-  /** a finished cell (voiced or without speech) that contains the playhead: the dub has joined (or never will here) */
+  private bufferedAt(at: number): boolean {
+    const ranges = this.deps.video.buffered;
+    for (let i = 0; ranges && i < ranges.length; i++) if (ranges.start(i) <= at && at <= ranges.end(i)) return true;
+    return false;
+  }
+
+  /** YouTube may expose a false zero until play() restores the position held by our pause. */
+  private playhead(): number {
+    const v = this.deps.video;
+    const saved = this.prerollPosition;
+    if (this.prerollActive && this.pausedByUs && v.paused && v.currentTime < 0.05 && saved !== undefined && saved > 1) {
+      const captured = [...this.tasks.values()].some((t) => t.chunk.startSec <= saved && saved < t.chunk.startSec + t.chunk.durationSec)
+        || [...this.doneRanges].some(([start, end]) => start <= saved && saved < end);
+      if (captured || this.bufferedAt(saved)) return saved;
+    }
+    return v.currentTime;
+  }
+
+  private nearbyDub(): DubSegment[] {
+    const ct = this.playhead();
+    const lag = this.lagSec();
+    return this.segments.filter((s) => !this.prerollRejected.has(s) && s.start + lag <= ct + PREROLL_BUFFER_AHEAD_SEC && s.end + lag > ct + 0.25)
+      .sort((a, b) => a.start - b.start);
+  }
+
+  /** A nearby playable dub, including a previous cell's tail, or a completed speech-free interval. */
   private coversPlayhead(): boolean {
-    const ct = this.deps.video.currentTime;
-    for (const [s, e] of this.doneRanges) if (ct >= s - 0.3 && ct < e - 0.3) return true;
+    const ct = this.playhead();
+    if (this.nearbyDub().length > 0) return true;
+    for (const [s, e] of this.doneRanges) {
+      if (ct < s - 0.3 || ct >= e - 0.05) continue;
+      if ([...this.prerollRejected].some((x) => x.start + this.lagSec() <= ct + PREROLL_BUFFER_AHEAD_SEC && x.end + this.lagSec() > ct)) continue;
+      // A partial cloud answer does not prove that its holes contain no speech.
+      const pending = [...this.localPending].some((t) => t.chunk.startSec === s && !t.ctrl.signal.aborted);
+      if (!pending || this.segments.some((x) => x.start + this.lagSec() <= ct + 0.3 && x.end + this.lagSec() > ct)) return true;
+    }
+    return false;
+  }
+
+  /** Ordinary scheduler decoding waits for playback; explicitly prepare the nearest dub while we hold the player. */
+  private preparePrerollResume(): boolean {
+    const scheduler = this.scheduler;
+    if (!this.prerollActive || !scheduler?.prepareUpgrade) return true;
+    const near = this.nearbyDub();
+    if (!near.length || near.some((s) => this.prerollPrepared.has(s))) return true;
+    if (this.prerollPreparing) return false;
+    this.prerollPreparing = true;
+    const prepareId = ++this.prerollPrepareId;
+    const ctrl = this.prerollCtrl;
+    const candidate = near[0]!;
+    const complete = (ready: boolean): void => {
+      if (ctrl !== this.prerollCtrl || prepareId !== this.prerollPrepareId) return;
+      this.prerollPreparing = false;
+      if (scheduler !== this.scheduler) {
+        this.updateReady();
+        return;
+      }
+      (ready ? this.prerollPrepared : this.prerollRejected).add(candidate);
+      this.updateReady();
+    };
+    void scheduler.prepareUpgrade([candidate], this.playhead()).then(complete, (e: unknown) => {
+      if (ctrl !== this.prerollCtrl || prepareId !== this.prerollPrepareId) return;
+      diag.log('preroll-decode-failed', { message: e instanceof Error ? e.message : String(e) });
+      complete(false);
+    });
     return false;
   }
 
   private updateReady(): void {
     if (this._state === 'idle' || this._state === 'stopped' || this._state === 'error' || this._state === 'skipped-ru' || this._state === 'native-dub') return;
-    if (!this.dubReady && this.coversPlayhead()) {
+    const covered = this.coversPlayhead();
+    if (!covered && this.settings.prerollPause === 'on' && this.playhead() >= this.waitBypassUntil && !this.isLive() && this.capture?.kind !== 'realtime' && this.capture?.kind !== 'hls') {
+      this.beginPreroll(this.gen);
+      if (this.prerollActive) this.dubReady = false;
+    }
+    if (!this.dubReady && covered) {
+      if (!this.preparePrerollResume()) return;
       this.dubReady = true;
       localReasons.clear('live');
       diag.log('dub-ready', {
         ms: (this.deps.now ?? Date.now)() - this.startedAt,
-        ct: this.deps.video.currentTime,
+        ct: this.playhead(),
         paused: this.prerollActive && this.pausedByUs,
       });
       if (this.prerollActive) {
         const gen = this.gen;
         const ctrl = this.prerollCtrl;
+        const prepareId = this.prerollPrepareId;
         (this.deps.sleep ?? defaultSleep)(PREROLL_RESUME_DELAY_MS, ctrl?.signal ?? new AbortController().signal).then(
           () => {
-            if (gen === this.gen) this.releasePreroll('ready');
+            if (gen === this.gen && prepareId === this.prerollPrepareId && this.coversPlayhead()) this.releasePreroll('ready');
           },
           () => {},
         );
@@ -2961,26 +3149,32 @@ export class TranslationEngine {
   /** prerollPause = 'on': hold the video paused until the first dub covering the playhead is ready */
   private beginPreroll(gen: number): void {
     const v = this.deps.video;
-    if (this.settings.prerollPause !== 'on' || v.paused || v.ended) return;
+    if (this.settings.prerollPause !== 'on' || this.prerollActive || v.paused || v.ended || v.currentTime < this.waitBypassUntil) return;
+    // A realtime tap needs playback to capture the missing audio; pausing would deadlock it.
+    if (this.capture?.kind === 'realtime') return;
+    // Reloading YouTube restores its saved position asynchronously. Do not freeze a not-yet-ready zero position.
+    if (typeof v.readyState === 'number' && (v.readyState < 2 || v.seeking || v.currentTime < 0.05 && !this.bufferedAt(v.currentTime))) return;
     // live: pausing destroys the player's buffer on Twitch (ct -> 0) and the delay seek replaces the wait
     if (this.isLive() || isHlsHost(this.hostName())) {
       diag.log('preroll-skip', { reason: 'live', ct: v.currentTime });
       return;
     }
+    const at = v.currentTime;
     try {
       v.pause();
     } catch {
       return;
     }
     this.prerollActive = true;
+    this.prerollPosition = at;
     this.pausedByUs = true;
     const ctrl = new AbortController();
     this.prerollCtrl = ctrl;
     this.prerollAt = (this.deps.now ?? Date.now)();
-    diag.log('preroll-pause', { ct: v.currentTime });
+    diag.log('preroll-pause', { ct: at });
     (this.deps.sleep ?? defaultSleep)(PREROLL_MAX_MS, ctrl.signal).then(
       () => {
-        if (gen === this.gen) this.releasePreroll('timeout');
+        if (gen === this.gen) diag.log('preroll-wait-long', { ct: v.currentTime, ms: PREROLL_MAX_MS });
       },
       () => {},
     );
@@ -3004,11 +3198,28 @@ export class TranslationEngine {
     this.prerollActive = false;
     this.prerollCtrl?.abort();
     this.prerollCtrl = undefined;
+    this.prerollPosition = undefined;
+    this.resetPrerollPreparation();
+  }
+
+  private resetPrerollPreparation(): void {
+    this.prerollPrepareId++;
+    this.prerollPreparing = false;
+    this.prerollPrepared.clear();
+    this.prerollRejected.clear();
+  }
+
+  private bypassWaitCell(): void {
+    const ct = this.playhead();
+    let end = (Math.floor(ct / this.cellSec()) + 1) * this.cellSec();
+    for (const t of this.tasks.values()) if (t.chunk.startSec <= ct && t.chunk.startSec + t.chunk.durationSec > ct) end = t.chunk.startSec + t.chunk.durationSec;
+    this.waitBypassUntil = end;
   }
 
   /** resume playback only if WE paused it and nobody touched the video since */
   private releasePreroll(reason: string): void {
     if (!this.prerollActive) return;
+    if (reason.startsWith('timeout') || reason === 'gave-up') this.bypassWaitCell();
     const v = this.deps.video;
     const resume = this.pausedByUs && v.paused && !v.ended;
     this.endPreroll();
@@ -3137,15 +3348,23 @@ export class TranslationEngine {
     old.dispose();
     const sch = (this.deps.createScheduler ?? defaultScheduler)(this.deps.video, this.deps.audioCtx, this.schedOpts());
     this.scheduler = sch;
-    const keepFrom = this.deps.video.currentTime - 30;
+    const keepFrom = this.playhead() - 30;
     this.segments = this.segments.filter((s) => s.end >= keepFrom);
     if (this.segments.length > 0) sch.addSegments(this.segments);
     if (this.schedStarted) sch.start();
+    if (this.prerollActive) {
+      this.resetPrerollPreparation();
+      this.dubReady = false;
+      this.updateReady();
+    }
   }
 
   // ---- lifecycle ----
 
   private abortTasks(): void {
+    for (const t of this.localPending) t.ctrl.abort();
+    this.localPending.clear();
+    this.repairQueue.length = 0;
     for (const t of this.tasks.values()) t.ctrl.abort();
     this.tasks.clear();
     this.inflight.clear();
@@ -3154,6 +3373,7 @@ export class TranslationEngine {
   private teardown(): void {
     this.gen++;
     this.session++;
+    this.repairQueue.length = 0;
     this.dropTracks();
     this.hintCtrl.abort();
     this.nativeCtrl?.abort();
@@ -3183,6 +3403,7 @@ export class TranslationEngine {
       this.deps.video.removeEventListener('seeked', this.onSeeked);
       this.deps.video.removeEventListener('timeupdate', this.onTimeUpdate);
       this.deps.video.removeEventListener('playing', this.onTimeUpdate);
+      this.deps.video.removeEventListener('loadeddata', this.onTimeUpdate);
       this.deps.video.removeEventListener('play', this.onPlayEvent);
     }
     this.listening = false;
@@ -3228,11 +3449,13 @@ export class TranslationEngine {
     localReasons.clear('quality-slow');
     this.qualityExtraDone = false;
     this.dubReady = false;
+    this.waitBypassUntil = -Infinity;
     this.firstRequestAt = 0;
     this.rateCap = 0;
     this.rateUntil = 0;
     this.segments = [];
     this.cues = [];
+    this.cueLayers.clear();
     this.sourceLang = undefined;
     this.unverified = false;
     this.langInfo = undefined;

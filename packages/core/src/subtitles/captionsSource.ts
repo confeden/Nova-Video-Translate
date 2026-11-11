@@ -10,6 +10,17 @@ import { SubtitleUnavailable, type CueTranslator, type WholeLoadCtx, type WholeS
 const isRu = (lang: string): boolean => /^ru(-|$)/i.test(lang);
 
 /**
+ * The language the video was recorded in. The active audio track may be a Russian dub of a foreign video; YouTube's
+ * auto-generated captions are made from the ORIGINAL speech, so a non-Russian `asr` track gives it away.
+ */
+export function originalAudioLang(info: CaptionInfo): string | undefined {
+  const a = info.audioLang?.toLowerCase();
+  if (!a || !isRu(a)) return a;
+  const asr = info.tracks.find((x) => x.kind === 'asr' && !isRu(x.lang));
+  return asr ? asr.lang.toLowerCase().split('-')[0] : a;
+}
+
+/**
  * Track to read: a manual Russian one, else (only when the audio is not Russian) the audio-language track, else a
  * Russian auto-generated one, else the first. An auto-translated Russian track on a foreign-audio video is not the
  * original: it would show Russian as "Оригинал" (0.3.26: diag showed `ru asr` picked for an English video).
@@ -17,7 +28,7 @@ const isRu = (lang: string): boolean => /^ru(-|$)/i.test(lang);
 export function pickTrack(info: CaptionInfo): CaptionTrack | undefined {
   const t = info.tracks;
   const manual = (x: CaptionTrack): boolean => x.kind !== 'asr';
-  const audio = info.audioLang?.toLowerCase();
+  const audio = originalAudioLang(info);
   const sameAudio = (x: CaptionTrack): boolean => !!audio && x.lang.toLowerCase().split('-')[0] === audio;
   const foreignAudio = !!audio && !isRu(audio);
   return (
@@ -44,7 +55,7 @@ export function orderBatches(cues: readonly SubtitleCue[], now: number, size = B
 
 /** A non-Russian track in the audio language (manual first), or undefined when the audio language is unknown or Russian. */
 export function originalTrack(info: CaptionInfo): CaptionTrack | undefined {
-  const audio = info.audioLang?.toLowerCase();
+  const audio = originalAudioLang(info);
   if (!audio || isRu(audio)) return undefined;
   const same = (x: CaptionTrack): boolean => x.lang.toLowerCase().split('-')[0] === audio.split('-')[0];
   const others = info.tracks.filter((x) => !isRu(x.lang) && same(x));
@@ -138,9 +149,15 @@ export class CaptionsSource implements WholeSource {
       const result: SubtitleCue[] = [];
       let complete = true;
       try {
-        for (const batch of orderBatches(src, ctx.currentTime())) {
+        let pending = [...src];
+        while (pending.length > 0) {
           if (ctx.signal.aborted) throw new DOMException('aborted', 'AbortError');
+          // Publish a short first window, then re-prioritize at each batch (the viewer may seek during a long video).
+          const first = Math.max(0, pending.findIndex((c) => c.end > ctx.currentTime()));
+          const batch = pending.slice(first, first + (result.length === 0 ? 6 : BATCH_SIZE));
           const got = await tr.translate(batch, lang, ctx.signal);
+          const done = new Set(batch);
+          pending = pending.filter((c) => !done.has(c));
           if (got.length < batch.length) complete = false;
           result.push(...got);
           if (result.length > 0) {

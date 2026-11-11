@@ -6,6 +6,9 @@ import {
   SUB_BG_TRANSP_MAX,
   SUB_COLORS,
   SUB_FONTS,
+  SUB_LIFT_MAX,
+  SUB_LIFT_MIN,
+  SUB_LIFT_STEP,
   SUB_SIZE_MAX,
   SUB_SIZE_MIN,
   SUB_TEXT_TRANSP_MAX,
@@ -22,12 +25,12 @@ export const SUBS_CSS = `
  font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-weight:500;line-height:1.25;color:#fff}
 .nvt-subs span{display:inline-block;max-width:100%;padding:.08em .4em;border-radius:.25em;background:var(--nvt-bg,rgba(0,0,0,.55));
  box-decoration-break:clone;-webkit-box-decoration-break:clone;border:1px solid currentColor;
- max-height:2.7em;overflow:hidden;white-space:pre-line;overflow-wrap:anywhere;vertical-align:bottom;pointer-events:auto}
+ max-height:2.7em;overflow:hidden;white-space:pre-line;overflow-wrap:anywhere;vertical-align:bottom;pointer-events:none}
 .nvt-subs.nvt-noframe span{border-color:transparent}
 .nvt-subs .nvt-lw{display:inline;padding:0;border:0;background:none;max-height:none;overflow:visible;white-space:pre-wrap}
 .nvt-subs .nvt-cur{text-shadow:0 0 1px var(--nvt-neon),0 0 2px var(--nvt-neon);background:var(--nvt-neon-soft);border-radius:.2em;box-decoration-break:clone;-webkit-box-decoration-break:clone}
 .nvt-subs .nvt-canvas{position:absolute;left:0;top:0;width:100%;height:100%;display:block}
-.nvt-subs.nvt-ticker{left:0;right:0;width:100%;overflow:hidden;min-height:1.7em;padding:.08em 0;border-radius:.25em;
+.nvt-subs.nvt-ticker{pointer-events:none;left:0;right:0;width:100%;overflow:hidden;min-height:1.7em;padding:.08em 0;border-radius:.25em;
  background:var(--nvt-bg,rgba(0,0,0,.55));border:1px solid currentColor;text-align:left}
 .nvt-subs.nvt-ticker.nvt-noframe{border-color:transparent}
 .nvt-subs .nvt-track{position:absolute;left:0;top:0;width:100%;height:100%;will-change:transform}
@@ -37,6 +40,12 @@ export const SUBS_CSS = `
  z-index:2147483001;background:rgba(0,0,0,.6);color:#fff;font:16px/28px system-ui,sans-serif;text-align:center;
  opacity:0;pointer-events:none;transition:opacity .15s}
 .nvt-gear.nvt-on{opacity:1;pointer-events:auto}
+.nvt-mvb{position:absolute;width:28px;height:22px;border:0;border-radius:6px;padding:0;margin:0;cursor:pointer;z-index:2147483001;
+ background:rgba(0,0,0,.6);color:#fff;font:12px/22px system-ui,sans-serif;text-align:center;opacity:0;pointer-events:none;
+ transition:transform .08s,background .08s}
+.nvt-mvb.nvt-on{opacity:1;pointer-events:auto}
+.nvt-mvb.nvt-na{display:none}
+.nvt-mvb.nvt-press{transform:scale(.82);background:rgba(255,255,255,.35)}
 .nvt-subs-panel{position:absolute;z-index:2147483002;display:none;flex-direction:column;gap:7px;width:250px;padding:10px 12px;
  border-radius:8px;background:rgba(18,18,18,.94);color:#fff;font:12px/1.3 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
  box-shadow:0 4px 16px rgba(0,0,0,.45);pointer-events:auto;box-sizing:border-box}
@@ -60,6 +69,11 @@ export function subtitleMetrics(playerW: number, playerH: number): { fontPx: num
   return { fontPx, bottomPx };
 }
 
+/** true when the original is shown and some cues carry it: the ones without it are skipped (their translation would mix into the original line) */
+export function skipsUntranslated(cues: readonly SubtitleCue[], lang: 'original' | 'translation'): boolean {
+  return lang === 'original' && cues.some((c) => !!c.src);
+}
+
 /** Text of a cue for the chosen language; falls back to the translation when no original is known. */
 export function cueDisplayText(cue: SubtitleCue | undefined, lang: 'original' | 'translation'): string {
   if (!cue) return '';
@@ -71,11 +85,11 @@ export const TICKER_CHAR_EM = 0.56;
 /** the scrolling layer keeps this many seconds of words around the playhead in the DOM */
 export const TICKER_WINDOW_SEC = 30;
 /** the layer's speed follows the audio's average speed over a window centred on now (s): no speed jumps at word boundaries */
-export const TICKER_VEL_WINDOW_SEC = 1.2;
+export const TICKER_VEL_WINDOW_SEC = 2;
 /** the layer's speed changes gradually, with this time constant (s): it never jerks */
-export const TICKER_VEL_TAU_SEC = 0.5;
+export const TICKER_VEL_TAU_SEC = 0.6;
 /** extra speed (em/s) per em the layer lags behind the audio: a gentle pull, never a snap */
-export const TICKER_PULL_PER_SEC = 4;
+export const TICKER_PULL_PER_SEC = 5;
 /** a neon word stays lit this long (s) after its end, so no word is ever dark between two words */
 export const NEON_HOLD_SEC = 0.12;
 /** the layer always flows forward: at least this speed (em/s), never faster than the max, and never more than the lead
@@ -87,6 +101,12 @@ export const TICKER_MAX_LEAD_EM = 3;
 /** the translation is shown in the layer while it covers this many seconds ahead; below that the original text is shown */
 export const TICKER_FALLBACK_SEC = 8;
 export const TICKER_RESUME_SEC = 15;
+
+/** Only nearby cues need phrase merging and word layout. Keep the full input
+ * separately so seeking to another part of a long video is still immediate. */
+export function subtitleWindow(cues: readonly SubtitleCue[], t: number): SubtitleCue[] {
+  return cues.filter((c) => c.end > t - 60 && c.start < t + 90);
+}
 
 export interface SubtitleOverlay {
   /** which text to show (applies live, re-renders the current cue) */
@@ -119,7 +139,9 @@ export interface TimedWord {
 export function buildWordTimeline(cues: readonly SubtitleCue[], lang: 'original' | 'translation'): TimedWord[] {
   const out: TimedWord[] = [];
   let x = 0;
+  const skip = skipsUntranslated(cues, lang);
   for (const c of cues) {
+    if (skip && !c.src) continue;
     const words = cueDisplayText(c, lang).trim().split(/\s+/).filter(Boolean);
     if (words.length === 0) continue;
     const dur = Math.max(0.05, c.end - c.start);
@@ -215,14 +237,21 @@ const stop = (e: Event): void => e.stopPropagation();
  * said and the layer moves with the original audio (word timing), easing its speed. Hovering shows a settings button; its
  * panel reports the style through `onStyleChange` (the caller persists it).
  */
+/** passed as the test text: shows a sample line and opens the subtitle menu on the video (the page settings use it) */
+export const SUBS_MENU_REQUEST = '\u0000nvt-subs-menu';
+
 export function createSubtitleOverlay(
   video: HTMLVideoElement,
   getHost: () => HTMLElement | null,
   onStyleChange?: (style: SubStyle) => void,
   onLangChange?: (lang: 'original' | 'translation') => void,
+  subsSwitch?: { get(): boolean; set(on: boolean): void },
 ): SubtitleOverlay {
   const doc = video.ownerDocument;
   let cueList: SubtitleCue[] = [];
+  let allCues: readonly SubtitleCue[] = [];
+  let windowCues: readonly SubtitleCue[] = [];
+  let windowAt = -Infinity;
   let enabled = false;
   let lang: 'original' | 'translation' = 'original';
   let style: SubStyle = { ...DEFAULT_SUB_STYLE };
@@ -230,6 +259,11 @@ export function createSubtitleOverlay(
   let textEl: HTMLElement | undefined;
   let track: HTMLElement | undefined;
   let gearEl: HTMLButtonElement | undefined;
+  let moveUp: HTMLButtonElement | undefined;
+  let moveDown: HTMLButtonElement | undefined;
+  /** the mouse is outside the browser window (reported by the document) */
+  let mouseOut = false;
+  let hotTimer: ReturnType<typeof setTimeout> | undefined;
   let panelEl: HTMLElement | undefined;
   let panelOpen = false;
   const ctl: {
@@ -242,6 +276,9 @@ export function createSubtitleOverlay(
     ticker?: HTMLInputElement;
     highlight?: HTMLInputElement;
     frame?: HTMLInputElement;
+    lift?: HTMLInputElement;
+    hideOutside?: HTMLInputElement;
+    on?: HTMLInputElement;
     textTransparency?: HTMLInputElement;
     bgTransparency?: HTMLInputElement;
     swatches: HTMLButtonElement[];
@@ -262,6 +299,18 @@ export function createSubtitleOverlay(
   let wordsT: TimedWord[] = [];
   let wordsO: TimedWord[] = [];
   let tlKey = '';
+  const refreshCueWindow = (t: number, force = false): void => {
+    if (!force && Math.abs(t - windowAt) < 15) return;
+    windowAt = t;
+    const next = subtitleWindow(allCues, t);
+    if (next.length === windowCues.length && next.every((c, i) => {
+      const p = windowCues[i]!;
+      return c.start === p.start && c.end === p.end && c.text === p.text && c.src === p.src;
+    })) return;
+    windowCues = next;
+    cueList = mergeCuesToPhrases(next);
+    tlKey = '';
+  };
   let srcMode: 't' | 'o' = 't';
   /** scrolling layer: the word spans in the DOM, their window start and the layer's eased position (em) */
   let canvas: HTMLCanvasElement | undefined;
@@ -269,6 +318,9 @@ export function createSubtitleOverlay(
   let winKey = '';
   let tick: TickerMotion | null = null;
   let lastSampleMs = 0;
+  let tickerFontPx = 16;
+  let frameMaxMs = 0;
+  let longFrames = 0;
   let litIdx = -1;
   const EVENTS = ['timeupdate', 'seeked', 'seeking', 'pause', 'play', 'ratechange', 'loadedmetadata'] as const;
 
@@ -276,26 +328,46 @@ export function createSubtitleOverlay(
   const bgAlpha = (): number => 1 - style.bgTransparency / 100;
   const neonOn = (): boolean => style.highlight && lang === 'original';
 
-  /** positions the line inside the VIDEO's box; the scrolling layer covers the whole player width */
+  /** positions the line inside the VIDEO's box; the scrolling layer covers the video's width */
   const layout = (host: HTMLElement): void => {
     if (!el) return;
-    const hr = host.getBoundingClientRect();
+    const doc = video.ownerDocument;
+    // a static <body> / <html> host (the browser's own media viewer) is not the containing block of the absolute layer: the initial one is
+    const icb = (host === doc.body || host === doc.documentElement) && getComputedStyle(host).position === 'static';
+    const hr = icb ? new DOMRect(-(doc.defaultView?.scrollX ?? 0), -(doc.defaultView?.scrollY ?? 0), doc.documentElement.clientWidth, doc.documentElement.clientHeight) : host.getBoundingClientRect();
     const vr = video.getBoundingClientRect();
     if (vr.width === 0 || vr.height === 0) return;
     const m = subtitleMetrics(vr.width, vr.height);
     const st = el.style;
-    st.fontSize = `${Math.round(m.fontPx * (style.size / 100) * 10) / 10}px`;
+    tickerFontPx = Math.round(m.fontPx * (style.size / 100) * 10) / 10;
+    st.fontSize = `${tickerFontPx}px`;
     st.right = 'auto';
     if (style.ticker) {
-      st.left = '0px';
-      st.width = `${Math.round(hr.width)}px`;
+      // the scrolling layer spans the video's own width, never the wider player / page
+      st.left = `${Math.round(vr.left - hr.left - (icb ? 0 : host.clientLeft))}px`;
+      st.width = `${Math.round(vr.width)}px`;
     } else {
-      st.left = `${Math.round(vr.left - hr.left - host.clientLeft + vr.width * 0.10)}px`;
+      st.left = `${Math.round(vr.left - hr.left - (icb ? 0 : host.clientLeft) + vr.width * 0.10)}px`;
       st.width = `${Math.round(vr.width * 0.80)}px`;
     }
-    st.bottom = `${Math.round(hr.bottom - vr.bottom - host.clientTop + m.bottomPx)}px`;
+    const bottomPx = Math.round(hr.bottom - vr.bottom - (icb ? 0 : host.clientTop) + Math.min(Math.round((vr.height * style.lift) / 100), Math.max(0, Math.round(vr.height - el.offsetHeight - 30))));
+    st.bottom = `${bottomPx}px`;
+    st.visibility = style.hideOutside && mouseOut ? 'hidden' : '';
+    if (moveUp && moveDown) {
+      // one triangle above the line, one below it, both centred on the video
+      const cx = Math.round(vr.left - hr.left - (icb ? 0 : host.clientLeft) + vr.width / 2 - 14);
+      moveUp.style.left = `${cx}px`;
+      moveDown.style.left = `${cx}px`;
+      moveUp.style.bottom = `${bottomPx + el.offsetHeight + 4}px`;
+      moveDown.style.bottom = `${Math.max(0, bottomPx - 26)}px`;
+      moveUp.style.color = style.color;
+      moveDown.style.color = style.color;
+      const below = bottomPx - (hr.bottom - vr.bottom - (icb ? 0 : host.clientTop));
+      moveDown.classList.toggle('nvt-na', below < 26);
+      moveUp.classList.toggle('nvt-na', vr.height - below - el.offsetHeight < 26);
+    }
     // the gear and its panel sit at the top-right corner of the video
-    const top = Math.round(vr.top - hr.top - host.clientTop + 8);
+    const top = Math.round(vr.top - hr.top - (icb ? 0 : host.clientTop) + 8);
     const right = Math.round(hr.right - vr.right + 8);
     if (gearEl) {
       gearEl.style.top = `${top}px`;
@@ -307,8 +379,79 @@ export function createSubtitleOverlay(
     }
   };
 
+  /** the gear and the move buttons show on hover and linger a moment, so the pointer can travel between the line and them */
   const setHot = (on: boolean): void => {
     gearEl?.classList.toggle('nvt-on', on || panelOpen);
+    moveUp?.classList.toggle('nvt-on', on);
+    moveDown?.classList.toggle('nvt-on', on);
+  };
+
+  /** a drag in progress: the triangles stay shown and the pointer-position hover test does not hide them */
+  let dragging = false;
+
+  /**
+   * Either triangle is a handle: holding the left button and moving the pointer carries the line anywhere, up or down, by the
+   * distance travelled (kept as % of the video height). Nothing moves by itself; the position is saved when the button is released.
+   */
+  const dragButton = (b: HTMLButtonElement): void => {
+    b.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      const y0 = e.clientY;
+      const lift0 = style.lift;
+      const h = Math.max(1, video.getBoundingClientRect().height);
+      dragging = true;
+      b.classList.add('nvt-press');
+      setHot(true);
+      const onMove = (ev: PointerEvent): void => {
+        const lift = Math.round((lift0 - ((ev.clientY - y0) / h) * 100) * 10) / 10;
+        const top = Math.max(0, ((video.getBoundingClientRect().height - (el?.offsetHeight ?? 0) - 30) / h) * 100);
+        style = { ...style, lift: Math.min(SUB_LIFT_MAX, top, Math.max(SUB_LIFT_MIN, lift)) };
+        const host = el?.parentElement;
+        if (host) layout(host);
+        syncPanel();
+      };
+      const release = (): void => {
+        if (!dragging) return;
+        dragging = false;
+        b.classList.remove('nvt-press');
+        doc.removeEventListener('pointermove', onMove, true);
+        doc.removeEventListener('pointerup', release, true);
+        doc.removeEventListener('pointercancel', release, true);
+        doc.removeEventListener('mouseout', onLeave, true);
+        doc.defaultView?.removeEventListener('blur', release);
+        onStyleChange?.(style);
+      };
+      // the pointer left the browser window (another screen): the line is let go where it is
+      const onLeave = (ev: MouseEvent): void => {
+        if (!ev.relatedTarget) release();
+      };
+      doc.addEventListener('mouseout', onLeave, true);
+      doc.defaultView?.addEventListener('blur', release);
+      doc.addEventListener('pointermove', onMove, true);
+      doc.addEventListener('pointerup', release, true);
+      doc.addEventListener('pointercancel', release, true);
+    });
+  };
+
+  const ensureMove = (host: HTMLElement): void => {
+    if (moveUp && moveUp.parentElement === host) return;
+    moveUp?.remove();
+    moveDown?.remove();
+    const mk = (label: string, title: string): HTMLButtonElement => {
+      const b = doc.createElement('button');
+      b.type = 'button';
+      b.className = 'nvt-mvb';
+      b.textContent = label;
+      b.title = title;
+      b.setAttribute('aria-label', title);
+      for (const ev of STOP_EVENTS) b.addEventListener(ev, stop);
+      dragButton(b);
+      host.appendChild(b);
+      return b;
+    };
+    moveUp = mk('\u25B2', 'Зажмите и двигайте мышью, чтобы переместить субтитры');
+    moveDown = mk('\u25BC', 'Зажмите и двигайте мышью, чтобы переместить субтитры');
   };
 
   const applyStyle = (): void => {
@@ -335,8 +478,6 @@ export function createSubtitleOverlay(
     const span = doc.createElement('span');
     span.textContent = text;
     if (!style.ticker) span.style.maxHeight = `${style.lines * 1.25 + 0.2}em`;
-    span.addEventListener('pointerenter', () => setHot(true));
-    span.addEventListener('pointerleave', () => setHot(false));
     return span;
   };
 
@@ -355,6 +496,7 @@ export function createSubtitleOverlay(
     ctx2d = null;
     winKey = '';
     host.appendChild(el);
+    ensureMove(host);
     applyStyle();
     layout(host);
     if (typeof ResizeObserver !== 'undefined') {
@@ -375,8 +517,6 @@ export function createSubtitleOverlay(
     gearEl.title = 'Настройки субтитров';
     gearEl.setAttribute('aria-label', 'Настройки субтитров');
     for (const ev of STOP_EVENTS) gearEl.addEventListener(ev, stop);
-    gearEl.addEventListener('pointerenter', () => setHot(true));
-    gearEl.addEventListener('pointerleave', () => setHot(false));
     gearEl.addEventListener('click', () => openPanel(!panelOpen));
     host.appendChild(gearEl);
     setHot(false);
@@ -404,6 +544,9 @@ export function createSubtitleOverlay(
     if (ctl.ticker) ctl.ticker.checked = style.ticker;
     if (ctl.highlight) ctl.highlight.checked = style.highlight;
     if (ctl.frame) ctl.frame.checked = style.frame;
+    if (ctl.hideOutside) ctl.hideOutside.checked = style.hideOutside;
+    if (ctl.on) ctl.on.checked = subsSwitch?.get() ?? true;
+    if (ctl.lift) ctl.lift.value = String(style.lift);
     if (ctl.textTransparency) ctl.textTransparency.value = String(style.textTransparency);
     if (ctl.bgTransparency) ctl.bgTransparency.value = String(style.bgTransparency);
     for (const b of ctl.swatches) b.setAttribute('aria-pressed', String(b.dataset.hex === style.color));
@@ -503,9 +646,18 @@ export function createSubtitleOverlay(
     ctl.ticker = checkbox((v) => update({ ticker: v }));
     ctl.highlight = checkbox((v) => update({ highlight: v }));
     ctl.frame = checkbox((v) => update({ frame: v }));
+    ctl.hideOutside = checkbox((v) => update({ hideOutside: v }));
+    ctl.on = checkbox((v) => subsSwitch?.set(v));
+    ctl.lift = doc.createElement('input');
+    ctl.lift.type = 'range';
+    ctl.lift.min = String(SUB_LIFT_MIN);
+    ctl.lift.max = String(SUB_LIFT_MAX);
+    ctl.lift.step = String(SUB_LIFT_STEP);
+    ctl.lift.addEventListener('input', () => update({ lift: Number(ctl.lift!.value) }));
 
     panelEl.append(
       head,
+      field('Показывать субтитры', ctl.on),
       field('Язык субтитров', ctl.lang),
       field('Размер', ctl.size),
       field('Прозрачность текста', ctl.textTransparency),
@@ -514,6 +666,8 @@ export function createSubtitleOverlay(
       field('Жирность', ctl.weight),
       field('Цвет', sws),
       field('Рамка', ctl.frame),
+      field('Высота над низом', ctl.lift),
+      field('Скрывать, когда мышь ушла с окна (на другой экран)', ctl.hideOutside),
       field('Выравнивание', ctl.align),
       field('Строк', ctl.lines),
       field('Бегущая строка', ctl.ticker),
@@ -535,6 +689,8 @@ export function createSubtitleOverlay(
     if (on) syncPanel();
   };
 
+  /** the text of a cue in the chosen language; '' for a cue with no original while other cues have one (never a mixed line) */
+  const cueText = (c: SubtitleCue): string => (skipsUntranslated(cueList, lang) && !c.src ? '' : cueDisplayText(c, lang));
   const activeCue = (t: number): SubtitleCue | undefined => cueList.find((c) => t >= c.start && t < c.end);
   const activeKey = (): unknown => {
     if (test && Date.now() < test.until) return test;
@@ -563,6 +719,7 @@ export function createSubtitleOverlay(
    * flapping; a switch re-anchors the layer (one step, not a jerk).
    */
   const ensureWords = (t: number): void => {
+    refreshCueWindow(t);
     const key = `${cueList.length}|${cueList[0]?.start ?? 0}|${cueList[cueList.length - 1]?.end ?? 0}`;
     if (key !== tlKey) {
       tlKey = key;
@@ -641,7 +798,7 @@ export function createSubtitleOverlay(
       canvas.width = pw;
       canvas.height = ph;
     }
-    const fontPx = parseFloat(getComputedStyle(el).fontSize) || 16;
+    const fontPx = tickerFontPx;
     // a seek or a long silence (a jump far beyond half the width) moves the layer at once; anything smaller glides
     const gap = tick === null ? 0 : layerPositionAt(words, t) - tick.pos;
     if (tick === null || Math.abs(gap) * fontPx > w * 0.5) {
@@ -658,8 +815,12 @@ export function createSubtitleOverlay(
         lagEm: Math.round((layerPositionAt(words, t) - shownX) * 100) / 100,
         velEm: Math.round(tick.vel * 100) / 100,
         dtMs: Math.round(dt * 1000),
+        maxFrameMs: Math.round(frameMaxMs),
+        longFrames,
         src: srcMode,
       });
+      frameMaxMs = 0;
+      longFrames = 0;
     }
 
     const c = ctx2d;
@@ -708,7 +869,10 @@ export function createSubtitleOverlay(
   const frame = (now: number): void => {
     rafId = 0;
     if (!loopWanted()) return;
-    const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 1 / 60;
+    const elapsed = lastFrame ? (now - lastFrame) / 1000 : 1 / 60;
+    frameMaxMs = Math.max(frameMaxMs, elapsed * 1000);
+    if (elapsed > 0.035) longFrames++;
+    const dt = Math.min(0.1, elapsed);
     lastFrame = now;
     advanceClock(dt);
     draw(dt);
@@ -726,6 +890,7 @@ export function createSubtitleOverlay(
   };
 
   const render = (force = false): void => {
+    refreshCueWindow(video.currentTime);
     if (test && Date.now() >= test.until) test = undefined;
     shownKey = activeKey();
     if (!test && enabled && style.ticker) {
@@ -740,7 +905,7 @@ export function createSubtitleOverlay(
     }
     stopLoop();
     const cue = test ? undefined : enabled ? activeCue(video.currentTime) : undefined;
-    const want = test ? test.text : cue ? cueDisplayText(cue, lang) : '';
+    const want = test ? test.text : cue ? cueText(cue) : '';
     if (!want) {
       if (el) el.style.display = 'none';
       shown = '';
@@ -772,6 +937,37 @@ export function createSubtitleOverlay(
     render();
   };
   for (const e of EVENTS) video.addEventListener(e, onEvent);
+  // the pointer left the browser window: the document reports a mouseout with no element it went to
+  const setOut = (v: boolean): void => {
+    if (mouseOut === v) return;
+    mouseOut = v;
+    const h = el?.parentElement;
+    if (h) layout(h);
+  };
+  const onOut = (e: MouseEvent): void => {
+    if (!e.relatedTarget) {
+      setOut(true);
+      setHot(false);
+    }
+  };
+  const inside = (r: DOMRect | undefined, x: number, y: number, m = 4): boolean => !!r && r.width > 0 && x >= r.left - m && x <= r.right + m && y >= r.top - m && y <= r.bottom + m;
+  /** the gear and the triangles show while the pointer is on the visible line (or on them) and at no other time */
+  const onIn = (e?: MouseEvent): void => {
+    setOut(false);
+    if (dragging) {
+      setHot(true);
+      return;
+    }
+    if (!e || !el || el.style.display === 'none' || !enabled && !test) {
+      setHot(false);
+      return;
+    }
+    const line = (style.ticker ? el : textEl ?? el).getBoundingClientRect();
+    setHot(inside(line, e.clientX, e.clientY) || [gearEl, moveUp, moveDown].some((b) => b?.classList.contains('nvt-on') && inside(b.getBoundingClientRect(), e.clientX, e.clientY)));
+  };
+  doc.addEventListener('mouseout', onOut, true);
+  doc.addEventListener('mouseover', onIn, true);
+  doc.addEventListener('mousemove', onIn, true);
   // light timer: a cue that ends (or starts) between media events is caught here; re-render only on a cue change
   timer = setInterval(() => {
     if (activeKey() !== shownKey) render();
@@ -791,15 +987,16 @@ export function createSubtitleOverlay(
       render(true);
     },
     setCues(cues) {
-      // fragments of 1-2 words are joined into phrases (sentence or up to 8 s); the words keep their timing
-      cueList = mergeCuesToPhrases(cues);
-      tlKey = '';
+      allCues = [...cues].sort((a, b) => a.start - b.start || a.end - b.end);
+      refreshCueWindow(video.currentTime, true);
       winKey = '';
       render();
     },
     showTest(text, ms = 6000) {
-      test = { text, until: Date.now() + ms };
+      const menu = text === SUBS_MENU_REQUEST;
+      test = { text: menu ? 'Тестовый субтитр: так выглядят субтитры NVT' : text, until: Date.now() + (menu ? 60000 : ms) };
       render();
+      if (menu) openPanel(true);
     },
     setEnabled(on) {
       enabled = on;
@@ -812,6 +1009,14 @@ export function createSubtitleOverlay(
       ro?.disconnect();
       el?.remove();
       el = undefined;
+      moveUp?.remove();
+      moveUp = undefined;
+      moveDown?.remove();
+      moveDown = undefined;
+      if (hotTimer) clearTimeout(hotTimer);
+      doc.removeEventListener('mouseout', onOut, true);
+      doc.removeEventListener('mouseover', onIn, true);
+      doc.removeEventListener('mousemove', onIn, true);
       track = undefined;
       gearEl?.remove();
       gearEl = undefined;

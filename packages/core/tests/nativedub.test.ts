@@ -205,6 +205,10 @@ describe('audio track postMessage bridge', () => {
     expect(st?.tracks.map((t) => t.id)).toEqual(['en.4', 'ru.10', 'de.10']);
     expect(await client.select('ru.10', 200)).toBe(true);
     expect(f.current).toBe('ru.10');
+    const second = createAudioTracksBridgeClient(win);
+    expect((await second.list(200))?.currentId).toBe('ru.10');
+    expect((await client.list(200))?.currentId).toBe('ru.10');
+    second.dispose?.();
     client.dispose?.();
     main.dispose();
   });
@@ -295,11 +299,13 @@ describe('engine: native Russian dub', () => {
   it('switches to the Russian track, enters native-dub and starts no providers, capture or ducking', async () => {
     const t = new FakeTracks(state('en.4'));
     const e = setup(t);
+    e.video.volume = 0.1;
     await e.engine.start();
     await flush();
     expect(t.selected).toEqual(['ru.10']);
     expect(e.engine.state).toBe('native-dub');
     expect(e.caps).toHaveLength(0);
+    expect(e.video.volume).toBe(0.1);
     expect(e.providers.every((p) => p.calls.length === 0)).toBe(true);
     expect(evs('native-dub-probe')[0]!.data).toMatchObject({ tracks: ['en.4', 'ru.10', 'de.10'], hasRu: true });
     expect(evs('native-dub-switch')[0]!.data).toMatchObject({ ok: true, from: 'en.4', to: 'ru.10' });

@@ -3,9 +3,9 @@ import { DEFAULT_SUB_STYLE, hexAlpha, normalizeSubStyle, splitWords } from '../s
 import { normalizeSettings } from '../src/settings';
 
 describe('subtitle style (0.3.0)', () => {
-  it('defaults keep the old look: 100%, first font, weight 500, white, centred, 2 lines', () => {
+  it('defaults: 100%, first font, weight 500, green, centred, 1 line, ticker and highlight on', () => {
     expect(normalizeSubStyle(undefined)).toEqual(DEFAULT_SUB_STYLE);
-    expect(DEFAULT_SUB_STYLE).toMatchObject({ size: 100, weight: 500, color: '#ffffff', align: 'center', lines: 2, textTransparency: 20, bgTransparency: 25 });
+    expect(DEFAULT_SUB_STYLE).toMatchObject({ size: 100, weight: 500, color: '#b6ff5e', align: 'center', lines: 1, ticker: true, highlight: true, textTransparency: 20, bgTransparency: 25 });
   });
   it('unknown values fall back, numbers are clamped', () => {
     const s = normalizeSubStyle({ size: 999, font: 42, weight: 123, color: '#123456', align: 'justify', lines: 7, ticker: 'yes', highlight: 1 });
@@ -13,7 +13,7 @@ describe('subtitle style (0.3.0)', () => {
   });
   it('keeps valid picks', () => {
     const s = normalizeSubStyle({ size: 80, font: 2, weight: 900, color: '#ffd60a', align: 'left', lines: 1, ticker: true, highlight: true, frame: false, textTransparency: 50, bgTransparency: 80 });
-    expect(s).toEqual({ size: 80, font: 2, weight: 900, color: '#ffd60a', frame: false, textTransparency: 50, bgTransparency: 80, align: 'left', lines: 1, ticker: true, highlight: true });
+    expect(s).toEqual({ size: 80, font: 2, weight: 900, color: '#ffd60a', frame: false, textTransparency: 50, bgTransparency: 80, align: 'left', lines: 1, ticker: true, highlight: true, lift: 0, hideOutside: true });
   });
   it('a stored settings profile without subStyle gets the default; a stored one survives', () => {
     expect(normalizeSettings({}).subStyle).toEqual(DEFAULT_SUB_STYLE);

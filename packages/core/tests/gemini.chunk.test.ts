@@ -72,6 +72,17 @@ const TWO = [
 const twoSentenceAudio = () => concat(voiced(SR, 2.2, 120), silence(SR, 0.45), voiced(SR, 3.7, 121));
 
 describe('per-chunk TTS (one call for same-voice sentences)', () => {
+  it('does not voice Russian source text mislabeled English or instrumental music descriptions', async () => {
+    for (const [src, ru] of [
+      ['Это русская речь, её не нужно переводить ещё раз.', 'Это русская речь, её не нужно переводить ещё раз.'],
+      ['Soft instrumental music plays in the background.', 'Звучит спокойная инструментальная музыка без слов.'],
+    ]) {
+      const s = setup([{ start: 0, end: 10, src: src!, ru: ru! }], () => audioResp(voiced(SR, 3, 120)));
+      const p = new GeminiProvider({ keys: ['k'], fetch: s.fetchFn, tts: { guard: false } });
+      expect((await p.translateChunk(chunkOf(120), ctx())).segments).toEqual([]);
+      expect(s.calls).toHaveLength(0);
+    }
+  });
   it('voices two sentences with ONE call, text only, split by the pause', async () => {
     const s = setup(TWO, () => audioResp(twoSentenceAudio()));
     const p = new GeminiProvider({ keys: ['k'], fetch: s.fetchFn, tts: { guard: false } });

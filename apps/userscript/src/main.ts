@@ -1,4 +1,4 @@
-import { IdbCache, LiveGemini, createPageRuntime, type PageRuntime, createYandexProviders, startCacheMaintenance, transportFetch, type DubProvider, type FullTrackProber, type VoiceReport } from '@nvt/core';
+import { IdbCache, createPageProviders, createPageRuntime, fileFetch, pickLocalFile, startCacheMaintenance, type PageRuntime, type FullTrackProber, type VoiceReport } from '@nvt/core';
 import { gmGet, gmMenu, gmSet } from './gm';
 import { createGmTransport } from './gmTransport';
 import { isOauthCallback, oauthCallback } from './oauth';
@@ -7,6 +7,7 @@ import { NVT_VERSION } from './version';
 import { VOICE_STATUS_KEY, loadSettings, onSettingsChanged } from './storage';
 import { installTap, runPageTapOnly } from './tap';
 import { runUpdateCheck } from './updateCheck';
+import { createUserscriptLocalModels } from './localModels';
 
 function main(): void {
   // copy of this script injected into the page world: install the MSE tap and nothing else
@@ -34,9 +35,13 @@ function main(): void {
   const cache = new IdbCache();
   startCacheMaintenance(cache);
 
-  const settingsHost = createSettingsHost(transport, cache);
+  const localModels = createUserscriptLocalModels();
+  const settingsHost = { ...createSettingsHost(transport, cache), ...localModels.panelHost };
+  const reader = tap.captions();
   let runtime: PageRuntime | undefined;
   let fullTrack: FullTrackProber | undefined;
+  let censored: ((start: number, duration: number) => boolean) | undefined;
+  let localFile: File | undefined;
   let menuRegistered = false;
   const registerMenu = (): void => {
     if (menuRegistered) return;
@@ -53,7 +58,13 @@ function main(): void {
       cache,
       subtitleTransport: () => transport,
       hlsTransport: () => transport,
-      captions: () => tap.captions(),
+      async localFileFetch() {
+        if (!localFile && navigator.userActivation.isActive) localFile = await pickLocalFile();
+        return localFile ? fileFetch(localFile) : undefined;
+      },
+      fileAccessHint: 'Видео открыто с диска: нажмите «Переводить» и выберите тот же видеофайл. Для Tampermonkey должен быть разрешён доступ к URL-адресам файлов.',
+      captions: () => reader,
+      censored: (start, duration) => censored?.(start, duration) ?? false,
       audioTracks: () => tap.audioTracks(),
       reportVoice(r: VoiceReport) {
         const st = (gmGet(VOICE_STATUS_KEY) ?? {}) as { live?: VoiceReport; voiced?: VoiceReport };
@@ -63,14 +74,15 @@ function main(): void {
       },
       fullTrack: () => fullTrack,
       createProviders(getSettings) {
-        const y = createYandexProviders(transport, { getToken: () => getSettings().yandexToken });
-        fullTrack = y.fullTrack;
-        return [y.yandexLive, y.yandex, new LiveGemini(getSettings, transportFetch(transport))] satisfies DubProvider[];
+        const chain = createPageProviders({ transport, getSettings, reader, localTts: localModels.register(getSettings), whisperTransport: localModels.asrTransport });
+        fullTrack = chain.fullTrack;
+        censored = chain.censored;
+        return chain.providers;
       },
       createCapture: (v, o) => tap.createCapture(v, o),
     });
     // verification hook (userscript sandbox global, not exposed to the page): engine events without keys or audio
-    (globalThis as unknown as { __nvt?: unknown }).__nvt = { ...runtime.debug, tap: tap.mode };
+    (globalThis as unknown as { __nvt?: unknown }).__nvt = { ...runtime.debug, tap: tap.mode, localModels: localModels.panelHost, localAsr: localModels.asrTransport };
     const rt = runtime;
     onSettingsChanged((s) => rt.applySettings(s), () => rt.refreshPanel());
     // a player living in an iframe still gets its own settings menu entry

@@ -116,7 +116,10 @@ function setDisplay(el: HTMLElement, v: string): void {
 
 type SettingsAccess = { getSettings(): Promise<Settings>; saveSettings(patch: Partial<Settings>): Promise<void>; openKeyPage(url: string): Promise<void> };
 
-export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelHost> & Partial<SettingsAccess>): HTMLElement {
+/** the section element; `recBox` (recommendation line + the one-click download button) can be mounted elsewhere, e.g. under the translate button */
+export type LocalAsrSectionEl = HTMLElement & { recBox?: HTMLElement };
+
+export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelHost> & Partial<SettingsAccess>): LocalAsrSectionEl {
   let choice: LocalAsrModelChoice = 'auto';
   let pi: LocalAsrPanelInfo | null = null;
   let ti: LocalTtsPanelInfo | null = null;
@@ -125,7 +128,7 @@ export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelH
 
   const sel = h('select', { style: 'width:100%' });
   const rows = h('div', {});
-  const det = h('details', {}, h('summary', {}, h('h2', {}, 'Перевод live-трансляций')));
+  const det = h('details', {}, h('summary', {}, h('h2', {}, 'Распознавание речи и перевод Chrome')));
   det.open = localAsrOpen;
   det.addEventListener('toggle', () => (localAsrOpen = det.open));
   const sec = h('section', {}, det);
@@ -185,23 +188,53 @@ export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelH
   // ---- recommendation + one-click download of exactly what is missing (the click is the consent, D31) ----
   const activeLine = h('div', { class: 'hint', 'data-active': '1' });
   const recProg = h('div', { class: 'hint' });
-  const recBtn = h('button', { class: 'primary', style: 'display:none' }, 'Скачать рекомендуемое');
+  const recBtn = h('button', { class: 'primary', style: 'display:none' }, 'Скачать рекомендуемые модели');
   let rec: RecommendedSetup | null = null;
   let recMissing: MissingPiece[] = [];
   let recBusy = false;
+  let recPairsBusy = false;
+  /** how many pieces the recommendation has in all (the button says "Докачать" when only some are missing) */
+  let recTotal = 0;
   let recMsg = '';
   const curLang = (): string | undefined => (sourceLangSetting && sourceLangSetting !== 'auto' ? sourceLangSetting : getResolvedSourceLang());
-  const recBox = h('div', { style: 'margin:10px 0' }, activeLine, recProg, h('div', { class: 'row' }, recBtn));
+  const recBar = h('progress', { max: 100, value: 0, style: 'width:100%;display:none' });
+  /** after a click the download starts a moment later in the offscreen document: until its state shows up the button must not come back */
+  let recGraceUntil = 0;
+  const recBox = h('div', { style: 'margin:10px 0' }, activeLine, recProg, recBar, h('div', { class: 'row' }, recBtn));
   const paintRec = (): void => {
     setText(activeLine, choice === 'auto' ? activeAutoText(pi, curLang()) : '');
     setDisplay(activeLine, choice === 'auto' ? '' : 'none');
-    setText(recProg, recMsg || (recMissing.length ? `Не скачано: ${recMissing.map((p) => p.label).join(', ')}` : rec ? 'Всё рекомендуемое уже скачано' : ''));
-    setDisplay(recBtn, recMissing.length && !recBusy ? '' : 'none');
+    // what is being downloaded right now, from the persisted states (the same ones the rows below show)
+    const going: Array<{ name: string; loaded: number; total: number }> = [];
+    if (rec) {
+      const m = whisperModelInfo(rec.asr.modelId);
+      if (m) {
+        const st = asrModelState(m, pi).state;
+        if (st.phase === 'downloading') going.push({ name: m.label, loaded: st.loaded, total: st.total });
+      }
+      const ei = engineInfo(rec.tts.engine);
+      if (ei) {
+        const st = engineState(ei, ttsVoice, ti).state;
+        if (st.phase === 'downloading') going.push({ name: `голос ${ei.label}`, loaded: st.loaded, total: st.total });
+      }
+    }
+    if (pairBusy) going.push({ name: 'языковой пакет Chrome', loaded: pairPct, total: 100 });
+    const active = recBusy || recPairsBusy || going.length > 0 || recMissing.some((p) => p.kind === 'asr' && !!pi?.units[p.modelId]?.upgrade) || Date.now() < recGraceUntil;
+    if (going.length > 0) {
+      const loaded = going.reduce((n, g) => n + g.loaded, 0);
+      const total = going.reduce((n, g) => n + g.total, 0);
+      const pct = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+      setText(recProg, `Скачиваю: ${going.map((g) => g.name).join(', ')} — ${pct}%`);
+      if (recBar.value !== pct) recBar.value = pct;
+    } else setText(recProg, recMsg || (active ? 'Запускаю скачивание…' : recMissing.length ? `Не скачано: ${recMissing.map((p) => p.label).join(', ')}` : rec ? 'Всё рекомендуемое уже скачано' : ''));
+    setDisplay(recBar, going.length > 0 ? '' : 'none');
+    setText(recBtn, recMissing.length < recTotal ? 'Докачать рекомендуемые модели' : 'Скачать рекомендуемые модели');
+    setDisplay(recBtn, recMissing.length && !active ? '' : 'none');
   };
   const refreshRec = async (): Promise<void> => {
     if (recBusy || !pi) return;
     const lang = curLang();
-    const caps = { webgpu: !!pi.env.gpu, f16: !!pi.env.f16 };
+    const caps = { webgpu: !!pi.env.gpu, f16: !!pi.env.f16, ttsWebgpu: ti?.env.gpu };
     let r = recommendedLocalSetup(caps, lang, false);
     const pairs: InstalledPieces['pairs'] = {};
     if (r.translator) {
@@ -214,6 +247,8 @@ export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelH
       }
     }
     rec = r;
+    recPairsBusy = Object.values(pairs).some((state) => state === 'downloading');
+    recTotal = missingPieces(r, { asr: {}, tts: new Set(), pairs: Object.fromEntries(Object.keys(pairs).map((k) => [k, 'downloadable' as const])) }).length;
     ttsVoice = resolveVoice(r.tts.engine, ttsVoice);
     recMissing = missingPieces(r, installedFrom(pi, ti, ttsVoice, pairs));
     paintRec();
@@ -225,6 +260,9 @@ export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelH
     recBusy = true;
     recMsg = '';
     paintRec();
+    // Start every Translator.create in this click, before any await consumes the
+    // transient activation (a pivot can require TWO language packs).
+    const pairJobs = new Map(todo.filter((p) => p.kind === 'translator').map((p) => [p, downloadPair(p.src, p.tgt).then(() => null, (e: unknown) => e)]));
     void (async () => {
       const errs: string[] = [];
       for (const p of todo) {
@@ -232,10 +270,8 @@ export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelH
           recMsg = `Скачиваю: ${p.label}…`;
           paintRec();
           if (p.kind === 'translator') {
-            await downloadPair(p.src, p.tgt, (f) => {
-              recMsg = `Скачиваю: ${p.label} — ${Math.round(f * 100)}%`;
-              paintRec();
-            });
+            const error = await pairJobs.get(p);
+            if (error) throw error;
           } else if (p.kind === 'tts') await host.localTtsDownload?.(p.engine, ttsVoice);
           else if (p.dtype === 'gpu-mixed' && pi?.units[p.modelId]?.model === 'ready') await host.localAsrUpgrade?.(p.modelId);
           else await host.localAsrDownload?.(p.modelId);
@@ -246,7 +282,8 @@ export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelH
         paintRec();
       }
       recBusy = false;
-      recMsg = errs.length ? `Не удалось скачать — ${errs.join('; ')}` : 'Загрузка запущена';
+      recMsg = errs.length ? `Не удалось скачать — ${errs.join('; ')}` : '';
+      recGraceUntil = errs.length ? 0 : Date.now() + 8000;
       await tick();
       paintRec();
     })();
@@ -299,8 +336,9 @@ export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelH
     busy = true;
     try {
       await fn();
-    } catch {
-      /* the next poll shows the real state */
+    } catch (e) {
+      recMsg = `Ошибка: ${String((e as Error)?.message ?? e)}`;
+      paintRec();
     } finally {
       busy = false;
       void tick();
@@ -410,5 +448,7 @@ export function localAsrSection(host: LocalAsrPanelHost & Partial<LocalTtsPanelH
       void tick();
     } else if (seen || ++idle > 5) clearInterval(timer);
   }, 700);
-  return sec;
+  const out: LocalAsrSectionEl = sec;
+  out.recBox = recBox;
+  return out;
 }

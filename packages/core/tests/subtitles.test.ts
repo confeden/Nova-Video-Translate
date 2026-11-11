@@ -19,6 +19,8 @@ import {
   parseJson3,
   parseTranslateReply,
   parseYandexSubtitles,
+  originalAudioLang,
+  originalTrack,
   pickTrack,
   readCaptionInfo,
   spreadSentences,
@@ -56,6 +58,19 @@ describe('parsers', () => {
     const cues = parseYandexSubtitles(JSON.stringify({ subtitles: [{ text: 'Привет', startMs: 500, durationMs: 1500, speakerId: '0', tokens: [] }, { text: '', startMs: 1, durationMs: 1 }] }));
     expect(cues).toEqual([c(0.5, 2, 'Привет')]);
     expect(parseYandexSubtitles('[]')).toEqual([]);
+  });
+  it('drops music descriptions and music-tagged filler before translating or displaying captions', () => {
+    const texts = ['[music] Oh, heat, heat. >> [music]', 'Dramatic orchestral music plays.', '[music] Welcome to the show! [applause]', 'Heat the pan.'];
+    const cues = parseJson3({ events: texts.map((text, i) => ({ tStartMs: i * 2000, dDurationMs: 2000, segs: [{ utf8: text }] })) });
+    expect(cues.map((x) => x.text)).toEqual(['Welcome to the show!', 'Heat the pan.']);
+    expect(parseYandexSubtitles({ subtitles: [{ text: '[Музыка] Привет! (аплодисменты)', startMs: 0, durationMs: 2000 }] }).map((x) => x.text)).toEqual(['Привет!']);
+  });
+  it('uses nearby separate music labels for repeated filler, preserving narration and meaningful lyrics', () => {
+    const texts = ['[music]', 'Oh, heat, heat.', '>> [music]', 'Heat the pan before adding oil.', '[music]', 'Take me home, country roads.', 'Use (optional) settings.'];
+    const events = texts.map((text, i) => ({ tStartMs: i * 2000, dDurationMs: 2000, segs: [{ utf8: text }] }));
+    expect(parseJson3({ events }).map((x) => x.text)).toEqual(['Heat the pan before adding oil.', 'Take me home, country roads.', 'Use (optional) settings.']);
+    const distant = { events: [{ tStartMs: 0, dDurationMs: 1000, segs: [{ utf8: '[music]' }] }, { tStartMs: 20000, dDurationMs: 1000, segs: [{ utf8: 'Heat, heat.' }] }] };
+    expect(parseJson3(distant).map((x) => x.text)).toEqual(['Heat, heat.']);
   });
   it('sentences are spread over a span proportionally', () => {
     const s = splitSentences('One. Two two two two! Three?');
@@ -118,6 +133,13 @@ describe('captions source', () => {
     expect(pickTrack({ tracks: [t('de', 'asr'), t('fr'), t('es')], translationLangs: [] })!.baseUrl).toBe('fr');
     expect(pickTrack({ tracks: [t('de', 'asr'), t('en', 'asr')], translationLangs: [], audioLang: 'en' })!.baseUrl).toBe('enasr');
   });
+  it('a Russian dub of a foreign video: the original is the language of the auto captions', () => {
+    const t = (lang: string, kind = ''): CaptionInfo['tracks'][number] => ({ lang, kind, baseUrl: lang + kind, translatable: false });
+    const info: CaptionInfo = { tracks: [t('en', 'asr'), t('ru')], translationLangs: [], audioLang: 'ru' };
+    expect(originalAudioLang(info)).toBe('en');
+    expect(originalTrack(info)!.baseUrl).toBe('enasr');
+    expect(originalAudioLang({ tracks: [t('ru', 'asr'), t('ru')], translationLangs: [], audioLang: 'ru' })).toBe('ru');
+  });
 
   it('orders translation batches starting at the playhead', () => {
     const cues = Array.from({ length: 100 }, (_, i) => c(i * 10, i * 10 + 5, `c${i}`));
@@ -140,10 +162,10 @@ describe('captions source', () => {
     const x = ctx(0);
     const cues = await new CaptionsSource({ reader: r, translators: [chrome, gem] }).load(x);
     expect(chrome.calls).toBe(0);
-    expect(gem.calls).toBe(3); // 90 cues / 40 per batch
+    expect(gem.calls).toBe(4); // short first window, then 40 cues per batch
     expect(cues).toHaveLength(90);
     expect(cues[0]!.text).toBe('ru:l0');
-    expect(x.partials.length).toBe(3);
+    expect(x.partials.length).toBe(4);
     expect(x.labels.at(-1)).toBe('YouTube + перевод Gemini');
     expect(r.urls[0]).toContain('fmt=json3');
   });
@@ -163,6 +185,23 @@ describe('captions source', () => {
     expect(chrome.calls).toBe(1);
     expect(gem.calls).toBe(0);
     expect(x.labels.at(-1)).toBe('YouTube + локальный перевод');
+  });
+
+  it('publishes a short first window and follows a seek before translating the rest', async () => {
+    let now = 0;
+    const batches: number[][] = [];
+    const translator = tr('chrome-ai', true);
+    translator.translate = async (cues) => {
+      batches.push(cues.map((x) => x.start));
+      if (batches.length === 1) now = 160;
+      return cues.map((x) => ({ ...x, src: x.text, text: `ru:${x.text}` }));
+    };
+    const x = { ...ctx(), currentTime: () => now };
+    const cues = await new CaptionsSource({ reader: reader(en, { 'lang=en': json3(100) }), translators: [translator] }).load(x);
+    expect(batches[0]).toEqual([0, 2, 4, 6, 8, 10]);
+    expect(batches[1]![0]).toBeGreaterThanOrEqual(160);
+    expect(x.partials[0]).toHaveLength(6);
+    expect(cues).toHaveLength(100);
   });
 
   it('falls back to YouTube auto-translation (tlang=ru) when no translator exists; throws when nothing helps', async () => {
@@ -185,7 +224,8 @@ describe('captions source', () => {
     };
     expect(pickTrack(info)?.lang).toBe('en');
     expect(pickTrack({ ...info, tracks: [info.tracks[0]!] })).toBeUndefined();
-    expect(pickTrack({ ...info, audioLang: 'ru' })?.lang).toBe('ru');
+    // the active audio is a Russian dub: the auto captions (English) still say what was recorded
+    expect(pickTrack({ ...info, audioLang: 'ru' })?.lang).toBe('en');
   });
 
   it('a Russian caption track keeps the audio-language track as the original line', async () => {
@@ -393,7 +433,7 @@ describe('SubtitleController', () => {
     expect(out.cues.map((x) => x.text)).toEqual(['t15']);
   });
 
-  it('skips cells the Gemini voice already covers, and everything once Gemini is the voice tier', async () => {
+  it('skips only cells covered by voice cues, even when Gemini is the voice tier', async () => {
     const ch = chunkSrc('gemini');
     const { ctl, out } = make(on, [], [ch]);
     ctl.start();
@@ -409,8 +449,8 @@ describe('SubtitleController', () => {
     ctl.noteVoiceTier('gemini');
     ctl.feedChunk(chunk(30));
     await tick(20);
-    expect(ch.calls).toHaveLength(1);
-    expect(out.cues.map((x) => x.text)).toEqual(['голос', 't15']);
+    expect(ch.calls).toHaveLength(2);
+    expect(out.cues.map((x) => x.text)).toEqual(['голос', 't15', 't30']);
   });
 
   it('merges chunk cues with voice cues by overlap (no double lines)', async () => {
@@ -508,6 +548,10 @@ describe('captions bridge', () => {
     const client = createCaptionsBridgeClient(win as never);
     const info = await client.getTracks(500);
     expect(info?.videoId).toBe('v');
+    const second = createCaptionsBridgeClient(win as never);
+    expect((await second.getTracks(500))?.videoId).toBe('v');
+    expect((await client.getTracks(500))?.videoId).toBe('v');
+    second.dispose?.();
     const ok = await client.fetchText('https://www.youtube.com/api/timedtext?v=v&lang=en&fmt=json3', 500);
     expect(ok).toEqual({ status: 200, text: '{"events":[]}' });
     const bad = await client.fetchText('https://evil.example/api/timedtext?x=1', 500);
